@@ -1,6 +1,24 @@
 import { describe, expect, it } from 'vitest'
 
-import { FakeClock } from '../src/index.js'
+import { FakeClock, systemClock } from '../src/index.js'
+
+describe('systemClock', () => {
+  it('reads the wall clock', () => {
+    const before = Date.now()
+    const now = systemClock.now()
+    expect(now).toBeGreaterThanOrEqual(before)
+    expect(now).toBeLessThanOrEqual(Date.now())
+  })
+
+  it('schedules and cancels real timers', async () => {
+    let fired = false
+    const cancelled = systemClock.setTimeout(() => (fired = true), 0)
+    systemClock.clearTimeout(cancelled)
+
+    await new Promise<void>((resolve) => systemClock.setTimeout(resolve, 0))
+    expect(fired).toBe(false)
+  })
+})
 
 describe('FakeClock', () => {
   it('starts at the given time and advances', async () => {

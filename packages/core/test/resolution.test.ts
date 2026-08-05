@@ -154,9 +154,23 @@ describe('createPoller config validation', () => {
     ).toThrow(/defer/)
   })
 
-  it('rejects a missing clock: core never touches the wall clock', () => {
+  it('defaults to systemClock when no clock is passed', async () => {
+    const store = memoryStore()
+    const poller = createPoller({ store, driver: makeDriver(), queries, random: () => 0 })
+    const before = Date.now()
+    expect((await poller.runDue()).ran).toEqual(['q'])
+    expect(await store.readResult('q')).toMatchObject({ data: 'v1' })
+    expect((await store.readSchedule('q'))!.nextRunAt).toBeGreaterThanOrEqual(before + 300_000)
+  })
+
+  it('rejects a malformed clock', () => {
     expect(() =>
-      createPoller({ store: memoryStore(), driver: makeDriver(), queries } as never),
+      createPoller({
+        store: memoryStore(),
+        driver: makeDriver(),
+        queries,
+        clock: { now: () => 0 } as never,
+      }),
     ).toThrow(/clock/)
   })
 

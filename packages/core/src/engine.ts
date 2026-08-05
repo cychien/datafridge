@@ -1,10 +1,11 @@
-import { backoffMs, firstRunJitterMs, MAX_JITTER_RATIO, mulberry32 } from './backoff.js'
+import { backoffMs, firstRunJitterMs, MAX_JITTER_RATIO } from './backoff.js'
 import type { Clock } from './clock.js'
 import { defineQueries, Queries } from './define-queries.js'
 import { ConfigError, TimeoutError } from './errors.js'
 import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
 import { shapeRead } from './reader.js'
+import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
   Envelope,
@@ -20,7 +21,7 @@ import type {
 export interface PollerConfig {
   queries: Queries | readonly QueryDef[]
   driver: Driver
-  clock: Clock
+  clock?: Clock
   store?: Store
   results?: ResultStore
   schedule?: ScheduleStore
@@ -40,10 +41,10 @@ export interface Poller {
 export function createPoller(config: PollerConfig): Poller {
   const queries = config.queries instanceof Queries ? config.queries : defineQueries(config.queries)
   const driver = validateDriver(config.driver)
-  const clock = validateClock(config.clock)
+  const clock = validateClock(config.clock ?? systemClock)
   const sources = validateSources(config.sources)
   const { results, schedule } = resolveStores(config, driver)
-  const random = config.random ?? mulberry32(clock.now())
+  const random = config.random ?? systemRandom
 
   const isOwner = async (name: string, token: number): Promise<boolean> => {
     const current = await schedule.readSchedule(name)
@@ -232,10 +233,7 @@ function validateClock(clock: Clock): Clock {
     typeof clock.setTimeout !== 'function' ||
     typeof clock.clearTimeout !== 'function'
   ) {
-    throw new ConfigError(
-      'createPoller requires an injected clock ({ now, setTimeout, clearTimeout }); ' +
-        'core never touches the wall clock',
-    )
+    throw new ConfigError('clock must provide { now, setTimeout, clearTimeout }')
   }
   return clock
 }

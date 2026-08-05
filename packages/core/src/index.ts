@@ -9,6 +9,7 @@ export { ConfigError, TimeoutError } from './errors.js'
 export { memoryStore } from './memory-store.js'
 export { createReader } from './reader.js'
 export type { Reader, ReaderConfig } from './reader.js'
+export { systemClock } from './system-clock.js'
 export type {
   Driver,
   Envelope,

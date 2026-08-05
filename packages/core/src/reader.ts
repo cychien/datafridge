@@ -1,5 +1,6 @@
 import type { Clock } from './clock.js'
 import { ConfigError } from './errors.js'
+import { systemClock } from './system-clock.js'
 import type { Envelope, ReadResult, ResultStore } from './types.js'
 
 export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> | null {
@@ -15,7 +16,7 @@ export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> |
 
 export interface ReaderConfig {
   results: ResultStore
-  clock: Clock
+  clock?: Clock
 }
 
 export interface Reader {
@@ -23,9 +24,8 @@ export interface Reader {
 }
 
 export function createReader(config: ReaderConfig): Reader {
-  const { results, clock } = config
+  const { results, clock = systemClock } = config
   if (!results) throw new ConfigError('createReader requires a results store')
-  if (!clock) throw new ConfigError('createReader requires a clock')
   return {
     async read<T>(name: string): Promise<ReadResult<T> | null> {
       return shapeRead<T>(await results.readResult(name), clock.now())

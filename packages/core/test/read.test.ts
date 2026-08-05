@@ -48,6 +48,16 @@ describe('read() contract', () => {
     expect(await reader.read('unknown')).toBeNull()
   })
 
+  it('createReader defaults to systemClock when no clock is passed', async () => {
+    const { store, poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    await poller.runDue()
+
+    const reader = createReader({ results: resultsOnly(store) })
+    const result = await reader.read<string>('q')
+    expect(result).toMatchObject({ data: 'v1', fetchedAt: 0 })
+    expect(result!.age).toBeGreaterThan(0)
+  })
+
   it('exposes lastError from the envelope', async () => {
     let fail = false
     const { clock, poller } = makeHarness([

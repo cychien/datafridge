@@ -17,6 +17,7 @@ export default tseslint.config(
   },
   {
     files: ['packages/core/src/**/*.ts'],
+    ignores: ['packages/core/src/system-clock.ts'],
     rules: {
       'no-restricted-properties': [
         'error',

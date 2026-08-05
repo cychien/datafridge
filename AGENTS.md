@@ -4,7 +4,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - DESIGN.md and PLAN.md at the repo root are authoritative; the semantic contract in DESIGN.md section 2 must never be violated, and milestone scope/test tables live in PLAN.md.
 - Commands (repo root): `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build`. All must be green before a milestone is done.
-- `packages/core` has zero runtime dependencies and never touches the wall clock: no `Date.now`, `Math.random`, or global timers (eslint enforces this). Time and randomness are injected (`Clock`, `random`); tests use `FakeClock` from core - no sleeps, no wall-clock dependence.
+- `packages/core` has zero runtime dependencies and never touches the wall clock: no `Date.now`, `Math.random`, or global timers (eslint enforces this). The single sanctioned exception is `src/system-clock.ts`, which provides the default `systemClock`/`systemRandom`; `clock` and `random` stay injectable and tests use `FakeClock` from core - no sleeps, no wall-clock dependence.
 - Every Store adapter must pass `storeContractSuite` from `@datafridge/core/contract-tests` (see `packages/core/test/contract.test.ts` for usage). The suite documents claim/version/lease semantics beyond the type signatures, including create-on-claim at expectedVersion 0.
 - Invalid configuration fails at construction (`defineQueries`, `createPoller` resolution rules), never at runtime.
 
