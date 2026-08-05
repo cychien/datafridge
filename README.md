@@ -1,5 +1,7 @@
 # datafridge
 
+English | [繁體中文](./README.zh-TW.md)
+
 A fridge for your API data. datafridge restocks it on a schedule (proactive polling), so opening the door is always instant (`read()` never waits on upstream), every item carries a freshness label (`fetchedAt` / `freshUntil` / `isStale`), and when the supermarket burns down there is still food in the fridge (stale-if-error).
 
 > **Status: pre-release.** The API described here follows [DESIGN.md](./DESIGN.md) and may change before the first npm publish. Wave 1 targets Cloudflare only (Durable Object alarms + D1, or Cron Triggers + D1). Everything listed under [Roadmap](#roadmap-wave-2) does not exist yet. See [PLAN.md](./PLAN.md) for milestone status.

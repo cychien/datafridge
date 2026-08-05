@@ -1,5 +1,7 @@
 # Concepts
 
+English | [繁體中文](./zh-TW/concepts.md)
+
 datafridge turns slow or unreliable APIs into local reads that are always instant, always populated, and always labeled with their age. This page explains the data model and the semantics behind that promise.
 
 ## Architecture in one picture

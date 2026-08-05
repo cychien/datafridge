@@ -1,5 +1,7 @@
 # Cloudflare (wave 1)
 
+English | [繁體中文](./zh-TW/cloudflare.md)
+
 Wave 1 ships two drivers and one store, composing into two complete setups. Both are fully usable on their own, and together they demonstrate that the modules really are orthogonal.
 
 ## Combo A (recommended): doAlarms driver + D1 result store

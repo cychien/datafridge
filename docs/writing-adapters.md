@@ -1,5 +1,7 @@
 # Writing adapters
 
+English | [繁體中文](./zh-TW/writing-adapters.md)
+
 datafridge's core only depends on contracts; it assumes nothing about any platform. Durable Objects, D1, Redis, cron, and node timers are all just adapters. Some backends make an adapter unusually easy to implement (a DO's single-threaded execution, for example) - that is the adapter's luck, never a core assumption.
 
 The interfaces are deliberately tiny. The query registry is a finite set declared in code (a handful to a few dozen queries), so per-name `readSchedule` calls are entirely viable and `listDue` is only an optimization. This is the guarantee behind "any backend gets an adapter in half a day".

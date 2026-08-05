@@ -1,5 +1,7 @@
 # Rate limiting
 
+English | [繁體中文](./zh-TW/rate-limiting.md)
+
 datafridge groups queries by `source` (the `source` field on a query definition, defaulting to `'default'`) and limits how hard each source gets hit. Wave 1 ships the simple, stateless version; a precise accounting version is on the roadmap for the narrow cases that actually need it.
 
 ## v1: per-tick budget + jitter
