@@ -1,1 +1,5 @@
-export {}
+export { FakeClock, flushMicrotasks } from './clock.js'
+export type { Clock } from './clock.js'
+export { parseDuration } from './duration.js'
+export type { Duration, DurationString } from './duration.js'
+export { ConfigError, TimeoutError } from './errors.js'
