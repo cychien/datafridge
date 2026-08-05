@@ -1,0 +1,34 @@
+{
+  "name": "@datafridge/cloudflare",
+  "version": "0.0.0",
+  "description": "Cloudflare adapters for datafridge - Durable Object alarms driver, D1 store, cron shell",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist"
+  ],
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@datafridge/core": "workspace:^"
+  },
+  "devDependencies": {
+    "@datafridge/core": "workspace:*",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
