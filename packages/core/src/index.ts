@@ -4,6 +4,7 @@ export { parseDuration } from './duration.js'
 export type { Duration, DurationString } from './duration.js'
 export { defineQueries, Queries } from './define-queries.js'
 export { ConfigError, TimeoutError } from './errors.js'
+export { memoryStore } from './memory-store.js'
 export type {
   Driver,
   Envelope,
