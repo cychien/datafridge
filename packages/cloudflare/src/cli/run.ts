@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { D1_DATABASE_NAME, InitError, planInit } from './init-wrangler.js'
+import { D1_DATABASE_NAME, InitError, declarationSnippets, planInit } from './init-wrangler.js'
 import type { InitAction, InitPlan } from './init-wrangler.js'
 
 const USAGE = `Usage: datafridge init cloudflare [--config <path>]
@@ -55,6 +55,20 @@ export function runCli(argv: readonly string[], io: CliIo): number {
 
   const path = resolve(io.cwd, configPath ?? 'wrangler.toml')
   const existing = existsSync(path) ? readFileSync(path, 'utf8') : null
+  if (existing === null) {
+    const sibling = ['wrangler.jsonc', 'wrangler.json']
+      .map((name) => resolve(dirname(path), name))
+      .find((candidate) => existsSync(candidate))
+    if (sibling !== undefined) {
+      io.error(
+        `datafridge init: found ${sibling}; this tool only writes wrangler.toml and refuses to ` +
+          'scaffold one that would conflict with your existing config. ' +
+          'Add the equivalent of these declarations manually:\n\n' +
+          declarationSnippets().join('\n\n'),
+      )
+      return 1
+    }
+  }
   let plan: InitPlan
   try {
     plan = planInit(existing, io.today())
@@ -66,16 +80,19 @@ export function runCli(argv: readonly string[], io: CliIo): number {
     throw err
   }
 
+  const manualRemaining = plan.actions.some((action) => action.kind === 'manual')
   for (const action of plan.actions) io.log(renderAction(action))
   if (plan.changed) {
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, plan.content)
     io.log(`${plan.created ? 'created' : 'updated'} ${path}`)
     io.log(NEXT_STEPS)
+  } else if (manualRemaining) {
+    io.log(`${path} not modified; manual steps remain above`)
   } else {
     io.log(`${path} already fully configured; nothing written`)
   }
-  return plan.actions.some((action) => action.kind === 'manual') ? 1 : 0
+  return manualRemaining ? 1 : 0
 }
 
 function renderAction(action: InitAction): string {

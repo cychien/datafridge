@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -189,6 +189,55 @@ describe('runCli', () => {
     expect(runCli(['init', 'cloudflare', '--config', 'infra/wrangler.toml'], cli)).toBe(0)
     const written = readFileSync(join(dir, 'infra/wrangler.toml'), 'utf8')
     expect(parsed(written)).toMatchObject({ triggers: { crons: ['* * * * *'] } })
+  })
+
+  it.each(['wrangler.jsonc', 'wrangler.json'])(
+    'refuses to scaffold a wrangler.toml next to an existing %s and prints manual snippets',
+    (siblingName) => {
+      dir = mkdtempSync(join(tmpdir(), 'datafridge-init-'))
+      writeFileSync(join(dir, siblingName), '{ "name": "my-app" }\n')
+
+      const cli = io(dir)
+      expect(runCli(['init', 'cloudflare'], cli)).toBe(1)
+      expect(existsSync(join(dir, 'wrangler.toml'))).toBe(false)
+
+      const output = cli.errors.join('\n')
+      expect(output).toContain(join(dir, siblingName))
+      expect(output).toContain('[[durable_objects.bindings]]')
+      expect(output).toContain('[[migrations]]')
+      expect(output).toContain('crons = ["* * * * *"]')
+      expect(output).toContain('[[d1_databases]]')
+    },
+  )
+
+  it('distinguishes outstanding manual steps from a fully configured file', () => {
+    dir = mkdtempSync(join(tmpdir(), 'datafridge-init-'))
+    const path = join(dir, 'wrangler.toml')
+    const configured = `triggers = {}
+name = "my-app"
+
+[[durable_objects.bindings]]
+name = "POLLER"
+class_name = "Poller"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Poller"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "datafridge"
+database_id = "1234"
+`
+    writeFileSync(path, configured)
+
+    const cli = io(dir)
+    expect(runCli(['init', 'cloudflare'], cli)).toBe(1)
+    expect(readFileSync(path, 'utf8')).toBe(configured)
+
+    const output = cli.lines.join('\n')
+    expect(output).not.toContain('already fully configured')
+    expect(output).toContain(`${path} not modified; manual steps remain above`)
   })
 
   it('leaves an invalid file untouched and exits non-zero', () => {
