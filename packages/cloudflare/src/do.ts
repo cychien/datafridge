@@ -7,6 +7,7 @@ import type {
   ScheduleStore,
   SourceBudget,
 } from '@datafridge/core'
+import { assertTimeoutsFitInvocation } from './limits.js'
 
 const REGISTRY_META_KEY = 'registry'
 const MIN_ALARM_DELAY_MS = 1_000
@@ -191,7 +192,9 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
 
   #resolveQueries(): Queries {
     const queries = this.queries
-    return queries instanceof Queries ? queries : defineQueries(queries)
+    const resolved = queries instanceof Queries ? queries : defineQueries(queries)
+    assertTimeoutsFitInvocation(resolved, 'Durable Object alarm')
+    return resolved
   }
 
   async #scheduleNextAlarm(queries: Queries): Promise<void> {

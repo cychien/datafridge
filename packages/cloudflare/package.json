@@ -13,6 +13,9 @@
     "migrations"
   ],
   "types": "./dist/index.d.ts",
+  "bin": {
+    "datafridge": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -25,11 +28,15 @@
     "./d1": {
       "types": "./dist/d1.d.ts",
       "import": "./dist/d1.js"
+    },
+    "./cron": {
+      "types": "./dist/cron.d.ts",
+      "import": "./dist/cron.js"
     }
   },
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.cli.json"
   },
   "peerDependencies": {
     "@datafridge/core": "workspace:^"
@@ -37,8 +44,9 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.2",
     "@cloudflare/workers-types": "^5.20260804.1",
-    "@types/node": "^24.0.0",
     "@datafridge/core": "workspace:*",
+    "@types/node": "^24.0.0",
+    "smol-toml": "^1.7.1",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2",
     "vitest": "^4.1.10"
