@@ -1,5 +1,8 @@
 import type { Envelope, ResultStore, ScheduleRow, Store } from '@datafridge/core'
 
+// D1's documented maximum string/BLOB/row size (developers.cloudflare.com/d1/platform/limits).
+const D1_MAX_ROW_BYTES = 2_000_000
+
 type ScheduleRecord = {
   name: string
   next_run_at: number
@@ -29,12 +32,20 @@ export function d1Results(db: D1Database): ResultStore {
     },
 
     async writeResult(name, env) {
+      const envelope = JSON.stringify(env)
+      const bytes = new TextEncoder().encode(envelope).byteLength
+      if (bytes > D1_MAX_ROW_BYTES) {
+        throw new Error(
+          `datafridge: envelope for query "${name}" is ${bytes} bytes, ` +
+            `exceeding D1's ${D1_MAX_ROW_BYTES}-byte row limit; the previous envelope is kept`,
+        )
+      }
       await db
         .prepare(
           'INSERT INTO datafridge_results (name, envelope) VALUES (?, ?) ' +
             'ON CONFLICT (name) DO UPDATE SET envelope = excluded.envelope',
         )
-        .bind(name, JSON.stringify(env))
+        .bind(name, envelope)
         .run()
     },
 
