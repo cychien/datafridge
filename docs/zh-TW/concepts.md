@@ -2,7 +2,7 @@
 
 [English](../concepts.md) | 繁體中文
 
-datafridge 把慢或不穩定的 API 變成永遠即回、永遠有資料、永遠標著年齡的本地讀取。本頁說明支撐這個承諾的資料模型與語意。
+datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的本地讀取。第一次成功 refresh 後，stale-if-error 會讓它持續有資料。本頁說明支撐這個承諾的資料模型與語意。
 
 ## 一張圖的架構
 
@@ -63,6 +63,14 @@ Schedule plane 只有兩個合法的家：
 2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。
 
 正式的 resolution 規則見 [writing-adapters.md](./writing-adapters.md)。
+
+## Parameter variants 與 identity
+
+Parameterized query 會把有限的 runtime list 展開成一般 scheduled identities。每個 variant 都有自己的 `ScheduleRow`、lease、version、failure count、backoff 與 `Envelope`。因此 registry reconcile 對新增或移除 variant 的行為，與新增或移除 fixed query 完全相同。
+
+Variant params 是 canonical JSON。Storage key 為 `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`，所以 raw ID 與 preset value 不會出現在 D1 key 或 `RunReport`。SHA-256 提供跨 object key ordering 的穩定 collision-resistant identity。Params 用來識別，不是 secret storage。Credential 與 private payload 必須留在 binding 或 fetcher closure。
+
+只有有限 registry 中的 variant 會被排程，也只有這些 variant 能直接讀取。Read 不會建立任意 on-demand variant。
 
 ## Staleness 語意
 

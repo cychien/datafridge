@@ -62,13 +62,13 @@ The schedule plane resolves in order:
 三種典型寫法：
 
 ```ts
-createPoller({ store: d1Store(env.DB), driver: cronShell(), queries })            // full store does both
-createPoller({ results: d1Results(env.DB), driver: doAlarms(), queries })         // driver carries bookkeeping
-createPoller({ results: redisResults(c), schedule: d1Schedule(env.DB),            // fully explicit, maximum mix
-               driver: cronShell(), queries })
+createPoller({ store: d1Store(env.DB), driver: cronDriver(ctx), queries })
+createPoller({ results, driver: { serialized: true, defer, schedule }, queries })
+createPoller({ results: customResults, schedule: customAtomicSchedule,
+               driver: cronDriver(ctx), queries })
 ```
 
-反例：`{ results: d1Results(...), driver: cronShell() }` - 只有 ResultStore 子集、cron 非 serialized、沒有明確的 schedule store。套用規則 4：建構時報錯。
+`PollerDO` 會在內部使用自己的 SQLite schedule store 建構第二種 shape。反例：`{ results: d1Results(...), driver: cronDriver(ctx) }` 只有 ResultStore 子集、cron 非 serialized，而且沒有明確 schedule store。套用規則 4，因此建構時報錯。
 
 ## Driver contract
 

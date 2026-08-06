@@ -2,7 +2,20 @@
   "name": "@datafridge/core",
   "version": "0.0.0",
   "description": "Proactively refreshed local reads for slow or unreliable APIs - core engine, zero runtime dependencies",
+  "keywords": [
+    "cache",
+    "polling",
+    "stale-if-error",
+    "typescript"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cychien/datafridge.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/cychien/datafridge#readme",
+  "bugs": "https://github.com/cychien/datafridge/issues",
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -33,6 +46,10 @@
     "vitest": {
       "optional": true
     }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "devDependencies": {
     "tsup": "^8.5.0",

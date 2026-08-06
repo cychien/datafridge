@@ -1,22 +1,49 @@
 import type { Duration } from './duration.js'
 
+export type QueryParams =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly QueryParams[]
+  | { readonly [key: string]: QueryParams }
+
 export interface FetchCtx {
   signal: AbortSignal
   now: number
   attempt: number
 }
 
-export interface QueryDef<T = unknown> {
+export interface ParameterizedFetchCtx<P extends QueryParams> extends FetchCtx {
+  params: P
+}
+
+interface QuerySettings {
   name: string
   every: Duration
   timeout?: Duration
   lease?: Duration
   source?: string
+}
+
+export interface QueryDef<T = unknown> extends QuerySettings {
   fetch: (ctx: FetchCtx) => Promise<T>
 }
 
+export interface ParameterizedQueryDef<
+  P extends QueryParams = QueryParams,
+  T = unknown,
+> extends QuerySettings {
+  variants: readonly P[] | (() => readonly P[])
+  fetch(ctx: ParameterizedFetchCtx<P>): Promise<T>
+}
+
+export type QueryDefinition = QueryDef | ParameterizedQueryDef
+
 export interface ResolvedQuery<T = unknown> {
   readonly name: string
+  readonly baseName: string
+  readonly params?: QueryParams
   readonly everyMs: number
   readonly timeoutMs: number
   readonly leaseMs: number

@@ -8,13 +8,14 @@ datafridge groups queries by `source` (the `source` field on a query definition,
 
 ```ts
 createPoller({
+  driver: cronDriver(ctx),
   store: d1Store(env.DB),
   queries,
   sources: { posthog: { maxPerTick: 2 } },
 })
 ```
 
-Each `runDue` tick groups due queries by source and runs at most `maxPerTick` per group. Queries squeezed out by the budget stay due and are picked up on the next tick - and because priority is the overdue *ratio* `(now - nextRunAt) / every`, a squeezed-out query rises in priority every tick it waits, so nothing starves.
+Each `runDue` tick groups due queries by source and runs at most `maxPerTick` per group. Expanded parameter variants participate as independent queries under their definition's source. Queries squeezed out by the budget stay due and are picked up on the next tick - and because priority is the overdue *ratio* `(now - nextRunAt) / every`, a squeezed-out query rises in priority every tick it waits, so nothing starves.
 
 Two properties make this the right v1:
 

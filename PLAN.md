@@ -71,7 +71,7 @@ DESIGN.md 裡走過的每一條時間軸都變成一個測試案例：
 ## M3 - Cron shell + init CLI + 打磨（2 個晚上）
 
 - cron trigger driver shell（`scheduled` handler 一行接線，組合 B：cron + d1Store，CAS 保護併發 tick）
-- `npx datafridge init cloudflare` - 寫入兩種組合的 wrangler.toml 宣告（migrations、bindings、crons）
+- 安裝 `@datafridge/cloudflare` 後以 `pnpm exec datafridge init cloudflare`（npm：`npx --no-install datafridge init cloudflare`）寫入兩種組合的 wrangler.toml 宣告（migrations、bindings、crons）
 - config-time 驗證補完（timeout vs 平台上限、schedule plane resolution 失敗案例）
 - **測試**：CLI 對 fixture wrangler.toml 的冪等寫入；cron shell 的 e2e（vitest-pool-workers 可直接呼叫 scheduled handler）；兩個併發 scheduled invocation 對同一 D1 → 每個 query 恰好 fetch 一次
 
@@ -79,6 +79,8 @@ DESIGN.md 裡走過的每一條時間軸都變成一個測試案例：
 
 - 用真實 PostHog query 接一個實際 project 跑數天（第一個真使用者）
 - README（語意契約放最前面）、API docs、npm publish with provenance
+- Dogfood 發現並由 captain 接受一個提前交付的 Wave 2 slice：finite parameterized queries。支援 runtime variants、canonical SHA-256 identity、每個 variant 獨立 schedule/lease/backoff/envelope、增刪 reconcile，以及 base name + params direct read；identity 與 evidence 不含 raw params 或 secrets
+- **測試**：deterministic variant identity、canonical collision/非法 params、獨立成功/失敗/lease state、added/removed reconcile、direct read，以及 PollerDO + D1 variant lifecycle
 - **驗收**：dogfood 期間 zero 手動介入；RunReport log 裡 lease/backoff 行為與設計一致
 
 ## 里程碑依賴
@@ -92,4 +94,4 @@ M1 的 Store contract 測試套件是槓桿點：之後每個新 adapter（redis
 ## 明確不在本計劃內
 
 - Node timer driver、Redis/SQLite adapters（wave 2）
-- 精確配額記帳、參數化 queries、metrics exporter（DESIGN.md roadmap）
+- 精確配額記帳、無界或 read-time on-demand/custom-range variants、metrics exporter（DESIGN.md roadmap）

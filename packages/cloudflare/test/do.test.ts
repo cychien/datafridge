@@ -1,6 +1,6 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test'
-import { createReader } from '@datafridge/core'
-import type { QueryDef } from '@datafridge/core'
+import { createReader, defineParameterizedQuery, queryKey } from '@datafridge/core'
+import type { QueryDef, QueryDefinition } from '@datafridge/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { d1Results } from '../src/d1.js'
@@ -30,7 +30,7 @@ function reader() {
 
 type Stub = ReturnType<typeof pollerStub>
 
-async function configure(stub: Stub, defs: readonly QueryDef[]) {
+async function configure(stub: Stub, defs: readonly QueryDefinition[]) {
   await runInDurableObject(stub, async (instance) => {
     ;(instance as TestPoller).queries = defs
   })
@@ -86,6 +86,17 @@ describe('PollerDO alarm loop', () => {
 
     expect(fetchCounts.get('alpha')).toBe(1)
     expect(fetchCounts.get('beta')).toBe(1)
+    const reports = await runInDurableObject(stub, async (instance) =>
+      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+    )
+    expect(reports).toEqual([
+      {
+        ran: ['alpha', 'beta'],
+        skippedLeased: [],
+        deferredBudget: [],
+        failed: [],
+      },
+    ])
 
     const alpha = await reader().read<{ name: string; tick: number }>('alpha')
     expect(alpha).not.toBeNull()
@@ -97,6 +108,27 @@ describe('PollerDO alarm loop', () => {
     const alarm = await currentAlarm(stub)
     expect(alarm).toBe(Math.min(...rows.map((r) => r.next_run_at)))
     expect(alarm).toBeGreaterThan(Date.now())
+  })
+
+  it('keeps alarm-level error details out of logs while continuing the chain', async () => {
+    const stub = pollerStub('sanitized-alarm-error')
+    await configure(stub, [counting('safe', '1m')])
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestPoller).reportError = new Error('private payload must not leak')
+    })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      await stub.ensureStarted()
+      await settled(stub, ['safe'])
+      await vi.waitFor(() => expect(error).toHaveBeenCalled())
+
+      expect(error).toHaveBeenCalledWith('datafridge: alarm-level failure; alarm chain continues')
+      expect(JSON.stringify(error.mock.calls)).not.toContain('private payload')
+      expect(await currentAlarm(stub)).not.toBeNull()
+    } finally {
+      error.mockRestore()
+    }
   })
 
   it('keeps the chain alive when a fetcher throws: no alarm error, failCount recorded', async () => {
@@ -174,6 +206,33 @@ describe('PollerDO alarm loop', () => {
     expect(stale!.data).toEqual({ fresh: true })
     expect(stale!.fetchedAt).toBe(good!.fetchedAt)
     expect(stale!.lastError).toMatchObject({ message: 'now failing', count: 1 })
+  })
+
+  it('reconciles runtime parameter variants and stores each envelope independently', async () => {
+    const stub = pollerStub('parameterized')
+    const query = (courseIds: readonly string[]) =>
+      defineParameterizedQuery({
+        name: 'course-summary',
+        every: '5m',
+        variants: courseIds.map((courseId) => ({ courseId, window: '7d' })),
+        fetch: async ({ params }) => params.courseId,
+      })
+    const alpha = { courseId: 'alpha', window: '7d' }
+    const beta = { courseId: 'beta', window: '7d' }
+    const gamma = { courseId: 'gamma', window: '7d' }
+
+    await configure(stub, [query(['alpha', 'beta'])])
+    await stub.ensureStarted()
+    await settled(stub, [queryKey('course-summary', alpha), queryKey('course-summary', beta)])
+    await expect(reader().read('course-summary', alpha)).resolves.toMatchObject({ data: 'alpha' })
+    await expect(reader().read('course-summary', beta)).resolves.toMatchObject({ data: 'beta' })
+
+    await configure(stub, [query(['beta', 'gamma'])])
+    await stub.ensureStarted()
+    await settled(stub, [queryKey('course-summary', beta), queryKey('course-summary', gamma)])
+    await expect(reader().read('course-summary', alpha)).resolves.toBeNull()
+    await expect(reader().read('course-summary', beta)).resolves.toMatchObject({ data: 'beta' })
+    await expect(reader().read('course-summary', gamma)).resolves.toMatchObject({ data: 'gamma' })
   })
 
   it('ensureStarted is idempotent: no double chain, no early re-alarm', async () => {

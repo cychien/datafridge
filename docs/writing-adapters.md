@@ -62,13 +62,13 @@ The schedule plane resolves in order:
 Three typical configurations:
 
 ```ts
-createPoller({ store: d1Store(env.DB), driver: cronShell(), queries })            // full store does both
-createPoller({ results: d1Results(env.DB), driver: doAlarms(), queries })         // driver carries bookkeeping
-createPoller({ results: redisResults(c), schedule: d1Schedule(env.DB),            // fully explicit, maximum mix
-               driver: cronShell(), queries })
+createPoller({ store: d1Store(env.DB), driver: cronDriver(ctx), queries })
+createPoller({ results, driver: { serialized: true, defer, schedule }, queries })
+createPoller({ results: customResults, schedule: customAtomicSchedule,
+               driver: cronDriver(ctx), queries })
 ```
 
-Counter-example: `{ results: d1Results(...), driver: cronShell() }` - only the ResultStore subset, cron is not serialized, no explicit schedule store. Rule 4 applies: construction throws.
+`PollerDO` constructs the second shape internally with its SQLite schedule store. Counter-example: `{ results: d1Results(...), driver: cronDriver(ctx) }` has only the ResultStore subset, cron is not serialized, and no explicit schedule store. Rule 4 applies, so construction throws.
 
 ## Driver contract
 

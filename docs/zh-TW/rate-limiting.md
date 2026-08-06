@@ -8,13 +8,14 @@ datafridge 按 `source`（query 定義上的 `source` 欄位，預設 `'default'
 
 ```ts
 createPoller({
+  driver: cronDriver(ctx),
   store: d1Store(env.DB),
   queries,
   sources: { posthog: { maxPerTick: 2 } },
 })
 ```
 
-每個 `runDue` tick 把到期的 queries 按 source 分組，每組最多跑 `maxPerTick` 個。被預算擠掉的 queries 保持到期，下個 tick 自然接手 - 而且因為優先級是過期比例 `(now - nextRunAt) / every`，被擠掉的 query 每等一個 tick 優先級就升高，不會有東西餓死。
+每個 `runDue` tick 把到期的 queries 按 source 分組，每組最多跑 `maxPerTick` 個。展開的 parameter variants 會依 definition 的 source，以獨立 query 參與 budget。被預算擠掉的 queries 保持到期，下個 tick 自然接手 - 而且因為優先級是過期比例 `(now - nextRunAt) / every`，被擠掉的 query 每等一個 tick 優先級就升高，不會有東西餓死。
 
 兩個性質讓它成為正確的 v1：
 

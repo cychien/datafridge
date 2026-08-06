@@ -2,84 +2,110 @@
 
 [English](./README.md) | 繁體中文
 
-資料的冰箱。datafridge 按排程補貨（proactive polling），所以開門即拿（`read()` 永遠不等上游），每項食物都貼著有效期限標籤（`fetchedAt` / `freshUntil` / `isStale`），就算超市燒掉了，冰箱裡還有存糧（stale-if-error）。
-
-> **狀態：pre-release。** 此處描述的 API 依循 [DESIGN.md](./DESIGN.md)，在第一次 npm publish 之前仍可能變動。Wave 1 只支援 Cloudflare（Durable Object alarms + D1，或 Cron Triggers + D1）。[Roadmap](#roadmap-wave-2) 列出的東西目前都還不存在。里程碑進度見 [PLAN.md](./PLAN.md)。
-
 ## 語意契約
 
-這六條保證就是產品本身。所有實作都不得違反：
+這六項保證就是產品本身。所有實作都必須遵守：
 
-1. **讀取永遠即回。** `read()` 只碰 result store，永遠不等上游。
-2. **讀取永遠附帶時間。** 每個結果都帶 `fetchedAt`，caller 永遠知道資料多舊。
-3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標記 `isStale`，application 完全無感。
-4. **At-least-once refresh。** 執行中的實例暴斃，租約（lease）過期後工作會自動被重撿，不需要任何清理程序。
-5. **寫回一致性。** 併發或 zombie 執行者的過期寫回會被拒絕，store 永遠一致。
-6. **Fail at config time。** 非法設定（timeout >= lease、沒有合法的 schedule plane、重複 name）在建構時就報錯，絕不留到 runtime。
+1. **讀取永遠立即回傳。** `read()` 只存取 result store，絕不等待上游。
+2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
+3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
+4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。
+5. **寫回一致性。** Version 檢查會拒絕 concurrent 或 zombie executor 的遲到寫回。
+6. **Fail at config time。** 非法 duration、重複名稱、不安全的 lease、不受平台支援的 timeout，以及無法解析的 schedule plane，都會在建構時拋錯。
 
-## 為什麼
+資料的冰箱。datafridge 主動刷新 named queries，讓 request-time 讀取不必等待緩慢或不穩定的上游。每次讀取都標示資料年齡，stale-if-error 則保留最後一筆成功值。
 
-- **Request-triggered SWR libraries**（bentocache、cachified、stale-while-revalidate-cache）只在有人來讀時才刷新。沒有流量就沒有保鮮，而且冷啟動的第一個請求得吞下慢查詢。datafridge 主動刷新，資料永遠是熱的。
-- **重量級 ETL 平台**（Airbyte、Fivetran）是 connector 生意，不是能隨插即用丟進 TypeScript 專案的 library。
-- **自幹的 cron + Redis** 每個專案都重寫一次，而且 lease 處理、backoff、staleness 語意每次都做不全。
+Wave 1 支援兩種 Cloudflare 組合：Durable Object alarms 搭配 D1 results，或 Cron Triggers 搭配完整 D1 store。已接受的 parameterized-query slice 則加入有限的 runtime variants，可表達 resource ID 與 preset window 等維度。Fetcher 仍是 application code。datafridge 不是 API connector、proxy、dashboard 或 configuration DSL。
 
-datafridge 是 **proactive scheduled refresh**、**per-source rate limiting**、**serve-stale-on-error** 三者的組合，做成模組完全正交、可替換的 TypeScript library：store 決定狀態放哪、driver 決定誰來踢、fetcher 跟著 poller 實例跑在哪都行。
+## 安裝
 
-Non-goals：不做 API connector（fetcher 一律是你自己的 closure）、不做 dashboard、不做 config DSL（config 就是 code）、不做 transparent proxy（只服務事先註冊的 named queries）。
+```sh
+pnpm add @datafridge/core @datafridge/cloudflare
+# 或：npm install @datafridge/core @datafridge/cloudflare
+```
 
-## Quick start（Cloudflare）
+兩個 package 都只提供 ESM，開發工具需要 Node.js 20 以上版本。Worker code 在 Cloudflare Workers runtime 執行。
 
-Wave 1 提供兩套完整的 Cloudflare 接法。兩者都用你自己的 D1 資料庫當 result store。
+## Parameterized preset queries
 
-### 組合 A（推薦）：Durable Object alarms + D1 results
-
-Durable Object 在這裡的身分純粹是 scheduler：alarm 自我喚醒、單線程執行到期的 queries、排程簿記存在自己的 SQLite（driver 內部細節）。結果落在你的 D1，讀取端直接查 D1，完全不經過 DO。
+相同 fetch 適用於有限的 runtime variants 時，使用一個 parameterized definition：
 
 ```ts
-// poller.ts
-import { defineQueries } from '@datafridge/core'
-import { PollerDO, d1Results } from '@datafridge/cloudflare'
+import { defineParameterizedQuery, defineQueries } from '@datafridge/core'
+
+const courseAnalytics = defineParameterizedQuery({
+  name: 'course-analytics',
+  every: '10m',
+  source: 'posthog',
+  variants: () => courseIds.flatMap((courseId) =>
+    ['7d', '30d', '90d'].map((window) => ({ courseId, window })),
+  ),
+  fetch: ({ params, signal }) => queryPostHogPreset(params, { signal }),
+})
+
+const queries = defineQueries([courseAnalytics])
+const result = await reader.read('course-analytics', { courseId: 'course-a', window: '30d' })
+```
+
+每個 variant 都有獨立的 schedule、lease、backoff 與 envelope。新增或移除 variant 時，reconcile 行為與 named query 相同。Storage 與 `RunReport` identity 只包含公開 base name 與 canonical SHA-256 digest，不包含 raw parameter values。Params 仍只能放非機密的 JSON dimensions。Credential 必須放在 binding 或 fetcher closure。
+
+## Cloudflare quick start
+
+部署任一組合前，先套用 package 內附的 D1 schema：
+
+```sh
+pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
+  --file node_modules/@datafridge/cloudflare/migrations/0001_datafridge_init.sql
+```
+
+### 組合 A：Durable Object alarms + D1 results
+
+Durable Object 在自己的 SQLite 中管理 serialized schedule bookkeeping。結果寫入 D1，reader 則直接查詢 D1。
+
+```ts
+import { createReader, defineQueries } from '@datafridge/core'
+import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+
+interface Env {
+  DB: D1Database
+  POLLER: DurableObjectNamespace<Poller>
+}
 
 const queries = defineQueries([
   {
-    name: 'posthog-weekly',
+    name: 'weekly-summary',
     every: '10m',
-    source: 'posthog',
-    fetch: ({ signal }) => posthogQuery(weeklyReportSql, { signal }),
+    timeout: '30s',
+    source: 'analytics',
+    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
   },
 ])
 
-export class Poller extends PollerDO {
+export class Poller extends PollerDO<Env> {
   queries = queries
+
   results(env: Env) {
     return d1Results(env.DB)
   }
 }
-```
-
-```ts
-// worker.ts - the read side; same Worker or a completely different one
-import { createReader } from '@datafridge/core'
-import { d1Results, ensureStarted } from '@datafridge/cloudflare'
 
 export default {
-  async fetch(req, env) {
-    await ensureStarted(env.POLLER) // idempotent; ignites the alarm chain
-    const r = await createReader({ results: d1Results(env.DB) }).read('posthog-weekly')
-    return Response.json(r)
-    // r: { data, fetchedAt, isStale, age } | null (null = first fetch not done yet)
+  async fetch(_request: Request, env: Env) {
+    await ensureStarted(env.POLLER)
+    const reader = createReader({ results: d1Results(env.DB) })
+    return Response.json(await reader.read('weekly-summary'))
   },
 }
 ```
 
 ```toml
-# wrangler.toml
 [[durable_objects.bindings]]
 name = "POLLER"
 class_name = "Poller"
 
 [[d1_databases]]
 binding = "DB"
+database_name = "datafridge"
 database_id = "..."
 
 [[migrations]]
@@ -87,74 +113,95 @@ tag = "v1"
 new_sqlite_classes = ["Poller"]
 ```
 
+`ensureStarted()` 可重複安全呼叫。第一次使用時會啟動 alarm chain，部署後則會 reconcile 變更過的 query registry。
+
 ### 組合 B：Cron Triggers + D1 full store
 
-完全不用 Durable Object。D1 同時承擔兩個 plane：results，以及由 compare-and-swap claim（`UPDATE ... WHERE version = ?`）保護的排程簿記，所以併發的 cron invocation 是安全的。排程粒度下限為 1 分鐘。
+D1 同時儲存 results 與 schedule rows。Atomic compare-and-swap claim 可確保重疊的 scheduled invocations 安全執行。
 
 ```ts
-import { defineQueries, createPoller } from '@datafridge/core'
-import { d1Store } from '@datafridge/cloudflare'
+import { defineQueries } from '@datafridge/core'
+import { cronPoller, d1Store } from '@datafridge/cloudflare'
+
+interface Env {
+  DB: D1Database
+}
 
 const queries = defineQueries([
   {
-    name: 'posthog-weekly',
+    name: 'weekly-summary',
     every: '10m',
-    source: 'posthog',
-    fetch: ({ signal }) => posthogQuery(weeklyReportSql, { signal }),
+    source: 'analytics',
+    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
   },
 ])
 
 export default {
-  scheduled: (event, env, ctx) =>
-    ctx.waitUntil(createPoller({ store: d1Store(env.DB), queries }).runDue()),
+  scheduled: cronPoller<Env>({
+    queries,
+    store: (env) => d1Store(env.DB),
+  }),
 }
 ```
 
 ```toml
-# wrangler.toml
 [triggers]
-crons = ["* * * * *"] # minimum granularity: 1 minute
+crons = ["* * * * *"]
 ```
 
-### 選哪個？
-
-| | 組合 A（doAlarms） | 組合 B（cron + D1 CAS） |
+| | 組合 A | 組合 B |
 |---|---|---|
-| 排程粒度 | 任意 timestamp | 1 分鐘下限 |
-| 排程可動態調整 | 可（backoff、runtime 改頻率） | tick 固定，due 判斷仍動態 |
-| 併發保護 | driver 序列化，零成本 | D1 CAS claim |
-| 元件 | DO + D1 | 只有 D1 |
+| Scheduler | Durable Object alarms | Cron Triggers |
+| Schedule state | Durable Object SQLite | 使用 atomic claims 的 D1 |
+| Result state | D1 | D1 |
+| 粒度 | 精確 alarm timestamp | 最低 1 分鐘 |
+| 適合情境 | 動態 backoff 與最低 claim 成本 | 較少平台元件 |
 
-生命週期細節（alarm 鏈點火、registry reconcile）與平台限制見 [docs/zh-TW/cloudflare.md](./docs/zh-TW/cloudflare.md)。
+## Init CLI
 
-## 從任何地方讀取
+安裝 `@datafridge/cloudflare` 後，可把兩種支援組合的設定 scaffold 到 TOML config：
 
-結果是 result store 裡的純 JSON envelope。任何能連到 store 的 process 都能讀，不需要 poller 存在：
+```sh
+pnpm exec datafridge init cloudflare
+# npm：npx --no-install datafridge init cloudflare
+```
+
+需要時可加上 `--config path/to/wrangler.toml`。此命令具備 idempotent 行為、保留既有 declarations、拒絕與 `wrangler.json` 或 `wrangler.jsonc` 衝突，並列出無法安全加入的 declaration。保留你要使用的組合，刪除另一組 declarations。
+
+## 讀取與失敗行為
 
 ```ts
-import { createReader } from '@datafridge/core'
-
-const reader = createReader({ results: d1Results(env.DB) })
-const r = await reader.read<WeeklyReport>('posthog-weekly')
+const result = await createReader({ results: d1Results(env.DB) }).read<Summary>(
+  'weekly-summary',
+)
+// { data, fetchedAt, isStale, age, lastError? } | null
 ```
 
-完整的 poller 也直接提供 `poller.read()`，所以跑 poller 的那個家不需要另建 reader。其他語言的 consumer 只要能讀底層 store 就行，envelope 格式是純 JSON。
+`null` 表示第一次成功 refresh 尚未完成。上游錯誤與 timeout 會保留舊 envelope、增加失敗狀態，並以有 jitter 的 exponential backoff 重試，上限為正常 interval。`runDue()` 回傳 `{ ran, skippedLeased, deferredBudget, failed }`。組合 A 的 subclass 可 override `onRunReport(report)`，用於 sanitized operational logging。
+
+權威語意契約見 [DESIGN.md section 2](./DESIGN.md#2-語意契約)，lease、version、backoff 與 staleness model 見 [docs/zh-TW/concepts.md](./docs/zh-TW/concepts.md)。
 
 ## 文件
 
-- [docs/zh-TW/concepts.md](./docs/zh-TW/concepts.md) - 兩個 plane、envelope 與 schedule row、staleness 與失敗語意
-- [docs/zh-TW/cloudflare.md](./docs/zh-TW/cloudflare.md) - 兩個組合的完整細節、生命週期、平台限制
-- [docs/zh-TW/writing-adapters.md](./docs/zh-TW/writing-adapters.md) - ResultStore / ScheduleStore / Driver contracts 與 adapter 的驗收方式
-- [docs/zh-TW/rate-limiting.md](./docs/zh-TW/rate-limiting.md) - per-tick budget、jitter，以及什麼時候才需要精確配額記帳
+- [API reference](./docs/zh-TW/api.md)
+- [Cloudflare 設定與營運](./docs/zh-TW/cloudflare.md)
+- [概念與失敗語意](./docs/zh-TW/concepts.md)
+- [Rate limiting](./docs/zh-TW/rate-limiting.md)
+- [撰寫 adapters](./docs/zh-TW/writing-adapters.md)
+- [Release 流程與 package 名稱](./docs/zh-TW/releasing.md)
+- [可執行的 Cloudflare 範例](./examples/cloudflare-basic)
 
-## Roadmap（wave 2+）
+## Wave 2 排除項目
 
-計劃中，目前尚未提供：
+Wave 1 尚未提供：
 
-- `@datafridge/node`（setInterval driver）、`@datafridge/sqlite`、`@datafridge/redis`
-- Result-plane 讀取加速複本（KV / Cache API；result plane 可接受最終一致性）
-- 精確的 per-source 配額記帳（見 [docs/zh-TW/rate-limiting.md](./docs/zh-TW/rate-limiting.md)）
-- 參數化 queries（`variants: () => params[]`）
-- Metrics hook（`RunReport` 介面已為此預留）
-- QStash / Inngest provisioning drivers
-- `npx datafridge init cloudflare` scaffolding CLI（wave 1，里程碑 M3）
+- Node timer、Redis、SQLite、Postgres、KV 或 Cache API adapters
+- 不在有限 registry 內的 unbounded、on-demand 或任意 custom-range variants
+- 精確的 shared quota-window accounting
+- Metrics exporters 與 dashboards
+- QStash 或 Inngest provisioning drivers
+- Documentation website
+
+## License
+
+[MIT](./LICENSE)
