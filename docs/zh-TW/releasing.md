@@ -50,6 +50,18 @@ Publish job 會 checkout `main`、pin npm、依 lockfile 安裝、在還有任�
 
 `changesets/action` pin 在 `v1`，也就是支援本 repository 所安裝的 `@changesets/cli` v2 的那條線。`v2` action 線要求 `@changesets/cli` v3，對著 v2 CLI 會立刻失敗，因此兩者必須一起升級，否則都不要動。
 
+### Version job 依賴一個 repository 設定
+
+建立 version PR 需要開啟 **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**（`can_approve_pull_request_reviews`）。目前是開啟的。關掉它只會讓最後一步失敗：job 仍然會建立 `changeset-release/main`、執行 `pnpm version-packages`、commit 並推出該 branch，然後才失敗於
+
+```
+GitHub Actions is not permitted to create or approve pull requests.
+```
+
+Job 層的 `pull-requests: write` permission 蓋不過這個 repository 設定。若真的發生，versioned branch 已經推上去了，可以在恢復設定的同時從 `changeset-release/main` 手動開 version PR。
+
+`default_workflow_permissions` 維持 `read`，這是正確的，也不該放寬：每個 job 各自宣告所需的 write scopes，因此預設 token 一開始不會擁有超過 read 的權限。
+
 ### 認證方式是 npm Trusted Publishing
 
 沒有 npm token，也沒有任何 Actions secret。Workflow 以 OIDC 認證：`id-token: write` 讓 npm 把 GitHub 發出的 id token 換成短期 publishing token。這帶來兩個影響 workflow 結構的後果：
@@ -72,7 +84,7 @@ npm 只能為已經存在的 package 設定 trusted publisher，因此 `1.0.0` �
 
 **以這種方式發布的 `1.0.0` 不會有 provenance attestation。** npm 只在 GitHub Actions 或 GitLab CI 內產生 provenance；在其他環境 `libnpmpublish` 會丟出 `EUSAGE: Automatic provenance generation not supported for provider: null`。因此 provenance 是從第一個由 CI 發布的 release 開始，而不是從 `1.0.0` 開始。這是不用 token 做 bootstrap 所接受的一次性後果。
 
-目前 package versions 是 `0.0.0`。在執行以下任何步驟前，`1.0.0` 必須已透過 merge 的 version PR 進入 `main`。
+`1.0.0` 已經在 `main` 上：version PR 已於 [#6](https://github.com/cychien/datafridge/pull/6) merge，兩個 packages 都是 `1.0.0`，changeset queue 也是空的。這個前置條件已經滿足，確認即可，不要重跑一次。
 
 ```sh
 git checkout main
@@ -116,6 +128,8 @@ pnpm publish --no-provenance --access public
 如果你的 npm 帳號在寫入時要求 2FA，請在每個 publish 指令加上 `--otp <code>`。
 
 注意 `pnpm publish --dry-run` 不會走到 npm 的認證與 provenance 程式碼，因此 dry run 乾淨只能證明 tarball 正確。
+
+`--no-provenance` 的處境相同：它只能靠一次真正的 publish 才能完全驗證。它的前提是 npm 會忽略同時出現在 command line 上的 `publishConfig` key，而這是從 npm 原始碼讀出來的、不是實際觀察到的，任何 dry run 都無法驗證。如果 npm 仍然在 provenance 上拒絕 - `EUSAGE: Automatic provenance generation not supported for provider: ...` - 就把兩個 package 的 `publishConfig` 裡的 `provenance` 改成 `false`，作為**不 commit 的本機修改**，發布完再用 `git checkout -- packages/*/package.json` 還原。絕對不要 commit 這個修改：CI 路徑需要的是 `publishConfig.provenance: true`。
 
 完成後在 npmjs.com 上，替 `@datafridge/core` 與 `@datafridge/cloudflare` **各自**進入 Settings，以上面列出的 owner、repository、workflow filename 與 environment 新增 GitHub Actions trusted publisher。只有在這之後才可以 dispatch workflow。
 

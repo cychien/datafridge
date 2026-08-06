@@ -50,6 +50,18 @@ The publish job checks out `main`, pins npm, installs with the lockfile, refuses
 
 `changesets/action` is pinned to `v1`, the line that supports the `@changesets/cli` v2 this repository installs. The `v2` action line requires `@changesets/cli` v3 and fails immediately against a v2 CLI, so the two must be upgraded together or not at all.
 
+### The version job depends on one repository setting
+
+Opening the version PR requires **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** to be enabled (`can_approve_pull_request_reviews`). It is enabled today. Turning it off breaks only the last step: the job still creates `changeset-release/main`, runs `pnpm version-packages`, commits, and pushes the branch, and then fails with
+
+```
+GitHub Actions is not permitted to create or approve pull requests.
+```
+
+A job-level `pull-requests: write` permission does not override the repository setting. If that ever happens, the versioned branch is already pushed, so the version PR can be opened by hand from `changeset-release/main` while the setting is restored.
+
+`default_workflow_permissions` stays `read`, which is correct and should not be widened: each job declares the write scopes it needs, so the default token starts with no more than read access.
+
 ### Authentication is npm Trusted Publishing
 
 There is no npm token, and no Actions secret of any kind. The workflow authenticates with OIDC: `id-token: write` lets npm exchange a GitHub-issued id token for a short-lived publishing token. Two consequences shape the workflow:
@@ -72,7 +84,7 @@ npm can only accept a trusted-publisher configuration for a package that already
 
 **`1.0.0` published this way carries no provenance attestation.** npm only generates provenance inside GitHub Actions or GitLab CI; anywhere else `libnpmpublish` throws `EUSAGE: Automatic provenance generation not supported for provider: null`. Provenance therefore starts with the first CI-published release, not with `1.0.0`. That is an accepted, one-time consequence of bootstrapping without a token.
 
-Package versions are `0.0.0` today. `1.0.0` must already be on `main` through a merged version PR before any of this runs.
+`1.0.0` is already on `main`: the version PR landed in [#6](https://github.com/cychien/datafridge/pull/6), so both packages read `1.0.0` and the changeset queue is empty. This precondition is met; confirm it rather than re-create it.
 
 ```sh
 git checkout main
@@ -116,6 +128,8 @@ Each part of that command is load-bearing:
 If your npm account requires 2FA on writes, add `--otp <code>` to each publish command.
 
 Note that `pnpm publish --dry-run` never reaches npm's authentication or provenance code, so a clean dry run proves only that the tarball is right.
+
+`--no-provenance` is in the same position: it can only be fully proven by a real publish. It rests on npm ignoring a `publishConfig` key that also appears on the command line, which is read out of npm's source rather than observed, and no dry run can exercise it. If npm still refuses on provenance - `EUSAGE: Automatic provenance generation not supported for provider: ...` - set `provenance` to `false` in each package's `publishConfig` as an **uncommitted local edit**, publish, then revert it with `git checkout -- packages/*/package.json`. Never commit that edit: `publishConfig.provenance: true` is what the CI path needs.
 
 Afterwards, on npmjs.com, for **each** of `@datafridge/core` and `@datafridge/cloudflare`, open Settings and add a GitHub Actions trusted publisher with the owner, repository, workflow filename, and environment listed above. Only then may the workflow be dispatched.
 
