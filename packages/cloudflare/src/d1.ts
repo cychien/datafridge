@@ -4,11 +4,21 @@ import { D1_SCHEMA } from './schema.js'
 // D1's documented maximum string/BLOB/row size (developers.cloudflare.com/d1/platform/limits).
 const D1_MAX_ROW_BYTES = 2_000_000
 
+// Enough for the handful of executors one source can realistically have racing
+// on the same window; beyond that, refusing is the correct answer anyway.
+const QUOTA_CAS_ATTEMPTS = 8
+
 type ScheduleRecord = {
   name: string
   next_run_at: number
   fail_count: number
   lease_until: number | null
+  version: number
+}
+
+type QuotaRecord = {
+  window_start: number
+  used: number
   version: number
 }
 
@@ -161,6 +171,49 @@ export function d1(db: D1Database): Store {
           .bind(leaseUntil, name, expectedVersion, now)
           .run()
         return result.meta.changes === 1
+      })
+    },
+
+    async takeQuota(source, limit, windowMs, now) {
+      return withSchema(db, async () => {
+        const windowStart = Math.floor(now / windowMs) * windowMs
+        // Same CAS as claim: read, decide, then write only if nobody moved. A
+        // lost race means a peer took a slot, so the count has to be re-read
+        // rather than retried blindly, and running out of attempts refuses the
+        // call - the safe direction for a ceiling.
+        for (let attempt = 0; attempt < QUOTA_CAS_ATTEMPTS; attempt += 1) {
+          const record = await db
+            .prepare('SELECT window_start, used, version FROM datafridge_quota WHERE source = ?')
+            .bind(source)
+            .first<QuotaRecord>()
+          if (!record) {
+            if (limit < 1) return false
+            const created = await db
+              .prepare(
+                'INSERT INTO datafridge_quota (source, window_start, used, version) ' +
+                  'VALUES (?, ?, 1, 1) ON CONFLICT (source) DO NOTHING',
+              )
+              .bind(source, windowStart)
+              .run()
+            if (created.meta.changes === 1) return true
+            continue
+          }
+          // A window is never rewound: an executor whose clock lags must not
+          // reopen one its peers have already closed and hand out the quota
+          // twice.
+          const openWindow = Math.max(record.window_start, windowStart)
+          const used = record.window_start === openWindow ? record.used : 0
+          if (used >= limit) return false
+          const taken = await db
+            .prepare(
+              'UPDATE datafridge_quota SET window_start = ?, used = ?, version = version + 1 ' +
+                'WHERE source = ? AND version = ?',
+            )
+            .bind(openWindow, used + 1, source, record.version)
+            .run()
+          if (taken.meta.changes === 1) return true
+        }
+        return false
       })
     },
 

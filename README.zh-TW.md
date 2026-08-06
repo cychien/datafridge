@@ -172,7 +172,7 @@ const result = await reader.read<Summary>('weekly-summary')
 | 上游錯誤或 timeout | 記錄失敗、backoff、保留舊結果 | 舊資料、`isStale`、`lastError` |
 | Executor 執行到一半暴斃 | 租約過期後由另一個 tick 重新 claim | 舊資料、`isStale` |
 | Zombie 遲到寫回 | Version 不符，寫入被拒 | 不受影響 |
-| 被 source budget 擠掉 | 保持到期，下個 tick 優先度提高 | 舊資料，稍微舊一點 |
+| 被 source 的 rate limit 擠掉 | 保持到期，下個 tick 優先度提高 | 舊資料，稍微舊一點 |
 | 連續失敗數小時 | Backoff 收斂在 `every`，永久保留 last-known-good | 舊資料、`lastError` |
 | 從未成功 fetch 過 | 依排程持續嘗試 | `null` |
 
@@ -202,21 +202,30 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 ## 依 source 做 rate limiting
 
-替 query 標上 `source`，並限制該群組每個 tick 最多跑幾個：
+替 query 標上 `source`，並說明那個 source 能承受什麼：
 
 ```ts
 export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { posthog: { maxPerTick: 2 } },
+    sources: {
+      posthog: {
+        limit: { requests: 100, per: '1m', reserve: 10 },
+        maxConcurrent: 4,
+      },
+    },
   }),
 }
 ```
 
-不論你註冊多少 query，排程刷新都不會超過 `maxPerTick × tick 頻率`。冷讀取在 miss 時觸發的抓取由 lease 保證同一個 key 只有一次，但目前還不計入這個預算。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
+`limit` 是真的在數，不是啟發式：store 為每個 source 保留一列 ledger，每次呼叫都用與 claim lease 同一套 version-checked CAS 遞增它，所以兩個 Worker 和一個 Durable Object 只要指向同一個資料庫，就共用同一份額度。所有上游呼叫都走它 - 排程刷新與「讀取時發現沒資料」的抓取吃的是同一個窗。
 
-Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` 加上隨機偏移，所以 `5m`、`10m`、`1h` 的 query 不會永遠對齊在同一個 tick、一次擠爆同一個 source。預算是保險絲，jitter 讓保險絲平常不用燒。
+`reserve` 從每個窗口保留一部分不給排程刷新，否則剛好落在窗口邊界的 tick 會在第一秒把整分鐘花光，讓背後有真人的讀者什麼都拿不到。被擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
+
+Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` 加上隨機偏移，所以 `5m`、`10m`、`1h` 的 query 不會永遠對齊在同一個 tick、一次擠爆同一個 source。Ledger 是保險絲，jitter 讓保險絲平常不用燒。
+
+`maxConcurrent`、`throttled` 這個讀取狀態，以及用 `RateLimitError` 把供應商自己的 `Retry-After` 帶回來，見 [rate limiting](./docs/zh-TW/rate-limiting.md)。
 
 ## 文件
 

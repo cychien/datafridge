@@ -29,27 +29,29 @@ describe('runDue', () => {
     expect(clock.now()).toBe(0)
   })
 
-  it('budget squeeze: the deferred query is picked up on the next tick', async () => {
+  it('quota squeeze: the throttled query stays due and runs in the next window', async () => {
     const calls = { p1: 0, p2: 0, p3: 0 }
-    const { clock, fridge } = makeHarness(
+    const { clock, store, fridge } = makeHarness(
       (['p1', 'p2', 'p3'] as const).map((name) => ({
         name,
         every: '5m' as const,
         source: 'posthog',
         fetch: async () => ++calls[name],
       })),
-      { sources: { posthog: { maxPerTick: 2 } } },
+      { sources: { posthog: { limit: { requests: 2, per: '1m' } } } },
     )
 
     const first = await fridge.runDue()
     expect(first.ran).toEqual(['p1', 'p2'])
-    expect(first.deferredBudget).toEqual(['p3'])
+    expect(first.throttled).toEqual(['p3'])
     expect(calls).toEqual({ p1: 1, p2: 1, p3: 0 })
+    // Refused before the claim, so nothing was written and nothing is leased.
+    expect(await store.readSchedule('p3')).toBeNull()
 
     await clock.advance(60_000)
     const second = await fridge.runDue()
     expect(second.ran).toEqual(['p3'])
-    expect(second.deferredBudget).toEqual([])
+    expect(second.throttled).toEqual([])
     expect(calls).toEqual({ p1: 1, p2: 1, p3: 1 })
   })
 
@@ -59,7 +61,7 @@ describe('runDue', () => {
         { name: 'hourly', every: '60m', source: 's', fetch: async () => 'h' },
         { name: 'fast', every: '5m', source: 's', fetch: async () => 'f' },
       ],
-      { clock: new FakeClock(1_000_000), sources: { s: { maxPerTick: 1 } } },
+      { clock: new FakeClock(1_000_000), sources: { s: { limit: { requests: 1, per: '1m' } } } },
     )
     await store.writeSchedule({
       name: 'hourly',
@@ -78,7 +80,7 @@ describe('runDue', () => {
 
     const report = await fridge.runDue()
     expect(report.ran).toEqual(['fast'])
-    expect(report.deferredBudget).toEqual(['hourly'])
+    expect(report.throttled).toEqual(['hourly'])
   })
 
   it('fixed-delay: a slow query reschedules from completion time, never piling up', async () => {
@@ -341,7 +343,7 @@ describe('runDue', () => {
     expect([...r1.failed, ...r2.failed]).toEqual([])
   })
 
-  it('RunReport: ran, skippedLeased, deferredBudget and failed are classified correctly', async () => {
+  it('RunReport: ran, skippedLeased, throttled and failed are classified correctly', async () => {
     const t0 = 1_000_000
     const clock = new FakeClock(t0)
     const { store, fridge } = makeHarness(
@@ -358,7 +360,7 @@ describe('runDue', () => {
         { name: 'old', every: '5m', source: 'limited', fetch: async () => 'old-data' },
         { name: 'newer', every: '5m', source: 'limited', fetch: async () => 'newer-data' },
       ],
-      { clock, sources: { limited: { maxPerTick: 1 } } },
+      { clock, sources: { limited: { limit: { requests: 1, per: '1m' } } } },
     )
     await store.claim('leased', 0, t0 + 100_000, t0)
     await store.writeSchedule({
@@ -380,7 +382,7 @@ describe('runDue', () => {
 
     expect(report.ran.toSorted()).toEqual(['ok', 'old'])
     expect(report.skippedLeased).toEqual(['leased'])
-    expect(report.deferredBudget).toEqual(['newer'])
+    expect(report.throttled).toEqual(['newer'])
     expect(report.failed).toEqual([{ name: 'boom', message: 'exploded' }])
   })
 })

@@ -9,6 +9,7 @@ function cloneEnvelope(env: Envelope): Envelope {
 export function memoryStore(): Store {
   const results = new Map<string, Envelope>()
   const rows = new Map<string, ScheduleRow>()
+  const quota = new Map<string, { windowStart: number; used: number }>()
 
   return {
     capabilities: { atomicClaim: true, listDue: true },
@@ -50,6 +51,20 @@ export function memoryStore(): Store {
       if (row.leaseUntil !== null && row.leaseUntil > now) return false
       row.version += 1
       row.leaseUntil = leaseUntil
+      return true
+    },
+
+    async takeQuota(source, limit, windowMs, now) {
+      const windowStart = Math.floor(now / windowMs) * windowMs
+      const ledger = quota.get(source)
+      // A window is never rewound: an executor whose clock lags must not reopen
+      // one its peers have already closed and hand out the quota twice.
+      const current =
+        ledger !== undefined && ledger.windowStart >= windowStart
+          ? ledger
+          : { windowStart, used: 0 }
+      if (current.used >= limit) return false
+      quota.set(source, { windowStart: current.windowStart, used: current.used + 1 })
       return true
     },
 

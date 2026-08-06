@@ -27,6 +27,8 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  * - claim fails on version mismatch or a live lease; a lease at or before `now` is expired
  * - when capabilities.atomicClaim: concurrent claims admit exactly one winner
  * - when capabilities.listDue: listDue returns rows with nextRunAt <= now, honoring limit
+ * - takeQuota counts per source in fixed epoch-aligned windows and never exceeds the limit
+ *   it was passed, which varies per call and is therefore never stored
  */
 export function storeContractSuite(label: string, makeStore: StoreFactory): void {
   describe(`store contract: ${label}`, () => {
@@ -177,6 +179,57 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
 
         const limited = await store.listDue(1_000, 2)
         expect(limited.map((r) => r.name)).toEqual(['late', 'later'])
+      })
+    })
+
+    describe('quota ledger', () => {
+      const WINDOW = 60_000
+
+      it('admits up to the limit within one window and refuses beyond it', async () => {
+        for (let i = 0; i < 3; i += 1) {
+          expect(await store.takeQuota('posthog', 3, WINDOW, 120_000 + i)).toBe(true)
+        }
+        expect(await store.takeQuota('posthog', 3, WINDOW, 150_000)).toBe(false)
+      })
+
+      it('refuses everything at a limit of zero without recording usage', async () => {
+        expect(await store.takeQuota('posthog', 0, WINDOW, 120_000)).toBe(false)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+      })
+
+      it('opens the next window at zero, on the epoch-aligned boundary', async () => {
+        expect(await store.takeQuota('posthog', 1, WINDOW, 179_999)).toBe(true)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 179_999)).toBe(false)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 180_000)).toBe(true)
+      })
+
+      it('never rewinds a window a later clock has already opened', async () => {
+        expect(await store.takeQuota('posthog', 1, WINDOW, 180_000)).toBe(true)
+        // An executor whose clock lags must not reopen the previous window and
+        // hand the same slot out twice.
+        expect(await store.takeQuota('posthog', 1, WINDOW, 179_999)).toBe(false)
+      })
+
+      it('honours the limit it is given on each call, rather than remembering one', async () => {
+        expect(await store.takeQuota('posthog', 10, WINDOW, 120_000)).toBe(true)
+        expect(await store.takeQuota('posthog', 10, WINDOW, 120_000)).toBe(true)
+        // Scheduled work sees a lower ceiling than a waiting reader does.
+        expect(await store.takeQuota('posthog', 2, WINDOW, 120_000)).toBe(false)
+        expect(await store.takeQuota('posthog', 3, WINDOW, 120_000)).toBe(true)
+      })
+
+      it('counts each source separately', async () => {
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(false)
+        expect(await store.takeQuota('stripe', 1, WINDOW, 120_000)).toBe(true)
+      })
+
+      it('admits exactly the limit under concurrent takes (atomicClaim stores)', async () => {
+        if (!store.capabilities.atomicClaim) return
+        const outcomes = await Promise.all(
+          Array.from({ length: 16 }, () => store.takeQuota('posthog', 5, WINDOW, 120_000)),
+        )
+        expect(outcomes.filter(Boolean)).toHaveLength(5)
       })
     })
   })

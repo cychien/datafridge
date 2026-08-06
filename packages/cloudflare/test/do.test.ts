@@ -201,7 +201,7 @@ describe('FridgeDO alarm loop', () => {
       {
         ran: ['alpha', 'beta'],
         skippedLeased: [],
-        deferredBudget: [],
+        throttled: [],
         failed: [],
       },
     ])
@@ -378,14 +378,14 @@ describe('FridgeDO alarm loop', () => {
     )
   })
 
-  it('rejects an invalid source budget at ignition instead of failing silently each alarm', async () => {
+  it('rejects an invalid source policy at ignition instead of failing silently each alarm', async () => {
     const stub = fridgeStub('invalid-source-budget')
     await configure(stub, [counting('budgeted', '1m')])
 
-    for (const maxPerTick of [0, -1, 1.5]) {
+    for (const requests of [0, -1, 1.5]) {
       const result = await runInDurableObject(stub, async (instance) => {
         const fridge = instance as TestFridge
-        fridge.sources = { posthog: { maxPerTick } }
+        fridge.sources = { posthog: { limit: { requests, per: '1m' } } }
         try {
           await fridge.ensureStarted()
           return null
@@ -395,7 +395,7 @@ describe('FridgeDO alarm loop', () => {
       })
       expect(result).toEqual({
         name: 'ConfigError',
-        message: "source 'posthog': maxPerTick must be a positive integer",
+        message: "source 'posthog': limit.requests must be a positive integer",
       })
     }
 
@@ -403,14 +403,14 @@ describe('FridgeDO alarm loop', () => {
     expect(await scheduleRows(stub)).toEqual([])
   })
 
-  it('accepts a valid source budget and defers the over-budget query to the next tick', async () => {
+  it('accepts a valid source policy and defers the throttled query to the next window', async () => {
     const stub = fridgeStub('valid-source-budget')
     await configure(stub, [
       { ...counting('first', '5m'), source: 'posthog' },
       { ...counting('second', '5m'), source: 'posthog' },
     ])
     await runInDurableObject(stub, async (instance) => {
-      ;(instance as TestFridge).sources = { posthog: { maxPerTick: 1 } }
+      ;(instance as TestFridge).sources = { posthog: { limit: { requests: 1, per: '1s' } } }
     })
 
     await stub.ensureStarted()
@@ -422,7 +422,7 @@ describe('FridgeDO alarm loop', () => {
       (instance as TestFridge).reports.map((report) => structuredClone(report)),
     )
     expect(reports[0]!.ran).toHaveLength(1)
-    expect(reports[0]!.deferredBudget).toHaveLength(1)
+    expect(reports[0]!.throttled).toHaveLength(1)
     expect(reports.flatMap((report) => report.ran).sort()).toEqual(['first', 'second'])
   })
 

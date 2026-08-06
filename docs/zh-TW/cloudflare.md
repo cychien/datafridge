@@ -72,7 +72,7 @@ export class Poller extends FridgeDO<Env> {
     console.log({
       ran: report.ran.length,
       skippedLeased: report.skippedLeased.length,
-      deferredBudget: report.deferredBudget.length,
+      throttled: report.throttled.length,
       failed: report.failed.length,
     })
   }
@@ -146,7 +146,7 @@ export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { analytics: { maxPerTick: 2 } },
+    sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
   }),
 }
 ```
@@ -193,10 +193,10 @@ ctx.waitUntil(writeSanitizedOperations(report))
 ## 建構時驗證
 
 - `defineQueries` 驗證 names、durations、fetchers、duplicate variants 與 `timeout < lease`。
-- `FridgeDO` 在啟動與每次 alarm 前驗證 registry、source budgets 與 Cloudflare wall-clock ceiling。
+- `FridgeDO` 在啟動與每次 alarm 前驗證 registry、source policies 與 Cloudflare wall-clock ceiling。
 - `cronFridge` 在建構時驗證 registry、store-factory shape、schedule-plane resolution 與 wall-clock ceiling。
 - Cloudflare query timeout 必須短於 15 分鐘。
-- Source budget 必須是正整數。
+- Source policy 必須宣告 `limit`、`maxConcurrent` 或兩者；`limit.requests`、`limit.per` 與 `maxConcurrent` 必須為正，`limit.reserve` 必須小於 `limit.requests`。
 
 ## 失敗與復原
 
@@ -206,7 +206,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 | Live lease | Identity 放入 `skippedLeased`，不重複 fetch | 立即回傳目前 envelope |
 | Executor 死亡 | Lease 過期後 reclaim | 立即回傳目前 envelope |
 | Zombie 遲到寫回 | Version mismatch 時拒絕 | 保持不變 |
-| Per-source budget 用完 | 保持 due，留待後續 tick | 立即回傳目前 envelope |
+| Per-source 額度用完 | 保持 due 且更過期，留待後續 tick | 立即回傳目前 envelope；miss 時為 `status: 'throttled'` |
 | 尚未成功 refresh | 繼續 scheduled attempts | 回傳 `null` |
 | Alarm-level error | 在 `finally` 排定下一個 alarm | 既有 D1 envelopes 仍可讀 |
 

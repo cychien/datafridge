@@ -8,6 +8,7 @@ storeContractSuite('d1', async () => {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM datafridge_results'),
     env.DB.prepare('DELETE FROM datafridge_schedule'),
+    env.DB.prepare('DELETE FROM datafridge_quota'),
   ])
   return d1(env.DB)
 })

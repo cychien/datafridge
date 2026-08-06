@@ -72,7 +72,7 @@ export class Poller extends FridgeDO<Env> {
     console.log({
       ran: report.ran.length,
       skippedLeased: report.skippedLeased.length,
-      deferredBudget: report.deferredBudget.length,
+      throttled: report.throttled.length,
       failed: report.failed.length,
     })
   }
@@ -146,7 +146,7 @@ export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { analytics: { maxPerTick: 2 } },
+    sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
   }),
 }
 ```
@@ -193,10 +193,10 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 ## Construction-time validation
 
 - `defineQueries` validates names, durations, fetchers, duplicate variants, and `timeout < lease`.
-- `FridgeDO` validates its registry, source budgets, and the Cloudflare wall-clock ceiling during ignition and before alarms.
+- `FridgeDO` validates its registry, source policies, and the Cloudflare wall-clock ceiling during ignition and before alarms.
 - `cronFridge` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
-- Source budgets must be positive integers.
+- A source policy must declare a `limit`, a `maxConcurrent`, or both; `limit.requests`, `limit.per` and `maxConcurrent` must be positive, and `limit.reserve` must be smaller than `limit.requests`.
 
 ## Failure and recovery
 
@@ -206,7 +206,7 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 | Live lease | Put the identity in `skippedLeased`; no duplicate fetch | Return the current envelope immediately |
 | Executor death | Reclaim after lease expiry | Return the current envelope immediately |
 | Late zombie write | Reject on version mismatch | Remain unchanged |
-| Per-source budget exhausted | Keep due for a later tick | Return the current envelope immediately |
+| Per-source quota exhausted | Keep due for a later tick, more overdue | Return the current envelope; on a miss, `status: 'throttled'` |
 | No successful refresh yet | Continue scheduled attempts | Return `null` |
 | Alarm-level error | Schedule the next alarm in `finally` | Existing D1 envelopes remain readable |
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { ConfigError, createReader } from '../src/index.js'
-import { makeHarness, resultsOnly } from './helpers.js'
+import { makeHarness, resultsOnly, stored } from './helpers.js'
 
 describe('read() contract', () => {
   it('serves the first read itself rather than answering null', async () => {
@@ -77,7 +77,7 @@ describe('read() contract', () => {
     await clock.advance(300_000)
     await fridge.runDue()
 
-    expect((await fridge.read('q'))?.lastError).toEqual({
+    expect(stored(await fridge.read('q'))?.lastError).toEqual({
       at: 300_000,
       message: 'upstream 500',
       count: 1,

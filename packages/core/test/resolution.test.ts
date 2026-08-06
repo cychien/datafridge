@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { ConfigError, createFridge, defineQueries, FakeClock, memoryStore } from '../src/index.js'
-import type { Store } from '../src/index.js'
+import type { SourcePolicy, Store } from '../src/index.js'
 import { makeDriver, scheduleOnly } from './helpers.js'
 
 const queries = defineQueries([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
@@ -163,18 +163,32 @@ describe('createFridge config validation', () => {
     ).toThrow(/clock/)
   })
 
-  it('rejects invalid source budgets', () => {
-    for (const maxPerTick of [0, -1, 1.5, NaN]) {
-      expect(() =>
-        createFridge({
-          store: memoryStore(),
-          driver: makeDriver(),
-          queries,
-          clock: clock(),
-          sources: { posthog: { maxPerTick } },
-        }),
-      ).toThrow(/maxPerTick/)
+  it('rejects invalid source policies', () => {
+    const build = (policy: SourcePolicy) =>
+      createFridge({
+        store: memoryStore(),
+        driver: makeDriver(),
+        queries,
+        clock: clock(),
+        sources: { posthog: policy },
+      })
+
+    for (const requests of [0, -1, 1.5, NaN]) {
+      expect(() => build({ limit: { requests, per: '1m' } })).toThrow(/limit\.requests/)
     }
+    for (const maxConcurrent of [0, -1, 1.5, NaN]) {
+      expect(() => build({ maxConcurrent })).toThrow(/maxConcurrent/)
+    }
+    expect(() => build({ limit: { requests: 10, per: '0s' } })).toThrow(/limit\.per/)
+    expect(() => build({ limit: { requests: 10, per: '1m', reserve: -1 } })).toThrow(
+      /limit\.reserve/,
+    )
+    // A reserve that swallows the whole window would freeze scheduled refreshes
+    // out forever, which is a configuration mistake, not a policy.
+    expect(() => build({ limit: { requests: 10, per: '1m', reserve: 10 } })).toThrow(
+      /must be smaller than/,
+    )
+    expect(() => build({})).toThrow(/limits nothing/)
   })
 
   it('validates raw query defs passed without defineQueries', () => {

@@ -8,7 +8,7 @@ import {
   queryKey,
 } from '../src/index.js'
 import type { QueryCodec } from '../src/index.js'
-import { makeHarness, resultsOnly } from './helpers.js'
+import { makeHarness, resultsOnly, stored } from './helpers.js'
 
 const mapCodec: QueryCodec<Map<string, number>> = {
   encode: (value) => ({ rows: [...value] }),
@@ -35,7 +35,7 @@ describe('codec', () => {
       ],
     })
 
-    const read = await fridge.read<Map<string, number>>('views')
+    const read = stored(await fridge.read<Map<string, number>>('views'))
     expect(read!.data).toBeInstanceOf(Map)
     expect(read!.data.get('/b')).toBe(7)
   })
@@ -81,7 +81,7 @@ describe('codec', () => {
 
     const report = await fridge.runDue()
     expect(report.failed).toEqual([{ name: 'views', message: 'not serializable' }])
-    expect((await fridge.read<string>('views'))!.data).toBe('v1')
+    expect(stored(await fridge.read<string>('views'))!.data).toBe('v1')
     expect((await store.readSchedule('views'))!.failCount).toBe(1)
   })
 
@@ -105,7 +105,7 @@ describe('codec', () => {
         ['/b', 7],
       ],
     })
-    const read = await fridge.read<Map<string, number>>('per-course', { courseId: 'alpha' })
+    const read = stored(await fridge.read<Map<string, number>>('per-course', { courseId: 'alpha' }))
     expect(read!.data).toBeInstanceOf(Map)
   })
 
@@ -126,6 +126,6 @@ describe('codec', () => {
     const { store, fridge } = makeHarness([{ name: 'plain', every: '5m', fetch: async () => 'v1' }])
     await fridge.runDue()
     expect((await store.readResult('plain'))!.data).toBe('v1')
-    expect((await fridge.read<string>('plain'))!.data).toBe('v1')
+    expect(stored(await fridge.read<string>('plain'))!.data).toBe('v1')
   })
 })

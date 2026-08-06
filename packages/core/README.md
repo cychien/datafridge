@@ -1,6 +1,6 @@
 # @datafridge/core
 
-The zero-runtime-dependency engine for [datafridge](https://github.com/cychien/datafridge): proactive refresh, finite parameter variants, stale-if-error reads, leases, backoff, and per-source budgets.
+The zero-runtime-dependency engine for [datafridge](https://github.com/cychien/datafridge): proactive refresh, finite parameter variants, stale-if-error reads, leases, backoff, and per-source rate limits.
 
 ```sh
 pnpm add @datafridge/core

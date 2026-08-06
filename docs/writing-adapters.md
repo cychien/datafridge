@@ -21,6 +21,9 @@ interface Store {
   deleteSchedule(name: string): Promise<void>
   // atomic claim: succeeds only if version matches and the lease has expired
   claim(name: string, expectedVersion: number, leaseUntil: number, now: number): Promise<boolean>
+  // source rate limiting: count one call in the fixed window containing `now`,
+  // and answer whether it fit under `limit`
+  takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // optional capability: SQL backends can fetch all due rows in one query;
   // without it, core reads row by row
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
@@ -48,6 +51,8 @@ The two halves still have different consistency needs, and one shipped case prov
 | memoryStore | synchronous within one process |
 
 A backend with no conditional-write primitive cannot host the schedule half at all, and one that is only eventually consistent cannot host it correctly. Such a backend declares `atomicClaim: false`, which construction accepts only under a serialized driver.
+
+`takeQuota` uses the same primitive. Windows are fixed and aligned to the epoch - the one containing `now` starts at `floor(now / windowMs) * windowMs` and opens with a usage of zero - and a window is never rewound, so an executor whose clock lags cannot reopen one its peers have closed. `limit` arrives per call and is never stored: callers pass a lower one for work nobody is waiting on. One row per source is enough, so there is nothing to garbage-collect. Putting it in the store is what makes a shared rate limit free: two services pointing at one backend share one ledger, with no separate limiter to run.
 
 ## Where the schedule half comes from (decided at config time)
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { defineQueries, memoryStore } from '../src/index.js'
-import type { QueryDef, Store } from '../src/index.js'
+import type { QueryDef, SourcePolicy, Store } from '../src/index.js'
 import { makeHarness } from './helpers.js'
 
 function tracing(inner: Store, log: string[]): Store {
@@ -19,6 +19,8 @@ function tracing(inner: Store, log: string[]): Store {
     deleteSchedule: (name) => note('deleteSchedule', name, () => inner.deleteSchedule(name)),
     claim: (name, expectedVersion, leaseUntil, now) =>
       note('claim', name, () => inner.claim(name, expectedVersion, leaseUntil, now)),
+    takeQuota: (source, limit, windowMs, now) =>
+      note('takeQuota', source, () => inner.takeQuota(source, limit, windowMs, now)),
     listDue: (now, limit) => note('listDue', '*', () => inner.listDue!(now, limit)),
   }
 }
@@ -62,6 +64,36 @@ describe('the dispatcher is the only exit to upstream', () => {
     ])
     expect(dispatchOf(demandLog)).toEqual(dispatchOf(scheduledLog))
     expect(demandLog.filter((op) => op === 'claim:q')).toHaveLength(1)
+  })
+
+  it('meters both doors at the same gate, before either takes a lease', async () => {
+    const sources: Record<string, SourcePolicy> = {
+      posthog: { limit: { requests: 5, per: '1m' } },
+    }
+    const metered = (fetch: () => Promise<string>): QueryDef[] => [
+      { ...query(fetch)[0]!, source: 'posthog' },
+    ]
+
+    const scheduledLog: string[] = []
+    const scheduled = makeHarness(defineQueries(metered(async () => 'v1')), {
+      store: tracing(memoryStore(), scheduledLog),
+      sources,
+    })
+    await scheduled.fridge.runDue()
+
+    const demandLog: string[] = []
+    const demand = makeHarness(defineQueries(metered(async () => 'v1')), {
+      store: tracing(memoryStore(), demandLog),
+      sources,
+    })
+    const read = demand.fridge.read('q')
+    await demand.clock.advance(0)
+    await read
+
+    for (const log of [scheduledLog, demandLog]) {
+      expect(log.filter((op) => op === 'takeQuota:posthog')).toHaveLength(1)
+      expect(log.indexOf('takeQuota:posthog')).toBeLessThan(log.indexOf('claim:q'))
+    }
   })
 
   it('a failed read miss backs off exactly as a failed tick does', async () => {

@@ -6,11 +6,13 @@ export { defineParameterizedQuery, defineQueries, Queries } from './define-queri
 export type { DynamicVariants } from './define-queries.js'
 export { createFridge } from './engine.js'
 export type { Fridge, FridgeConfig } from './engine.js'
-export { ConfigError, TimeoutError } from './errors.js'
+export { ConfigError, RateLimitError, TimeoutError } from './errors.js'
 export { memoryStore } from './memory-store.js'
 export { queryKey, variantBaseOf, VARIANT_KEY_PREFIX } from './query-key.js'
 export { createReader } from './reader.js'
 export type { Reader, ReaderConfig } from './reader.js'
+export { resolveSources } from './sources.js'
+export type { ResolvedSource, ResolvedSources } from './sources.js'
 export { systemClock } from './system-clock.js'
 export type {
   DimensionValues,
@@ -30,8 +32,10 @@ export type {
   RunReport,
   ScheduleRow,
   SchedulePlane,
-  SourceBudget,
+  SourceLimit,
+  SourcePolicy,
   Store,
   StoreCapabilities,
+  ThrottledRead,
   ValidityCtx,
 } from './types.js'

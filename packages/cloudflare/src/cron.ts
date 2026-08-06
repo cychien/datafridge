@@ -1,5 +1,5 @@
-import { ConfigError, createFridge, defineQueries, Queries } from '@datafridge/core'
-import type { Driver, QueryDefinition, RunReport, SourceBudget, Store } from '@datafridge/core'
+import { ConfigError, createFridge, defineQueries, Queries, resolveSources } from '@datafridge/core'
+import type { Driver, QueryDefinition, RunReport, SourcePolicy, Store } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
 
 /**
@@ -14,7 +14,7 @@ export function cronDriver(ctx: ExecutionContext): Driver {
 export interface CronFridgeConfig<Env> {
   queries: Queries | readonly QueryDefinition[]
   store: (env: Env) => Store
-  sources?: Record<string, SourceBudget>
+  sources?: Record<string, SourcePolicy>
   /**
    * Operational hook after each tick. Do not log payloads or error details:
    * they come from application fetchers. A throwing hook is absorbed so one
@@ -45,6 +45,7 @@ export function cronFridge<Env>(config: CronFridgeConfig<Env>): CronScheduledHan
   if (typeof config.store !== 'function') {
     throw new ConfigError('cronFridge requires a store: pass store: (env) => d1(env.DB)')
   }
+  resolveSources(config.sources)
   return async (_controller, env, ctx) => {
     const report = await createFridge({
       queries,

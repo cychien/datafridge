@@ -16,6 +16,7 @@ beforeEach(async () => {
   await env.DB.batch([
     env.DB.prepare('DROP TABLE IF EXISTS datafridge_results'),
     env.DB.prepare('DROP TABLE IF EXISTS datafridge_schedule'),
+    env.DB.prepare('DROP TABLE IF EXISTS datafridge_quota'),
   ])
 })
 
@@ -77,6 +78,7 @@ describe('d1 applies its own schema', () => {
     await env.DB.batch([
       env.DB.prepare('DROP TABLE datafridge_results'),
       env.DB.prepare('DROP TABLE datafridge_schedule'),
+      env.DB.prepare('DROP TABLE datafridge_quota'),
     ])
 
     await invoke(handler)

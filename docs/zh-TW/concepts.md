@@ -26,7 +26,7 @@ datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的�
 ├──────────────────────────────────────────────┤
 │  Core - pure logic, zero deps, no IO,         │
 │  injected clock: registry, due computation,   │
-│  priority, budget, backoff, lease, staleness  │
+│  priority, quota, backoff, lease, staleness   │
 ├──────────────────────────────────────────────┤
 │  Store - where results and schedule state live│
 │  wave 1: D1                                   │
@@ -101,8 +101,9 @@ runDue(now):
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
                         5m query's period but only 0.07 of a 60m query's)
-3. Apply budget         group by source, take the top maxPerTick per group;
-                        squeezed-out queries stay due and are picked up next tick
+3. Take quota           one call against the source's ledger for the current
+                        window, minus whatever `reserve` holds back for readers;
+                        refused queries stay due and come back more overdue
 4. Claim lease          claim(name, version, now + timeout + margin);
                         losing the claim means someone else is on it - skip
 5. Execute + write back concurrently (Promise.allSettled), each fetch wrapped
@@ -111,14 +112,15 @@ runDue(now):
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, deferredBudget, failed }
+Returns RunReport { ran, skippedLeased, throttled, failed }
 ```
 
 關鍵決策：
 
 - **Fixed-delay 語意。** 下一輪從完成時間起算。慢 query 自然自我放慢，永遠不會排在自己後面堆積。
 - **Backoff。** `min(every, 1m * 2^(failCount - 1))` 加 jitter，上限收在 `every`，因為比正常週期更慢地重試沒有意義。
-- **Jitter。** 首次註冊時給 `nextRunAt` 加隨機偏移，讓整數倍週期的 queries 永遠不會固定對齊同一個 tick、集體衝撞同一個 source 的預算。預算是保險絲，jitter 讓保險絲平常不用燒。
+- **Jitter。** 首次註冊時給 `nextRunAt` 加隨機偏移，讓整數倍週期的 queries 永遠不會固定對齊同一個 tick、集體衝撞同一個 source。Ledger 是保險絲，jitter 讓保險絲平常不用燒。
+- **只有一個上游出口。** 第 3 到 5 步就是 dispatcher，而讀取時發現沒資料的抓取，進入點完全相同。沒有第二條路，所以一條 rate limit 不可能只對其中一種呼叫成立。
 - **三道防線各守一關**：`nextRunAt` 管「該不該做」、lease 管「誰在做」、version 管「誰的結果算數」。慢速、崩潰、zombie 各打穿一關，下一關接住。
 
 ### 慢 query 的逐分鐘時間軸
@@ -146,5 +148,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | 執行者中途暴斃 | 租約過期後下個 tick 重撿（at-least-once） | 舊資料 + `isStale` |
 | Zombie 遲到寫回 | version 不符，寫入被拒 | 不受影響 |
 | 首輪尚未完成 | - | `null`（caller 應處理） |
-| 被預算擠掉 | 保持到期，下個 tick 優先（過期比例升高） | 舊資料，稍舊一點 |
+| Source 額度用完 | 保持到期，下個 tick 優先（過期比例升高） | 舊資料；miss 時為 `status: 'throttled'` |
 | 連續失敗 | backoff 收斂在 `every`，永久保留 last-known-good | 舊資料 + 可見的 `lastError` |

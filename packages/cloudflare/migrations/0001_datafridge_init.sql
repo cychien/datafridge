@@ -1,4 +1,4 @@
--- datafridge D1 schema: result plane + schedule plane.
+-- datafridge D1 schema: result plane + schedule plane + source quota ledger.
 -- Apply with `wrangler d1 migrations apply <DB>` after pointing your database's
 -- migrations_dir at this package's migrations/ directory, or copy this file
 -- into your own migrations pipeline.
@@ -18,3 +18,10 @@ CREATE TABLE IF NOT EXISTS datafridge_schedule (
 
 CREATE INDEX IF NOT EXISTS idx_datafridge_schedule_next_run_at
   ON datafridge_schedule (next_run_at);
+
+CREATE TABLE IF NOT EXISTS datafridge_quota (
+  source TEXT PRIMARY KEY,
+  window_start INTEGER NOT NULL,
+  used INTEGER NOT NULL,
+  version INTEGER NOT NULL
+);

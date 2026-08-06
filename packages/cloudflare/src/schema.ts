@@ -15,4 +15,6 @@ export const D1_SCHEMA: readonly string[] = [
     'lease_until INTEGER, version INTEGER NOT NULL)',
   'CREATE INDEX IF NOT EXISTS idx_datafridge_schedule_next_run_at ' +
     'ON datafridge_schedule (next_run_at)',
+  'CREATE TABLE IF NOT EXISTS datafridge_quota (source TEXT PRIMARY KEY, ' +
+    'window_start INTEGER NOT NULL, used INTEGER NOT NULL, version INTEGER NOT NULL)',
 ]

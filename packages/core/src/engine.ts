@@ -8,6 +8,7 @@ import { ConfigError } from './errors.js'
 import { planTick, virtualRow } from './planner.js'
 import { queryKey, variantBaseOf } from './query-key.js'
 import { decodeRead, shapeRead, waitForEnvelope } from './reader.js'
+import { resolveSources } from './sources.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
@@ -18,8 +19,9 @@ import type {
   RunReport,
   SchedulePlane,
   ScheduleRow,
-  SourceBudget,
+  SourcePolicy,
   Store,
+  ThrottledRead,
 } from './types.js'
 
 export interface FridgeConfig {
@@ -27,23 +29,26 @@ export interface FridgeConfig {
   driver: Driver
   store: Store
   clock?: Clock
-  sources?: Record<string, SourceBudget>
+  sources?: Record<string, SourcePolicy>
   random?: () => number
 }
 
 export interface Fridge {
   runDue(now?: number): Promise<RunReport>
-  read<T = unknown>(name: string, params?: QueryParams): Promise<ReadResult<T> | null>
+  read<T = unknown>(
+    name: string,
+    params?: QueryParams,
+  ): Promise<ReadResult<T> | ThrottledRead | null>
 }
 
 export function createFridge(config: FridgeConfig): Fridge {
   const queries = config.queries instanceof Queries ? config.queries : defineQueries(config.queries)
   const driver = validateDriver(config.driver)
   const clock = validateClock(config.clock ?? systemClock)
-  const sources = validateSources(config.sources)
+  const sources = resolveSources(config.sources)
   const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
-  const dispatcher = createDispatcher({ store, schedule, clock, random })
+  const dispatcher = createDispatcher({ store, schedule, clock, random, sources })
 
   interface EffectiveRegistry {
     list: readonly ResolvedQuery[]
@@ -182,7 +187,7 @@ export function createFridge(config: FridgeConfig): Fridge {
     query: ResolvedQuery,
     key: string,
     deadline: number,
-  ): Promise<ReadResult<T> | null> => {
+  ): Promise<ReadResult<T> | ThrottledRead | null> => {
     const start = clock.now()
     const row = (await schedule.readSchedule(key)) ?? virtualRow(key, start)
     const leaseHeld = row.leaseUntil !== null && row.leaseUntil > start
@@ -194,7 +199,7 @@ export function createFridge(config: FridgeConfig): Fridge {
 
       let outcome: DispatchOutcome | undefined
       const running = dispatcher
-        .run({ query, row, priority: 'demand' }, start)
+        .run({ query, row, priority: 'demand', deadline }, start)
         .then((result) => {
           outcome = result
         })
@@ -205,6 +210,9 @@ export function createFridge(config: FridgeConfig): Fridge {
       if (outcome.status === 'ran') {
         return shapeRead<T>(await store.readResult(key), clock.now())
       }
+      // The source is spent for this window. The row stays due, so the next
+      // tick picks the work up and the reader after this one finds it there.
+      if (outcome.status === 'throttled') return { status: 'throttled', retryAt: outcome.retryAt }
       // Lost the claim to an executor that got there first: wait for it.
     }
 
@@ -246,10 +254,9 @@ export function createFridge(config: FridgeConfig): Fridge {
           effective.list.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
         ),
       )
-      const { toRun, deferredBudget } = planTick(effective.list, rowsByName, now, sources)
+      const toRun = planTick(effective.list, rowsByName, now)
       const report = emptyReport()
       report.failed.push(...effective.failures)
-      report.deferredBudget.push(...deferredBudget)
       await Promise.allSettled(
         toRun.map(async (candidate) => {
           const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
@@ -259,7 +266,10 @@ export function createFridge(config: FridgeConfig): Fridge {
       return report
     },
 
-    async read<T>(name: string, params?: QueryParams): Promise<ReadResult<T> | null> {
+    async read<T>(
+      name: string,
+      params?: QueryParams,
+    ): Promise<ReadResult<T> | ThrottledRead | null> {
       const key = queryKey(name, params)
       let query = queries.getByKey(key)
       const dynamic = query ? undefined : queries.dynamicFor(name)
@@ -278,7 +288,9 @@ export function createFridge(config: FridgeConfig): Fridge {
         query = await resolveMemberBy(dynamic!, key, clock, deadline)
         if (!query) throw new ConfigError(`unknown query '${name}'`)
       }
-      return decodeRead(await readThrough<T>(query, key, deadline), codec)
+      const fetched = await readThrough<T>(query, key, deadline)
+      if (fetched !== null && fetched.status === 'throttled') return fetched
+      return decodeRead(fetched, codec)
     },
   }
 }
@@ -286,11 +298,12 @@ export function createFridge(config: FridgeConfig): Fridge {
 function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome): void {
   if (outcome.status === 'ran') report.ran.push(name)
   else if (outcome.status === 'leased') report.skippedLeased.push(name)
+  else if (outcome.status === 'throttled') report.throttled.push(name)
   else report.failed.push({ name, message: outcome.message })
 }
 
 function emptyReport(): RunReport {
-  return { ran: [], skippedLeased: [], deferredBudget: [], failed: [] }
+  return { ran: [], skippedLeased: [], throttled: [], failed: [] }
 }
 
 function errorMessage(err: unknown): string {
@@ -320,17 +333,6 @@ function validateClock(clock: Clock): Clock {
     throw new ConfigError('clock must provide { now, setTimeout, clearTimeout }')
   }
   return clock
-}
-
-function validateSources(
-  sources: Record<string, SourceBudget> | undefined,
-): Record<string, SourceBudget> | undefined {
-  for (const [source, budget] of Object.entries(sources ?? {})) {
-    if (!Number.isInteger(budget.maxPerTick) || budget.maxPerTick < 1) {
-      throw new ConfigError(`source '${source}': maxPerTick must be a positive integer`)
-    }
-  }
-  return sources
 }
 
 function resolveStores(

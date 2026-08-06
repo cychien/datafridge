@@ -1,11 +1,17 @@
 import { DurableObject } from 'cloudflare:workers'
-import { ConfigError, createFridge, defineQueries, Queries, variantBaseOf } from '@datafridge/core'
+import {
+  createFridge,
+  defineQueries,
+  Queries,
+  resolveSources,
+  variantBaseOf,
+} from '@datafridge/core'
 import type {
   QueryDefinition,
   RunReport,
   SchedulePlane,
   ScheduleRow,
-  SourceBudget,
+  SourcePolicy,
   Store,
 } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
@@ -24,6 +30,11 @@ const BOOKKEEPING_SCHEMA = `
   CREATE TABLE IF NOT EXISTS datafridge_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS datafridge_quota (
+    source TEXT PRIMARY KEY,
+    window_start INTEGER NOT NULL,
+    used INTEGER NOT NULL
   );
 `
 
@@ -102,6 +113,30 @@ function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
       return true
     },
 
+    async takeQuota(source, limit, windowMs, now) {
+      const windowStart = Math.floor(now / windowMs) * windowMs
+      const record = sql
+        .exec<{
+          window_start: number
+          used: number
+        }>('SELECT window_start, used FROM datafridge_quota WHERE source = ?', source)
+        .toArray()[0]
+      // A window is never rewound: this object may be the only executor, but a
+      // clock that steps backwards must not reopen a window it already closed.
+      const openWindow = Math.max(record?.window_start ?? windowStart, windowStart)
+      const used = record !== undefined && record.window_start === openWindow ? record.used : 0
+      if (used >= limit) return false
+      sql.exec(
+        'INSERT INTO datafridge_quota (source, window_start, used) VALUES (?, ?, ?) ' +
+          'ON CONFLICT (source) DO UPDATE SET window_start = excluded.window_start, ' +
+          'used = excluded.used',
+        source,
+        openWindow,
+        used + 1,
+      )
+      return true
+    },
+
     async listDue(now, limit) {
       return sql
         .exec<ScheduleRecord>(
@@ -113,14 +148,6 @@ function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
         .toArray()
         .map(toScheduleRow)
     },
-  }
-}
-
-function validateSourceBudgets(sources: Record<string, SourceBudget> | undefined): void {
-  for (const [source, budget] of Object.entries(sources ?? {})) {
-    if (!Number.isInteger(budget.maxPerTick) || budget.maxPerTick < 1) {
-      throw new ConfigError(`source '${source}': maxPerTick must be a positive integer`)
-    }
   }
 }
 
@@ -146,7 +173,7 @@ function registrySignature(queries: Queries): string {
 export abstract class FridgeDO<Env = unknown> extends DurableObject<Env> {
   abstract queries: Queries | readonly QueryDefinition[]
   abstract store(env: Env): Store
-  sources?: Record<string, SourceBudget>
+  sources?: Record<string, SourcePolicy>
 
   protected onRunReport(_report: RunReport): void | Promise<void> {}
 
@@ -209,7 +236,7 @@ export abstract class FridgeDO<Env = unknown> extends DurableObject<Env> {
     const queries = this.queries
     const resolved = queries instanceof Queries ? queries : defineQueries(queries)
     assertTimeoutsFitInvocation(resolved, 'Durable Object alarm')
-    validateSourceBudgets(this.sources)
+    resolveSources(this.sources)
     return resolved
   }
 

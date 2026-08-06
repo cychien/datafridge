@@ -21,6 +21,9 @@ interface Store {
   deleteSchedule(name: string): Promise<void>
   // atomic claim: succeeds only if version matches and the lease has expired
   claim(name: string, expectedVersion: number, leaseUntil: number, now: number): Promise<boolean>
+  // source rate limiting: count one call in the fixed window containing `now`,
+  // and answer whether it fit under `limit`
+  takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // optional capability: SQL backends can fetch all due rows in one query;
   // without it, core reads row by row
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
@@ -48,6 +51,8 @@ interface Store {
 | memoryStore | 單 process 內同步 |
 
 沒有條件寫入原語的後端根本無法承擔排程那一半；只有最終一致性的後端則無法正確承擔。這種後端會宣告 `atomicClaim: false`，而建構只在 serialized driver 之下才接受它。
+
+`takeQuota` 用的是同一個原語。窗口固定且對齊 epoch - 包含 `now` 的那個從 `floor(now / windowMs) * windowMs` 開始，並從零開起 - 而且窗口永不倒退，所以時鐘落後的 executor 無法重開一個同儕已經關掉的窗。`limit` 每次呼叫都帶進來、從不儲存：對沒有人在等的工作，呼叫端會傳一個比較低的值。每個 source 一列就夠，所以沒有東西需要 GC。把它放進 store，是共用 rate limit 免費的原因：兩個服務指向同一個後端就共用一份 ledger，不需要另外跑一個 limiter。
 
 ## 排程那一半從哪來（建構時就決定）
 

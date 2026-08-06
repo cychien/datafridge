@@ -87,7 +87,7 @@ const fridge = createFridge({
   queries,
   driver,
   store,
-  sources: { analytics: { maxPerTick: 2 } },
+  sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
 })
 
 const report = await fridge.runDue()
@@ -102,15 +102,17 @@ const value = await fridge.read<Result>('analytics-7d')
 
 選用欄位為 `sources`、`clock` 與 `random`。`clock` 和 `random` 供 deterministic adapter 與 test 使用。規則見 [排程那一半從哪來](./writing-adapters.md#排程那一半從哪來建構時就決定)。
 
-Missing 或 malformed driver、缺少任一半的 store、非法 source budget，以及在 non-serialized driver 下無法原子 claim 的 store，都會在建構時被拒絕。
+Missing 或 malformed driver、缺少任一半的 store、非法 source policy，以及在 non-serialized driver 下無法原子 claim 的 store，都會在建構時被拒絕。
 
-`runDue(now?)` 會 reconcile registry、選擇到期工作、套用 per-source budgets、claim leases、concurrently 執行 fetchers，並回傳：
+`sources` 宣告每個 source 能承受什麼。`limit` 是硬天花板，記在 store 的 quota ledger 裡、由所有 executor 共用；`reserve` 從每個窗口保留一部分不給排程刷新，讓等待中的讀者仍然過得去；`maxConcurrent` 限制單一 instance 在途的呼叫數。見 [rate limiting](./rate-limiting.md)。
+
+`runDue(now?)` 會 reconcile registry、以最過期優先選擇到期工作、對每個 source 的 ledger 計數、claim leases、concurrently 執行 fetchers，並回傳：
 
 ```ts
 interface RunReport {
   ran: string[]
   skippedLeased: string[]
-  deferredBudget: string[]
+  throttled: string[]
   failed: Array<{ name: string; message: string }>
 }
 ```
@@ -129,6 +131,15 @@ await fridge.read('course-analytics', { courseId: 'course-a', window: '7d' })
 - **沒資料** - 當下去抓，最多等該 query 自己的 `timeout` 那麼久。沒有東西要設定：一個 query，一個「最多多久」的答案。
 
 Fridge 在沒有人持有 lease 時自己抓，有人持有就等那個人，所以同時來多少讀者都只有一次上游呼叫 - 和讓併發 tick 只跑一次的是同一個 lease。Query 正處於 backoff 之間時直接回 `null`，不為一個不會來的東西等待；到達 timeout 時，那次抓取會像在排程 tick 上一樣被 abort 並記為失敗，讀取則回 `null`。
+
+Source 額度用完時的 miss 回傳第三種 status，而不是 `null` - 因為「還沒輪到你」不等於「沒有這個東西」：
+
+```ts
+const result = await fridge.read<Result>('analytics-7d')
+if (result?.status === 'throttled') return retryAfter(result.retryAt)
+```
+
+`createReader` 永遠不會產生它：reader 沒有 fetcher，它做的事沒有一件會被限流。
 
 ### Reader
 
@@ -166,7 +177,7 @@ interface ReadResult<T> {
 - `memoryStore()` 回傳 reference full `Store` implementation。
 - `storeContractSuite(label, factory)` 從 `@datafridge/core/contract-tests` 匯出，供 Vitest adapter compatibility tests 使用。
 - `FakeClock` 與 `flushMicrotasks` 支援 deterministic tests。
-- `parseDuration`、`queryKey`、`systemClock`、`ConfigError` 與 `TimeoutError` 是 public utilities。
+- `parseDuration`、`queryKey`、`systemClock`、`resolveSources`、`ConfigError`、`TimeoutError` 與 `RateLimitError` 是 public utilities。Adapter 用 `resolveSources` 在自己的建構時就擋下非法的 source policy。
 - Store 與 engine interfaces 都以 TypeScript types 從 package root 匯出。
 
 `@datafridge/core` 沒有 runtime dependency。只有匯入 `@datafridge/core/contract-tests` 時才需要選用的 `vitest` peer。
@@ -189,7 +200,7 @@ Subclass `FridgeDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提�
 ```ts
 class Poller extends FridgeDO<Env> {
   queries = queries
-  sources = { analytics: { maxPerTick: 2 } }
+  sources = { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } }
 
   store(env: Env) {
     return d1(env.DB)
@@ -205,7 +216,7 @@ class Poller extends FridgeDO<Env> {
 
 `ensureStarted(namespace, instanceName?)` 會 idempotently 啟動一個具名 `FridgeDO` instance。預設 instance name 是 `datafridge`。
 
-Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及每次 alarm 前驗證。`timeout` 必須短於 15 分鐘，每個 `maxPerTick` 必須是正整數。
+Registry、source policies 與 Cloudflare timeout ceiling 會在 object 啟動及每次 alarm 前驗證。`timeout` 必須短於 15 分鐘。
 
 ### D1 stores
 
@@ -222,7 +233,7 @@ export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { analytics: { maxPerTick: 2 } },
+    sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
   }),
 }
 ```

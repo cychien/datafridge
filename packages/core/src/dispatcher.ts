@@ -1,30 +1,38 @@
-import { backoffMs, firstRunJitterMs } from './backoff.js'
+import { backoffMs, firstRunJitterMs, retryAfterMs } from './backoff.js'
 import type { Clock } from './clock.js'
 import { withDeadline } from './deadline.js'
-import { ConfigError } from './errors.js'
+import { RateLimitError, ConfigError } from './errors.js'
+import { windowStartOf } from './sources.js'
+import type { ResolvedSource, ResolvedSources } from './sources.js'
 import type { Envelope, ResolvedQuery, SchedulePlane, ScheduleRow, Store } from './types.js'
 
-export interface FetchTask {
+export type FetchTask = {
   query: ResolvedQuery
   /** The schedule row as the caller observed it; its version is the CAS expectation. */
   row: ScheduleRow
-  /** 'demand' means a reader is waiting on this call. */
-  priority: 'demand' | 'scheduled'
-}
+} & (
+  | { priority: 'scheduled' }
+  /** A reader is waiting, and stops waiting at `deadline`. */
+  | { priority: 'demand'; deadline: number }
+)
 
 export type DispatchOutcome =
-  { status: 'ran' } | { status: 'leased' } | { status: 'failed'; message: string }
+  | { status: 'ran' }
+  | { status: 'leased' }
+  | { status: 'throttled'; retryAt: number }
+  | { status: 'failed'; message: string }
 
 export interface DispatcherConfig {
   store: Store
   schedule: SchedulePlane
   clock: Clock
   random: () => number
+  sources: ResolvedSources
 }
 
 /**
  * The single exit to upstream. Scheduled refreshes and read-miss fetches are
- * the same work arriving through different doors, so coalescing, execution,
+ * the same work arriving through different doors, so rate limiting, coalescing,
  * write-back and backoff live here once and nowhere else - there is no second
  * path that could skip one of them.
  */
@@ -32,12 +40,74 @@ export interface Dispatcher {
   run(task: FetchTask, now: number): Promise<DispatchOutcome>
 }
 
+/** Instantaneous smoothing inside this instance; it bounds concurrency, not volume. */
+function makeSemaphores(sources: ResolvedSources) {
+  const inFlight = new Map<string, number>()
+  const waiting = new Map<string, Array<() => void>>()
+
+  return {
+    async acquire(source: string): Promise<void> {
+      const max = sources.get(source)?.maxConcurrent ?? Infinity
+      if (max === Infinity) return
+      const running = inFlight.get(source) ?? 0
+      if (running < max) {
+        inFlight.set(source, running + 1)
+        return
+      }
+      await new Promise<void>((resolve) => {
+        const queue = waiting.get(source) ?? []
+        queue.push(resolve)
+        waiting.set(source, queue)
+      })
+    },
+
+    release(source: string): void {
+      const max = sources.get(source)?.maxConcurrent ?? Infinity
+      if (max === Infinity) return
+      const next = waiting.get(source)?.shift()
+      // The slot is handed straight over rather than counted down and up again,
+      // so a released slot cannot be taken by a newcomer ahead of the queue.
+      if (next) next()
+      else inFlight.set(source, Math.max(0, (inFlight.get(source) ?? 1) - 1))
+    },
+  }
+}
+
 export function createDispatcher(config: DispatcherConfig): Dispatcher {
-  const { store, schedule, clock, random } = config
+  const { store, schedule, clock, random, sources } = config
+  const semaphores = makeSemaphores(sources)
 
   const isOwner = async (name: string, token: number): Promise<boolean> => {
     const current = await schedule.readSchedule(name)
     return current !== null && current.version === token
+  }
+
+  const sleepUntil = (at: number): Promise<void> =>
+    new Promise((resolve) => {
+      clock.setTimeout(() => resolve(), Math.max(0, at - clock.now()))
+    })
+
+  /**
+   * Scheduled work takes what is left after the window's reserve and never
+   * waits: refusing it leaves the row due, and the next tick brings it back
+   * with a higher overdue ratio, so nothing starves. A demand fetch has someone
+   * waiting, so it may take the reserve too and may wait for the window to roll
+   * - but only for as long as that reader is still there.
+   */
+  const takeQuota = async (
+    task: FetchTask,
+    policy: ResolvedSource,
+    source: string,
+  ): Promise<{ ok: true } | { ok: false; retryAt: number }> => {
+    const { windowMs } = policy
+    const limit = task.priority === 'demand' ? policy.demandLimit : policy.scheduledLimit
+    for (;;) {
+      const now = clock.now()
+      if (await schedule.takeQuota(source, limit, windowMs, now)) return { ok: true }
+      const retryAt = windowStartOf(now, windowMs) + windowMs
+      if (task.priority !== 'demand' || retryAt >= task.deadline) return { ok: false, retryAt }
+      await sleepUntil(retryAt)
+    }
   }
 
   const succeed = async (
@@ -103,7 +173,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
         }
         await schedule.writeSchedule({
           name,
-          nextRunAt: done + backoffMs(failCount, query.everyMs, random),
+          nextRunAt: done + retryDelayMs(err, failCount, query.everyMs, random),
           failCount,
           leaseUntil: null,
           version: token,
@@ -117,22 +187,53 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     return { status: 'failed', message }
   }
 
+  const dispatch = async (task: FetchTask, now: number): Promise<DispatchOutcome> => {
+    const { query, row } = task
+    const { name, source } = query
+    const policy = sources.get(source)
+    // Quota is taken after the concurrency slot so a queued call is not holding
+    // one, and before the claim so a call that has no quota never takes a lease
+    // it would have to hand straight back.
+    if (policy !== undefined && policy.windowMs !== Infinity) {
+      const taken = await takeQuota(task, policy, source)
+      if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
+    }
+    const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
+    if (!claimed) return { status: 'leased' }
+    const token = row.version + 1
+    try {
+      const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
+        query.fetch({ signal, now, attempt: row.failCount + 1 }),
+      )
+      return await succeed(query, token, data, clock.now())
+    } catch (err) {
+      return await fail(query, row, token, err)
+    }
+  }
+
   return {
-    async run({ query, row }: FetchTask, now: number): Promise<DispatchOutcome> {
-      const { name } = query
-      const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
-      if (!claimed) return { status: 'leased' }
-      const token = row.version + 1
+    async run(task: FetchTask, now: number): Promise<DispatchOutcome> {
+      const { source } = task.query
+      await semaphores.acquire(source)
       try {
-        const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
-          query.fetch({ signal, now, attempt: row.failCount + 1 }),
-        )
-        return await succeed(query, token, data, clock.now())
-      } catch (err) {
-        return await fail(query, row, token, err)
+        return await dispatch(task, now)
+      } finally {
+        semaphores.release(source)
       }
     },
   }
+}
+
+function retryDelayMs(
+  err: unknown,
+  failCount: number,
+  everyMs: number,
+  random: () => number,
+): number {
+  const retryAfter = err instanceof RateLimitError ? err.retryAfterMs : undefined
+  return retryAfter !== undefined && Number.isFinite(retryAfter) && retryAfter > 0
+    ? retryAfterMs(retryAfter, random)
+    : backoffMs(failCount, everyMs, random)
 }
 
 function errorMessage(err: unknown): string {

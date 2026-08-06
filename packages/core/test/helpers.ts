@@ -1,5 +1,24 @@
 import { createFridge, FakeClock, memoryStore } from '../src/index.js'
-import type { Driver, FridgeConfig, SchedulePlane, Store } from '../src/index.js'
+import type {
+  Driver,
+  FridgeConfig,
+  ReadResult,
+  SchedulePlane,
+  Store,
+  ThrottledRead,
+} from '../src/index.js'
+
+/**
+ * Narrows a fridge read to the stored case. Tests that are not about rate
+ * limiting say so by using this: being throttled there is a failure, not a
+ * branch to handle.
+ */
+export function stored<T>(result: ReadResult<T> | ThrottledRead | null): ReadResult<T> | null {
+  if (result !== null && result.status === 'throttled') {
+    throw new Error(`expected a stored read, got throttled until ${result.retryAt}`)
+  }
+  return result
+}
 
 export function makeDriver(overrides: Partial<Driver> = {}): Driver {
   return { serialized: false, defer: () => undefined, ...overrides }
@@ -27,6 +46,7 @@ export function scheduleOnly(store: Store): SchedulePlane {
     deleteSchedule: (name) => store.deleteSchedule(name),
     claim: (name, expectedVersion, leaseUntil, now) =>
       store.claim(name, expectedVersion, leaseUntil, now),
+    takeQuota: (source, limit, windowMs, now) => store.takeQuota(source, limit, windowMs, now),
     listDue: (now, limit) => store.listDue!(now, limit),
     capabilities: store.capabilities,
   }

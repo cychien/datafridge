@@ -172,7 +172,7 @@ Nothing is thrown away. A failed refresh keeps the previously cached result, att
 | Upstream error or timeout | Count the failure, back off, keep the old result | Old data, `isStale`, `lastError` |
 | Executor died mid-fetch | Another tick re-claims it after the lease expires | Old data, `isStale` |
 | A zombie writes back late | Version mismatch, write rejected | Unaffected |
-| Squeezed out by a source budget | Stays due, rises in priority next tick | Old data, slightly older |
+| Squeezed out by a source's rate limit | Stays due, rises in priority next tick | Old data, slightly older |
 | Failing for hours | Backoff converges at `every`, last-known-good kept forever | Old data, `lastError` |
 | Never fetched successfully | Keeps trying on schedule | `null` |
 
@@ -202,21 +202,30 @@ Only variants in the finite registry are scheduled and readable. Arbitrary on-de
 
 ## Rate limiting by source
 
-Tag queries with a `source` and cap how many of that group run per tick:
+Tag queries with a `source` and say what that source tolerates:
 
 ```ts
 export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { posthog: { maxPerTick: 2 } },
+    sources: {
+      posthog: {
+        limit: { requests: 100, per: '1m', reserve: 10 },
+        maxConcurrent: 4,
+      },
+    },
   }),
 }
 ```
 
-However many queries you register, scheduled refreshes can never exceed `maxPerTick × tick frequency`. A cold read that fetches on a miss is deduplicated per key by the lease but does not yet count against that budget. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+`limit` is a real count, not a heuristic: the store keeps one ledger row per source and every call increments it under the same version-checked CAS that claims a lease, so two Workers and a Durable Object pointing at one database share one budget. Every upstream call goes through it - a scheduled refresh and a read that found nothing stored draw on the same window.
 
-Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
+`reserve` holds part of each window back from scheduled refreshes, because a tick landing on the window boundary would otherwise spend the whole minute in its first second and leave nothing for a reader with a person behind it. A query squeezed out stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+
+Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The ledger is the fuse; jitter keeps the fuse from blowing in normal operation.
+
+See [rate limiting](./docs/rate-limiting.md) for `maxConcurrent`, the `throttled` read status, and passing a vendor's own `Retry-After` back with `RateLimitError`.
 
 ## Documentation
 

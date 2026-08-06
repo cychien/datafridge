@@ -42,7 +42,7 @@ describe('parameterized queries', () => {
     expect(report).toEqual({
       ran: keys,
       skippedLeased: [],
-      deferredBudget: [],
+      throttled: [],
       failed: [],
     })
     expect(seen).toEqual(variants)

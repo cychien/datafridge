@@ -87,7 +87,7 @@ const fridge = createFridge({
   queries,
   driver,
   store,
-  sources: { analytics: { maxPerTick: 2 } },
+  sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
 })
 
 const report = await fridge.runDue()
@@ -102,15 +102,17 @@ const value = await fridge.read<Result>('analytics-7d')
 
 Optional fields are `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
 
-Construction rejects a missing or malformed driver, a store missing either half, an invalid source budget, or a store that cannot claim atomically under a non-serialized driver.
+Construction rejects a missing or malformed driver, a store missing either half, an invalid source policy, or a store that cannot claim atomically under a non-serialized driver.
 
-`runDue(now?)` reconciles the registry, selects due work, applies per-source budgets, claims leases, runs fetchers concurrently, and returns:
+`sources` declares what each source will tolerate. `limit` is a hard ceiling counted in the store's quota ledger and shared by every executor; `reserve` holds part of each window back from scheduled refreshes so a waiting reader still gets through; `maxConcurrent` bounds in-flight calls inside one instance. See [rate limiting](./rate-limiting.md).
+
+`runDue(now?)` reconciles the registry, selects due work most-overdue first, meters each source against its ledger, claims leases, runs fetchers concurrently, and returns:
 
 ```ts
 interface RunReport {
   ran: string[]
   skippedLeased: string[]
-  deferredBudget: string[]
+  throttled: string[]
   failed: Array<{ name: string; message: string }>
 }
 ```
@@ -129,6 +131,15 @@ A read has exactly two behaviours, and no options that change them:
 - **Nothing stored** - it fetches, waiting for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take.
 
 The fridge fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
+
+A miss on a source that has run out of quota answers a third status rather than `null`, because "not your turn yet" is not "there is nothing":
+
+```ts
+const result = await fridge.read<Result>('analytics-7d')
+if (result?.status === 'throttled') return retryAfter(result.retryAt)
+```
+
+`createReader` never produces it: a reader has no fetchers, so nothing it does can be rate limited.
 
 ### Reader
 
@@ -166,7 +177,7 @@ interface ReadResult<T> {
 - `memoryStore()` returns the reference `Store` implementation.
 - `storeContractSuite(label, factory)` is exported from `@datafridge/core/contract-tests` for Vitest adapter compatibility tests.
 - `FakeClock` and `flushMicrotasks` support deterministic tests.
-- `parseDuration`, `queryKey`, `systemClock`, `ConfigError`, and `TimeoutError` are public utilities.
+- `parseDuration`, `queryKey`, `systemClock`, `resolveSources`, `ConfigError`, `TimeoutError`, and `RateLimitError` are public utilities. Adapters call `resolveSources` to reject a bad source policy at their own construction time.
 - Store and engine interfaces are exported as TypeScript types from the package root.
 
 Importing `@datafridge/core` has zero runtime dependencies. The optional `vitest` peer is only needed when importing `@datafridge/core/contract-tests`.
@@ -189,7 +200,7 @@ Subclass `FridgeDO<Env>`, provide `queries` and `store(env)`, and optionally pro
 ```ts
 class Poller extends FridgeDO<Env> {
   queries = queries
-  sources = { analytics: { maxPerTick: 2 } }
+  sources = { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } }
 
   store(env: Env) {
     return d1(env.DB)
@@ -205,7 +216,7 @@ class Poller extends FridgeDO<Env> {
 
 `ensureStarted(namespace, instanceName?)` idempotently ignites one named `FridgeDO` instance. The default instance name is `datafridge`.
 
-The registry, source budgets, and Cloudflare timeout ceiling are validated when the object is ignited and before every alarm run. `timeout` must be shorter than 15 minutes, and every `maxPerTick` must be a positive integer.
+The registry, source policies, and Cloudflare timeout ceiling are validated when the object is ignited and before every alarm run. `timeout` must be shorter than 15 minutes.
 
 ### D1 stores
 
@@ -222,7 +233,7 @@ export default {
   scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { analytics: { maxPerTick: 2 } },
+    sources: { analytics: { limit: { requests: 100, per: '1m', reserve: 10 } } },
     onRunReport: (report) => logSanitized(report),
   }),
 }

@@ -140,6 +140,14 @@ export interface SchedulePlane {
   writeSchedule(row: ScheduleRow): Promise<void>
   deleteSchedule(name: string): Promise<void>
   claim(name: string, expectedVersion: number, leaseUntil: number, now: number): Promise<boolean>
+  /**
+   * Counts one upstream call against `source` and answers whether it fit under
+   * `limit`. Windows are fixed and aligned to the epoch: the one containing
+   * `now` starts at `floor(now / windowMs) * windowMs` and opens with a usage of
+   * zero. `limit` is passed per call rather than stored, because callers hold
+   * back part of a window from lower-priority work; the ledger keeps usage only.
+   */
+  takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: StoreCapabilities
 }
@@ -160,7 +168,8 @@ export interface Driver {
 export interface RunReport {
   ran: string[]
   skippedLeased: string[]
-  deferredBudget: string[]
+  /** Out of source quota this window; still due, and more overdue next tick. */
+  throttled: string[]
   failed: Array<{ name: string; message: string }>
 }
 
@@ -175,6 +184,31 @@ export interface ReadResult<T = unknown> {
   lastError?: LastError
 }
 
-export interface SourceBudget {
-  maxPerTick: number
+/**
+ * Nothing is stored and the source has no quota left to fetch it with. It is
+ * not the same answer as `null`: nothing is wrong and nothing is missing, the
+ * call is only waiting its turn, and `retryAt` says when the window rolls.
+ */
+export interface ThrottledRead {
+  status: 'throttled'
+  retryAt: number
+}
+
+export interface SourceLimit {
+  requests: number
+  per: Duration
+  /**
+   * Held back from scheduled refreshes. Without it a tick landing on the window
+   * boundary can spend the whole window's quota in its first second, and a
+   * reader arriving mid-window - with an actual person behind it - finds
+   * nothing left. Defaults to 0.
+   */
+  reserve?: number
+}
+
+export interface SourcePolicy {
+  /** The hard ceiling, counted in the store's ledger and shared by every executor. */
+  limit?: SourceLimit
+  /** Instantaneous smoothing inside one instance. Does not bound total volume. */
+  maxConcurrent?: number
 }

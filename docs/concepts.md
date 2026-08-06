@@ -26,7 +26,7 @@ They are the specification, not a summary of one. The rest of this page explains
 ├──────────────────────────────────────────────┤
 │  Core - pure logic, zero deps, no IO,         │
 │  injected clock: registry, due computation,   │
-│  priority, budget, backoff, lease, staleness  │
+│  priority, quota, backoff, lease, staleness   │
 ├──────────────────────────────────────────────┤
 │  Store - where results and schedule state live│
 │  wave 1: D1                                   │
@@ -101,8 +101,9 @@ runDue(now):
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
                         5m query's period but only 0.07 of a 60m query's)
-3. Apply budget         group by source, take the top maxPerTick per group;
-                        squeezed-out queries stay due and are picked up next tick
+3. Take quota           one call against the source's ledger for the current
+                        window, minus whatever `reserve` holds back for readers;
+                        refused queries stay due and come back more overdue
 4. Claim lease          claim(name, version, now + timeout + margin);
                         losing the claim means someone else is on it - skip
 5. Execute + write back concurrently (Promise.allSettled), each fetch wrapped
@@ -111,14 +112,15 @@ runDue(now):
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, deferredBudget, failed }
+Returns RunReport { ran, skippedLeased, throttled, failed }
 ```
 
 Key decisions:
 
 - **Fixed-delay semantics.** The next run is measured from completion time. Slow queries naturally slow themselves down and never queue up behind themselves.
 - **Backoff.** `min(every, 1m * 2^(failCount - 1))` plus jitter, capped at `every` because retrying slower than the normal period is pointless.
-- **Jitter.** First registration offsets `nextRunAt` randomly, so queries with integer-multiple periods never permanently align on the same tick and stampede one source's budget. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
+- **Jitter.** First registration offsets `nextRunAt` randomly, so queries with integer-multiple periods never permanently align on the same tick and stampede one source. The ledger is the fuse; jitter keeps the fuse from blowing in normal operation.
+- **One exit to upstream.** Steps 3 to 5 are the dispatcher, and a read that finds nothing stored enters at exactly the same point. There is no second path, so a rate limit cannot be true of one kind of call and not the other.
 - **Three lines of defense**, one gate each: `nextRunAt` decides "should this run", the lease decides "who is running it", the version decides "whose result counts". Slowness, crashes, and zombies each break through one gate; the next one catches them.
 
 ### A slow query, minute by minute
@@ -146,5 +148,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Executor dies mid-run | re-claimed on the next tick after the lease expires (at-least-once) | old data + `isStale` |
 | Zombie writes back late | version mismatch, write rejected | unaffected |
 | First round not finished | - | `null` (callers should handle it) |
-| Squeezed out by budget | stays due, prioritized next tick (overdue ratio grows) | old data, slightly older |
+| Out of source quota | stays due, prioritized next tick (overdue ratio grows) | old data; on a miss, `status: 'throttled'` |
 | Persistent failures | backoff converges at `every`, last-known-good kept forever | old data + `lastError` visible |
