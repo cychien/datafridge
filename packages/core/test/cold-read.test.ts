@@ -73,7 +73,7 @@ describe('poller.read on a cold query', () => {
     expect(calls).toBe(1)
 
     gate.resolve('shared')
-    await clock.advance(100)
+    await clock.advance(1_000)
     for (const read of await Promise.all(reads)) {
       expect(read).toMatchObject({ data: 'shared' })
     }
@@ -199,6 +199,27 @@ describe('reader.read on a cold query', () => {
     const reader = createReader({ store, clock })
     await expect(reader.read<string>('q')).resolves.toMatchObject({ data: 'v1' })
     await expect(reader.read('typo')).resolves.toBeNull()
+  })
+
+  it('escalates the poll interval so a full-timeout wait costs a few dozen store reads', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    let reads = 0
+    const counted = {
+      readResult: async (name: string) => {
+        reads += 1
+        return store.readResult(name)
+      },
+    }
+    const reader = createReader({ store: counted, queries, clock })
+
+    const read = reader.read('q')
+    await flushMicrotasks()
+    await clock.advance(30_000)
+    await expect(read).resolves.toBeNull()
+    // A flat 50ms poll would be 601; each read is a billed subrequest on
+    // Cloudflare, against a 50-per-invocation cap on the free plan.
+    expect(reads).toBeLessThan(40)
   })
 
   it('waits exactly as long as the query may take, with nothing to configure', async () => {

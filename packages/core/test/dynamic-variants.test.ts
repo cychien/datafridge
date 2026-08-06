@@ -68,6 +68,68 @@ describe('dynamic variants', () => {
     expect(await store.readSchedule(key('alpha'))).not.toBeNull()
   })
 
+  it('a failing resolution backs the base off in its own row instead of retrying every tick', async () => {
+    let down = false
+    let resolutions = 0
+    const queries = defineQueries([
+      courseQuery(async () => {
+        resolutions += 1
+        if (down) throw new Error('course db unreachable')
+        return [{ courseId: 'alpha' }]
+      }),
+    ])
+    const { poller, store, clock } = makeHarness(queries)
+    await poller.runDue()
+    const afterFirstTick = resolutions
+
+    down = true
+    await clock.advance(300_000)
+    const firstFailAt = clock.now()
+    await poller.runDue()
+    const first = (await store.readSchedule('per-course'))!
+    expect(first.failCount).toBe(1)
+    expect(first.nextRunAt).toBeGreaterThan(firstFailAt)
+    expect(resolutions).toBe(afterFirstTick + 1)
+
+    // Ticks inside the backoff window do not call resolve() at all, so a down
+    // dependency is not asked again once per alarm.
+    await clock.advance(1_000)
+    const quiet = await poller.runDue()
+    expect(resolutions).toBe(afterFirstTick + 1)
+    expect(quiet.failed).toEqual([])
+
+    await clock.advance(first.nextRunAt - clock.now())
+    const secondFailAt = clock.now()
+    await poller.runDue()
+    const second = (await store.readSchedule('per-course'))!
+    expect(second.failCount).toBe(2)
+    expect(second.nextRunAt - secondFailAt).toBeGreaterThan(first.nextRunAt - firstFailAt)
+
+    // Everything the base already had survived every failure.
+    expect(await store.readResult(key('alpha'))).not.toBeNull()
+    expect(await store.readSchedule(key('alpha'))).not.toBeNull()
+  })
+
+  it('a resolution that recovers clears the backoff row and resumes the variants', async () => {
+    let down = true
+    const queries = defineQueries([
+      courseQuery(async () => {
+        if (down) throw new Error('course db unreachable')
+        return [{ courseId: 'alpha' }]
+      }),
+    ])
+    const { poller, store, clock } = makeHarness(queries)
+    await poller.runDue()
+    expect((await store.readSchedule('per-course'))!.failCount).toBe(1)
+
+    down = false
+    await clock.advance(60_000)
+    const report = await poller.runDue()
+    expect(report.failed).toEqual([])
+    expect(await store.readSchedule('per-course')).toBeNull()
+    expect(await store.readResult(key('alpha'))).not.toBeNull()
+  })
+
   it('duplicate params in one resolution fail that base without touching its rows', async () => {
     let dup = false
     const queries = defineQueries([

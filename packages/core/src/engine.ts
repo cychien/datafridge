@@ -98,10 +98,15 @@ export function createPoller(config: PollerConfig): Poller {
       }
       await store.writeResult(name, envelope)
       const jitter = token === 1 ? firstRunJitterMs(query.everyMs, random) : 0
+      // everyMs is a positive duration, so periodic is always past `done`: no
+      // branch below can schedule a run that is due the moment it is written.
       const periodic = done + query.everyMs + jitter
-      // Data with its own expiry re-fetches at the boundary, not a period later.
+      // Data with its own expiry re-fetches at the boundary, not a period
+      // later. A boundary already behind us describes a window that has closed
+      // - legitimate for a variant naming a past date - so it schedules
+      // nothing and the ordinary period governs.
       const nextRunAt =
-        validUntil === undefined ? periodic : Math.min(periodic, Math.max(validUntil, done))
+        validUntil !== undefined && validUntil > done ? Math.min(periodic, validUntil) : periodic
       await schedule.writeSchedule({
         name,
         nextRunAt,
@@ -145,20 +150,28 @@ export function createPoller(config: PollerConfig): Poller {
     list: readonly ResolvedQuery[]
     byKey: ReadonlyMap<string, ResolvedQuery>
     failures: Array<{ name: string; message: string }>
-    failedBases: ReadonlySet<string>
+    unresolvedBases: ReadonlySet<string>
   }
 
   /**
    * The tick's working set: every static query plus each dynamic definition's
    * variant list as of right now. A resolution failure removes nothing - the
-   * base keeps whatever it already has, and the failure lands in the report.
+   * base keeps whatever it already has, the failure lands in the report, and
+   * the base backs off in a schedule row of its own, exactly as a failed fetch
+   * does. That row is keyed by the base name, which no variant key can collide
+   * with: variants are minted under the reserved '@df/v1/' prefix.
    */
-  const resolveEffective = async (): Promise<EffectiveRegistry> => {
+  const resolveEffective = async (now: number): Promise<EffectiveRegistry> => {
     const list: ResolvedQuery[] = [...queries.all]
     const byKey = new Map(queries.all.map((query) => [query.name, query]))
     const failures: Array<{ name: string; message: string }> = []
-    const failedBases = new Set<string>()
+    const unresolvedBases = new Set<string>()
     for (const dynamic of queries.dynamic) {
+      const row = await schedule.readSchedule(dynamic.baseName)
+      if (row && row.nextRunAt > now) {
+        unresolvedBases.add(dynamic.baseName)
+        continue
+      }
       try {
         const additions: ResolvedQuery[] = []
         const seen = new Set<string>()
@@ -174,12 +187,21 @@ export function createPoller(config: PollerConfig): Poller {
           byKey.set(query.name, query)
           list.push(query)
         }
+        if (row) await schedule.deleteSchedule(dynamic.baseName)
       } catch (err) {
         failures.push({ name: dynamic.baseName, message: errorMessage(err) })
-        failedBases.add(dynamic.baseName)
+        unresolvedBases.add(dynamic.baseName)
+        const failCount = (row?.failCount ?? 0) + 1
+        await schedule.writeSchedule({
+          name: dynamic.baseName,
+          nextRunAt: now + backoffMs(failCount, dynamic.everyMs, random),
+          failCount,
+          leaseUntil: null,
+          version: (row?.version ?? 0) + 1,
+        })
       }
     }
-    return { list, byKey, failures, failedBases }
+    return { list, byKey, failures, unresolvedBases }
   }
 
   const reconcile = async (now: number, effective: EffectiveRegistry): Promise<void> => {
@@ -187,8 +209,10 @@ export function createPoller(config: PollerConfig): Poller {
       const all = await schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
       for (const row of all) {
         if (effective.byKey.has(row.name)) continue
+        // A dynamic base's own row is backoff bookkeeping, not a departed variant.
+        if (queries.dynamicFor(row.name)) continue
         const base = variantBaseOf(row.name)
-        if (base !== undefined && effective.failedBases.has(base)) continue
+        if (base !== undefined && effective.unresolvedBases.has(base)) continue
         await schedule.deleteSchedule(row.name)
         await store.deleteResult(row.name)
       }
@@ -289,7 +313,7 @@ export function createPoller(config: PollerConfig): Poller {
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
       const now = nowArg ?? clock.now()
-      const effective = await resolveEffective()
+      const effective = await resolveEffective(now)
       await reconcile(now, effective)
       const rowsByName = new Map(
         await Promise.all(

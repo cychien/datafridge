@@ -90,6 +90,24 @@ describe('d1 applies its own schema', () => {
     await expect(reader.read('never-fetched')).resolves.toBeNull()
   })
 
+  it('a cold read applies no schema: a read-only consumer creates nothing', async () => {
+    const reader = createReader({
+      store: d1(env.DB),
+      queries: defineQueries([
+        { name: 'metrics', every: '5m', timeout: '200ms', fetch: async () => ({ ok: true }) },
+      ]),
+    })
+
+    // The miss reads the result row and then the schedule row; neither may
+    // reach for DDL, however cold the database is.
+    expect(await reader.read('metrics')).toBeNull()
+
+    const tables = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'datafridge_%'",
+    ).all<{ name: string }>()
+    expect(tables.results).toEqual([])
+  })
+
   it('a real read failure still propagates', async () => {
     const broken = {
       prepare: () => ({

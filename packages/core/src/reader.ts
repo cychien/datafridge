@@ -12,9 +12,14 @@ import type {
   Store,
 } from './types.js'
 
-// How often a waiting read looks for an envelope another executor is fetching.
-// Cheap enough to poll, long enough not to hammer the store.
+// How soon a waiting read first looks for an envelope another executor is
+// fetching, and how far apart those looks are allowed to drift. The interval
+// doubles up to the cap so a result that lands early is still seen almost at
+// once, while a full-timeout wait costs a few dozen store reads rather than
+// one per 50ms - on Cloudflare each of those is a billed subrequest against a
+// per-invocation cap.
 export const MISS_WAIT_POLL_INTERVAL_MS = 50
+export const MAX_MISS_WAIT_POLL_INTERVAL_MS = 1_000
 
 export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> | null {
   if (!env) return null
@@ -54,12 +59,14 @@ export async function waitForEnvelope(
   deadline: number,
   clock: Clock,
 ): Promise<Envelope | null> {
+  let interval = MISS_WAIT_POLL_INTERVAL_MS
   for (;;) {
     const remaining = deadline - clock.now()
     if (remaining <= 0) return null
-    await sleep(clock, Math.min(MISS_WAIT_POLL_INTERVAL_MS, remaining))
+    await sleep(clock, Math.min(interval, remaining))
     const env = await readResult(key)
     if (env) return env
+    interval = Math.min(interval * 2, MAX_MISS_WAIT_POLL_INTERVAL_MS)
   }
 }
 

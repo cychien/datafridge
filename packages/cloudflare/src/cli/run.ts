@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path'
 import {
   D1_DATABASE_NAME,
   InitError,
+  POLLER_CLASS,
   SCHEDULERS,
   STORES,
   declarationSnippets,
@@ -33,7 +34,7 @@ existing configuration is never rewritten. --config defaults to ./wrangler.toml.
 function nextSteps(selection: InitSelection): string {
   const wire =
     selection.scheduler === 'durable-object'
-      ? `export a PollerDO subclass named ${'Poller'} and call ensureStarted once after deploying`
+      ? `export a PollerDO subclass named ${POLLER_CLASS} and call ensureStarted once after deploying`
       : 'wire cronPoller as your scheduled handler'
   return `
 Next steps:

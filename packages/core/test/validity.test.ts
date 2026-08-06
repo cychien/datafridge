@@ -100,6 +100,55 @@ describe('validUntil', () => {
     expect(await poller.read('today')).toMatchObject({ status: 'ok' })
   })
 
+  it('a boundary already behind keeps the ordinary period instead of re-fetching every tick', async () => {
+    // A variant naming a past date: the window closed before the data landed.
+    const clock = new FakeClock(HOUR)
+    let fetches = 0
+    const { poller, store } = makeHarness(
+      [
+        {
+          name: 'yesterday',
+          every: '15m',
+          validUntil: () => HOUR - 1,
+          fetch: async () => {
+            fetches += 1
+            return 'closed-window'
+          },
+        },
+      ],
+      { clock },
+    )
+    await poller.runDue()
+    expect((await store.readSchedule('yesterday'))!.nextRunAt).toBe(HOUR + 900_000)
+    expect(await poller.read('yesterday')).toMatchObject({
+      status: 'invalid',
+      data: 'closed-window',
+    })
+
+    // No tick-every-time loop: the next run is a period away, not immediate.
+    await clock.advance(1_000)
+    expect((await poller.runDue()).ran).toEqual([])
+    expect(fetches).toBe(1)
+  })
+
+  it('a boundary exactly at completion is a closed window, not a zero-length period', async () => {
+    const clock = new FakeClock(HOUR)
+    const { poller, store } = makeHarness(
+      [
+        {
+          name: 'edge',
+          every: '15m',
+          validUntil: ({ now }: { now: number }) => now,
+          fetch: async () => 'edge-data',
+        },
+      ],
+      { clock },
+    )
+    await poller.runDue()
+    expect((await store.readSchedule('edge'))!.nextRunAt).toBe(HOUR + 900_000)
+    expect(await poller.read('edge')).toMatchObject({ status: 'invalid' })
+  })
+
   it('a non-finite boundary is a failure, not a corrupt envelope', async () => {
     const { poller, store } = makeHarness([
       {

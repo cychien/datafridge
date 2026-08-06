@@ -64,9 +64,10 @@ export function d1(db: D1Database): Store {
   return {
     capabilities: { atomicClaim: true, listDue: true },
 
-    // The read path never applies schema: staying a single SELECT is the whole
-    // point. Before anything has been written the table may not exist, which is
-    // the same answer as an empty one - but only that error is an empty answer.
+    // Neither read applies schema: a read-only consumer must never create
+    // tables, and a reader consults the schedule row on a miss. Before anything
+    // has been written the table may not exist, which is the same answer as an
+    // empty one - but only that error is an empty answer.
     async readResult(name) {
       try {
         const record = await db
@@ -107,13 +108,16 @@ export function d1(db: D1Database): Store {
     },
 
     async readSchedule(name) {
-      return withSchema(db, async () => {
+      try {
         const record = await db
           .prepare('SELECT * FROM datafridge_schedule WHERE name = ?')
           .bind(name)
           .first<ScheduleRecord>()
         return record ? toScheduleRow(record) : null
-      })
+      } catch (err) {
+        if (isMissingTable(err)) return null
+        throw err
+      }
     },
 
     async writeSchedule(row) {

@@ -131,7 +131,7 @@ Poller 在沒有人持有 lease 時自己抓，有人持有就等那個人，所
 
 ### Reader
 
-Reader 沒有 fetcher，也從不碰排程那一半 - 它唯一呼叫的方法是 `readResult`：
+Reader 沒有 fetcher：回答一次讀取只需要 `readResult`；store 有提供 `readSchedule` 時，miss 會多讀一次排程列，用來分辨「馬上就要落地的抓取」和「已經排到之後的重試」：
 
 ```ts
 const reader = createReader({ store, queries })

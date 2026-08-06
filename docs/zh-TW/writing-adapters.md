@@ -30,7 +30,7 @@ interface Store {
 
 一個 store 同時持有兩個半邊。應用程式只會遇到這一個 interface。
 
-**store 必須自己建立它需要的儲存空間。** 在第一次寫入前，它得自己套用需要的 table、key 或 collection，這樣任何 adapter 都不會丟一個「使用者要記得跑」的 migration 出來。使用者手動套用等價 schema 時必須是 no-op；儲存空間在暖 process 底下消失時，必須重建並重試，而不是一路失敗到那個 process 被回收；而 `readResult` 必須維持單純讀取：還不存在的儲存空間讀起來就是 `null`，和空的完全一樣。`@datafridge/cloudflare` 的 `test/schema.test.ts` 是可以照抄的參考測試 - 契約套件無法強制這一點，因為準備後端的正是套件的 factory。
+**store 必須自己建立它需要的儲存空間。** 在第一次寫入前，它得自己套用需要的 table、key 或 collection，這樣任何 adapter 都不會丟一個「使用者要記得跑」的 migration 出來。使用者手動套用等價 schema 時必須是 no-op；儲存空間在暖 process 底下消失時，必須重建並重試，而不是一路失敗到那個 process 被回收；而兩個讀取方法 - `readResult` 與 `readSchedule` - 都必須維持單純讀取：還不存在的儲存空間讀起來就是 `null`，和空的完全一樣，因為唯讀 consumer 的讀取路徑兩個都會碰到，絕不能套用 schema。`@datafridge/cloudflare` 的 `test/schema.test.ts` 是可以照抄的參考測試 - 契約套件無法強制這一點，因為準備後端的正是套件的 factory。
 
 這條義務就是 `datafridge init <平台>` 在每個平台上都一樣小的原因。
 

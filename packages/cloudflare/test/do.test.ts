@@ -110,6 +110,47 @@ describe('PollerDO alarm loop', () => {
     expect(alarm).not.toBeNull()
   })
 
+  it('a failed resolution backs the base off instead of pinning the alarm to its floor', async () => {
+    const stub = pollerStub('resolution-backoff')
+    let down = false
+    const variantKey = queryKey('per-course', { courseId: 'alpha' })
+    await configure(stub, [
+      defineParameterizedQuery({
+        name: 'per-course',
+        every: '15m',
+        variants: async () => {
+          if (down) throw new Error('course db unreachable')
+          return [{ courseId: 'alpha' }]
+        },
+        fetch: async () => ({ ok: true }),
+      }),
+    ])
+    await stub.ensureStarted()
+    await settled(stub, [variantKey])
+
+    // The variant is overdue and the course database is down: the old alarm
+    // came from that past-due row and re-fired at the 1-second floor forever.
+    down = true
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        'UPDATE datafridge_schedule SET next_run_at = ? WHERE name = ?',
+        Date.now() - 1_000,
+        variantKey,
+      )
+    })
+    await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
+
+    const rows = await scheduleRows(stub)
+    const base = rows.find((r) => r.name === 'per-course')!
+    expect(base.fail_count).toBe(1)
+    // A failed resolution deletes nothing.
+    expect(rows.map((r) => r.name)).toContain(variantKey)
+    expect(await reader().read('per-course', { courseId: 'alpha' })).not.toBeNull()
+
+    expect(await currentAlarm(stub)).toBe(base.next_run_at)
+    expect(base.next_run_at).toBeGreaterThan(Date.now() + 30_000)
+  })
+
   it('runs due queries, lands envelopes in D1, and re-sets the alarm to min(nextRunAt)', async () => {
     const stub = pollerStub('due')
     await configure(stub, [counting('alpha', '1m'), counting('beta', '5m')])

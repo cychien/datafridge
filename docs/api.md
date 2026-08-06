@@ -131,7 +131,7 @@ The poller fetches when nobody else holds the lease and waits for whoever does, 
 
 ### Reader
 
-A reader has no fetchers and never touches the schedule half - `readResult` is the only method it calls:
+A reader has no fetchers: `readResult` is all it needs to answer, and where the store offers `readSchedule` a miss reads the schedule row once, to tell a fetch that is about to land from a retry already scheduled for later:
 
 ```ts
 const reader = createReader({ store, queries })

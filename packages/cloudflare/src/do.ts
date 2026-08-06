@@ -231,19 +231,29 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
 
     if (queries.dynamic.length > 0) {
       // Dynamic variants exist only as rows, so the alarm has to come from the
-      // table; a base with no rows yet (or whose resolution keeps failing)
-      // still gets one, so resolution is retried on its own cadence.
+      // table. A base whose resolution failed carries its backoff in a row of
+      // its own: that retry time governs, and its variant rows are ignored
+      // however overdue they look, because none of them can run until the list
+      // resolves again. A base with no rows at all is woken on its own period.
       const bases = new Set(queries.dynamic.map((entry) => entry.baseName))
+      const blocked = new Set<string>()
+      for (const entry of queries.dynamic) {
+        const retryAt = byName.get(entry.baseName)
+        if (retryAt === undefined) continue
+        consider(retryAt)
+        if (retryAt > now) blocked.add(entry.baseName)
+      }
       const covered = new Set<string>()
       for (const row of rows) {
         const base = variantBaseOf(row.name)
-        if (base !== undefined && bases.has(base)) {
-          consider(row.next_run_at)
-          covered.add(base)
-        }
+        if (base === undefined || !bases.has(base) || blocked.has(base)) continue
+        consider(row.next_run_at)
+        covered.add(base)
       }
       for (const entry of queries.dynamic) {
-        if (!covered.has(entry.baseName)) consider(now + entry.everyMs)
+        if (!covered.has(entry.baseName) && !byName.has(entry.baseName)) {
+          consider(now + entry.everyMs)
+        }
       }
     }
 
