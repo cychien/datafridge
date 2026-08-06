@@ -1,3 +1,5 @@
+import type { Clock } from './clock.js'
+import { withDeadline } from './deadline.js'
 import { parseDuration } from './duration.js'
 import { ConfigError } from './errors.js'
 import { queryKey, snapshotQueryParams, validateQueryName } from './query-key.js'
@@ -8,6 +10,7 @@ import type {
   QueryDef,
   QueryDefinition,
   QueryParams,
+  ResolveCtx,
   ResolvedQuery,
 } from './types.js'
 
@@ -26,10 +29,45 @@ export interface DynamicVariants {
   readonly timeoutMs: number
   readonly codec?: QueryCodec
   /** Resolve the current variant list. Called once per tick, and on a cold read. */
-  readonly resolve: () => Promise<readonly QueryParams[]>
+  readonly resolve: (signal?: AbortSignal) => Promise<readonly QueryParams[]>
   readonly instantiate: (params: QueryParams) => ResolvedQuery
   /** The current member whose storage key matches, if any. */
-  readonly member: (key: string) => Promise<ResolvedQuery | undefined>
+  readonly member: (key: string, signal?: AbortSignal) => Promise<ResolvedQuery | undefined>
+}
+
+// Construction stays free of time: the bound belongs to whoever owns a clock.
+const NEVER_ABORTED = new AbortController().signal
+
+function resolveCtx(signal: AbortSignal | undefined): ResolveCtx {
+  return { signal: signal ?? NEVER_ABORTED }
+}
+
+function resolutionLabel(dynamic: DynamicVariants): string {
+  return `query '${dynamic.baseName}': variant resolution`
+}
+
+/**
+ * A variant list is application code reaching a database, so it gets the same
+ * deadline treatment a fetch does, bounded by the base's own `timeout`. A
+ * resolution that hangs then becomes the failed resolution it already is.
+ */
+export function resolveVariantsWithin(
+  dynamic: DynamicVariants,
+  clock: Clock,
+): Promise<readonly QueryParams[]> {
+  return withDeadline(clock, dynamic.timeoutMs, resolutionLabel(dynamic), (signal) =>
+    dynamic.resolve(signal),
+  )
+}
+
+export function resolveMemberWithin(
+  dynamic: DynamicVariants,
+  key: string,
+  clock: Clock,
+): Promise<ResolvedQuery | undefined> {
+  return withDeadline(clock, dynamic.timeoutMs, resolutionLabel(dynamic), (signal) =>
+    dynamic.member(key, signal),
+  )
 }
 
 export class Queries {
@@ -111,7 +149,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
 
 type VariantSource =
   | { kind: 'static'; list: readonly QueryParams[] }
-  | { kind: 'dynamic'; resolve: () => Promise<readonly QueryParams[]> }
+  | { kind: 'dynamic'; resolve: (signal?: AbortSignal) => Promise<readonly QueryParams[]> }
 
 function variantSource(definition: ParameterizedQueryDef): VariantSource {
   const at = `query '${definition.name}'`
@@ -124,7 +162,7 @@ function variantSource(definition: ParameterizedQueryDef): VariantSource {
     if (typeof variants === 'function') {
       return {
         kind: 'dynamic',
-        resolve: async () => requireArray(at, 'variants', await variants()),
+        resolve: async (signal) => requireArray(at, 'variants', await variants(resolveCtx(signal))),
       }
     }
     return { kind: 'static', list: requireArray(at, 'variants', variants) }
@@ -154,10 +192,11 @@ function variantSource(definition: ParameterizedQueryDef): VariantSource {
 
   return {
     kind: 'dynamic',
-    resolve: async () => {
+    resolve: async (signal) => {
+      const ctx = resolveCtx(signal)
       const resolvedEntries = await Promise.all(
         entries.map(async ([dimension, values]) => {
-          const list = typeof values === 'function' ? await values() : values
+          const list = typeof values === 'function' ? await values(ctx) : values
           return [dimension, requireArray(at, `dimension '${dimension}'`, list)] as const
         }),
       )
@@ -189,7 +228,7 @@ function cartesian(
 
 function makeDynamic(
   definition: ParameterizedQueryDef,
-  resolve: () => Promise<readonly QueryParams[]>,
+  resolve: (signal?: AbortSignal) => Promise<readonly QueryParams[]>,
 ): DynamicVariants {
   const settings = resolveSettings(definition)
   const instantiate = (params: QueryParams) => resolveParameterizedQuery(definition, params)
@@ -200,8 +239,8 @@ function makeDynamic(
     ...(settings.codec ? { codec: settings.codec } : {}),
     resolve,
     instantiate,
-    member: async (key: string) => {
-      for (const params of await resolve()) {
+    member: async (key: string, signal?: AbortSignal) => {
+      for (const params of await resolve(signal)) {
         const query = instantiate(params)
         if (query.name === key) return query
       }

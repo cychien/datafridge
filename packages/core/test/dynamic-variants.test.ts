@@ -9,15 +9,31 @@ import {
   flushMicrotasks,
   memoryStore,
   queryKey,
+  TimeoutError,
 } from '../src/index.js'
-import type { QueryParams } from '../src/index.js'
+import type { QueryParams, ResolveCtx } from '../src/index.js'
 import { makeHarness } from './helpers.js'
 
-function courseQuery(list: () => QueryParams[] | Promise<QueryParams[]>) {
+type VariantList = (ctx: ResolveCtx) => QueryParams[] | Promise<QueryParams[]>
+
+function courseQuery(list: VariantList) {
   return defineParameterizedQuery({
     name: 'per-course',
     every: '5m',
     variants: list,
+    fetch: async ({ params }) => `data:${JSON.stringify(params)}`,
+  })
+}
+
+function hangingQuery(name: string, onSignal: (signal: AbortSignal) => void) {
+  return defineParameterizedQuery({
+    name,
+    every: '5m',
+    timeout: '10s',
+    variants: ({ signal }) => {
+      onSignal(signal)
+      return new Promise<QueryParams[]>(() => {})
+    },
     fetch: async ({ params }) => `data:${JSON.stringify(params)}`,
   })
 }
@@ -130,6 +146,83 @@ describe('dynamic variants', () => {
     expect(await store.readResult(key('alpha'))).not.toBeNull()
   })
 
+  it('a resolution that hangs is a failed resolution, aborted at the base timeout', async () => {
+    let hang = false
+    let received: AbortSignal | undefined
+    const queries = defineQueries([
+      defineParameterizedQuery({
+        name: 'per-course',
+        every: '5m',
+        timeout: '10s',
+        variants: ({ signal }) => {
+          if (!hang) return [{ courseId: 'alpha' }]
+          received = signal
+          return new Promise<QueryParams[]>(() => {})
+        },
+        fetch: async ({ params }) => `data:${JSON.stringify(params)}`,
+      }),
+    ])
+    const { poller, store, clock } = makeHarness(queries)
+    await poller.runDue()
+
+    hang = true
+    await clock.advance(300_000)
+    const startedAt = clock.now()
+    const run = poller.runDue()
+    await flushMicrotasks()
+    await clock.advance(10_000)
+
+    const report = await run
+    expect(clock.now() - startedAt).toBe(10_000)
+    expect(report.failed).toEqual([
+      {
+        name: 'per-course',
+        message: "query 'per-course': variant resolution timed out after 10000ms",
+      },
+    ])
+    expect(received!.aborted).toBe(true)
+    expect(received!.reason).toBeInstanceOf(TimeoutError)
+
+    const base = (await store.readSchedule('per-course'))!
+    expect(base.failCount).toBe(1)
+    expect(base.nextRunAt).toBeGreaterThan(clock.now())
+    expect(await store.readResult(key('alpha'))).not.toBeNull()
+    expect(await store.readSchedule(key('alpha'))).not.toBeNull()
+  })
+
+  it('two hung bases cost one timeout, not two', async () => {
+    const queries = defineQueries([
+      hangingQuery('first', () => undefined),
+      hangingQuery('second', () => undefined),
+    ])
+    const { poller, clock } = makeHarness(queries)
+
+    const startedAt = clock.now()
+    const run = poller.runDue()
+    await flushMicrotasks()
+    await clock.advance(10_000)
+
+    const report = await run
+    expect(clock.now() - startedAt).toBe(10_000)
+    expect(report.failed.map((f) => f.name)).toEqual(['first', 'second'])
+  })
+
+  it('a cold read of a hung base surfaces the timeout rather than waiting past it', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const queries = defineQueries([hangingQuery('per-course', () => undefined)])
+    const { poller } = makeHarness(queries, { store, clock })
+    const reader = createReader({ store, queries, clock })
+
+    const viaPoller = poller.read('per-course', { courseId: 'alpha' })
+    const viaReader = reader.read('per-course', { courseId: 'alpha' })
+    await flushMicrotasks()
+    await clock.advance(10_000)
+
+    await expect(viaPoller).rejects.toThrow(TimeoutError)
+    await expect(viaReader).rejects.toThrow(TimeoutError)
+  })
+
   it('duplicate params in one resolution fail that base without touching its rows', async () => {
     let dup = false
     const queries = defineQueries([
@@ -145,6 +238,35 @@ describe('dynamic variants', () => {
     const report = await poller.runDue()
     expect(report.failed[0]!.message).toMatch(/duplicate variant params/)
     expect(await store.readResult(key('alpha'))).not.toBeNull()
+  })
+
+  it('the background refresh promise never rejects, however broken the variant list is', async () => {
+    let down = false
+    const queries = defineQueries([
+      courseQuery(async () => {
+        if (down) throw new Error('course db unreachable')
+        return [{ courseId: 'alpha' }]
+      }),
+    ])
+    const { poller, clock } = makeHarness(queries)
+    await poller.runDue()
+
+    down = true
+    await clock.advance(300_000)
+    const refreshes: Promise<void>[] = []
+    const read = await poller.read(
+      'per-course',
+      { courseId: 'alpha' },
+      {
+        swrRefresh: (refresh) => refreshes.push(refresh),
+      },
+    )
+
+    // Callers hand this straight to ctx.waitUntil, where a rejection would
+    // surface as an invocation error.
+    expect(read).toMatchObject({ isStale: true })
+    expect(refreshes).toHaveLength(1)
+    await expect(refreshes[0]).resolves.toBeUndefined()
   })
 
   it('a hit reads without resolving the list; only a miss pays for membership', async () => {

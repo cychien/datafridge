@@ -11,13 +11,13 @@ defineParameterizedQuery({
   every: '15m',
   dimensions: {
     preset: ['7d', '30d', '90d'],
-    courseId: async () => listCourseAnalyticsIds(db),
+    courseId: ({ signal }) => listCourseAnalyticsIds(db, { signal }),
   },
   fetch: ({ params, signal }) => ...,
 })
 ```
 
-An array expands once at construction, exactly as before. A function - `variants` itself, or any single dimension - is now resolved at every tick and may be async, so a list that changes at runtime needs no shadow tables or hand-rolled reconciliation: the reconcile that already creates and deletes variant rows simply runs against the current list. A resolution that throws deletes nothing - the base keeps everything it has, and the failure lands in that tick's `RunReport`. Reads stay cheap: a stored result is served without consulting the list, and only a miss resolves it, to fetch a member or reject a non-member.
+An array expands once at construction, exactly as before. A function - `variants` itself, or any single dimension - is now resolved at every tick and may be async, so a list that changes at runtime needs no shadow tables or hand-rolled reconciliation: the reconcile that already creates and deletes variant rows simply runs against the current list. A resolution that throws deletes nothing - the base keeps everything it has, and the failure lands in that tick's `RunReport`. A resolver receives `{ signal }` exactly as `fetch` does and is bound by the base's own `timeout`, so a list that hangs is aborted and counted as a failed resolution rather than stalling the tick; bases resolve concurrently. Reads stay cheap: a stored result is served without consulting the list, and only a miss resolves it, to fetch a member or reject a non-member.
 
 `dimensions` is the cartesian product of its entries, one param field per dimension, so a preset axis no longer has to be flattened into query names by hand.
 

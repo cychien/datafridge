@@ -1,5 +1,5 @@
 import type { Clock } from './clock.js'
-import { defineQueries, Queries } from './define-queries.js'
+import { defineQueries, Queries, resolveMemberWithin } from './define-queries.js'
 import { ConfigError } from './errors.js'
 import { queryKey } from './query-key.js'
 import { systemClock } from './system-clock.js'
@@ -117,7 +117,7 @@ export function createReader(config: ReaderConfig): Reader {
       if (query) {
         timeoutMs = query.timeoutMs
       } else {
-        const found = await dynamic!.member(key)
+        const found = await resolveMemberWithin(dynamic!, key, clock)
         if (!found) throw new ConfigError(`unknown query '${name}'`)
         timeoutMs = found.timeoutMs
       }

@@ -1,7 +1,14 @@
 import { backoffMs, firstRunJitterMs, MAX_JITTER_RATIO } from './backoff.js'
 import type { Clock } from './clock.js'
-import { defineQueries, Queries } from './define-queries.js'
-import { ConfigError, TimeoutError } from './errors.js'
+import { withDeadline } from './deadline.js'
+import {
+  defineQueries,
+  Queries,
+  resolveMemberWithin,
+  resolveVariantsWithin,
+} from './define-queries.js'
+import type { DynamicVariants } from './define-queries.js'
+import { ConfigError } from './errors.js'
 import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
 import { queryKey, variantBaseOf } from './query-key.js'
@@ -16,6 +23,7 @@ import type {
   ResolvedQuery,
   RunReport,
   SchedulePlane,
+  ScheduleRow,
   SourceBudget,
   Store,
 } from './types.js'
@@ -68,18 +76,10 @@ export function createPoller(config: PollerConfig): Poller {
       return
     }
     const token = row.version + 1
-    const controller = new AbortController()
-    const handle = clock.setTimeout(
-      () =>
-        controller.abort(new TimeoutError(`query '${name}' timed out after ${query.timeoutMs}ms`)),
-      query.timeoutMs,
-    )
     try {
-      const data = await raceAbort(
-        query.fetch({ signal: controller.signal, now, attempt: row.failCount + 1 }),
-        controller.signal,
+      const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
+        query.fetch({ signal, now, attempt: row.failCount + 1 }),
       )
-      clock.clearTimeout(handle)
       const done = clock.now()
       if (!(await isOwner(name, token))) {
         report.failed.push({ name, message: 'write discarded (lease reclaimed)' })
@@ -116,7 +116,6 @@ export function createPoller(config: PollerConfig): Poller {
       })
       report.ran.push(name)
     } catch (err) {
-      clock.clearTimeout(handle)
       const done = clock.now()
       let message = errorMessage(err)
       try {
@@ -153,6 +152,12 @@ export function createPoller(config: PollerConfig): Poller {
     unresolvedBases: ReadonlySet<string>
   }
 
+  type Attempt = { dynamic: DynamicVariants; row: ScheduleRow | null } & (
+    | { kind: 'backoff' }
+    | { kind: 'resolved'; params: readonly QueryParams[] }
+    | { kind: 'failed'; message: string }
+  )
+
   /**
    * The tick's working set: every static query plus each dynamic definition's
    * variant list as of right now. A resolution failure removes nothing - the
@@ -160,22 +165,62 @@ export function createPoller(config: PollerConfig): Poller {
    * the base backs off in a schedule row of its own, exactly as a failed fetch
    * does. That row is keyed by the base name, which no variant key can collide
    * with: variants are minted under the reserved '@df/v1/' prefix.
+   *
+   * Bases resolve concurrently so three hung lists cost one timeout rather than
+   * three, but they are expanded in registry order so which base is blamed for
+   * a duplicate key does not depend on who answered first.
    */
   const resolveEffective = async (now: number): Promise<EffectiveRegistry> => {
     const list: ResolvedQuery[] = [...queries.all]
     const byKey = new Map(queries.all.map((query) => [query.name, query]))
     const failures: Array<{ name: string; message: string }> = []
     const unresolvedBases = new Set<string>()
-    for (const dynamic of queries.dynamic) {
-      const row = await schedule.readSchedule(dynamic.baseName)
-      if (row && row.nextRunAt > now) {
+
+    const failBase = async (attempt: Attempt, message: string): Promise<void> => {
+      const { dynamic, row } = attempt
+      failures.push({ name: dynamic.baseName, message })
+      unresolvedBases.add(dynamic.baseName)
+      const failCount = (row?.failCount ?? 0) + 1
+      await schedule.writeSchedule({
+        name: dynamic.baseName,
+        nextRunAt: now + backoffMs(failCount, dynamic.everyMs, random),
+        failCount,
+        leaseUntil: null,
+        version: (row?.version ?? 0) + 1,
+      })
+    }
+
+    const attempts = await Promise.all(
+      queries.dynamic.map(async (dynamic): Promise<Attempt> => {
+        const row = await schedule.readSchedule(dynamic.baseName)
+        if (row && row.nextRunAt > now) return { dynamic, row, kind: 'backoff' }
+        try {
+          return {
+            dynamic,
+            row,
+            kind: 'resolved',
+            params: await resolveVariantsWithin(dynamic, clock),
+          }
+        } catch (err) {
+          return { dynamic, row, kind: 'failed', message: errorMessage(err) }
+        }
+      }),
+    )
+
+    for (const attempt of attempts) {
+      const { dynamic, row } = attempt
+      if (attempt.kind === 'backoff') {
         unresolvedBases.add(dynamic.baseName)
+        continue
+      }
+      if (attempt.kind === 'failed') {
+        await failBase(attempt, attempt.message)
         continue
       }
       try {
         const additions: ResolvedQuery[] = []
         const seen = new Set<string>()
-        for (const params of await dynamic.resolve()) {
+        for (const params of attempt.params) {
           const query = dynamic.instantiate(params)
           if (byKey.has(query.name) || seen.has(query.name)) {
             throw new ConfigError(`query '${dynamic.baseName}': duplicate variant params`)
@@ -189,16 +234,7 @@ export function createPoller(config: PollerConfig): Poller {
         }
         if (row) await schedule.deleteSchedule(dynamic.baseName)
       } catch (err) {
-        failures.push({ name: dynamic.baseName, message: errorMessage(err) })
-        unresolvedBases.add(dynamic.baseName)
-        const failCount = (row?.failCount ?? 0) + 1
-        await schedule.writeSchedule({
-          name: dynamic.baseName,
-          nextRunAt: now + backoffMs(failCount, dynamic.everyMs, random),
-          failCount,
-          leaseUntil: null,
-          version: (row?.version ?? 0) + 1,
-        })
+        await failBase(attempt, errorMessage(err))
       }
     }
     return { list, byKey, failures, unresolvedBases }
@@ -237,17 +273,26 @@ export function createPoller(config: PollerConfig): Poller {
     return base !== undefined ? queries.dynamicFor(base) : undefined
   }
 
+  /**
+   * Fire-and-forget: callers hand this straight to ctx.waitUntil, so a variant
+   * list that is down, or a store that is, must not surface as an invocation
+   * error. The report it would produce is discarded too.
+   */
   const refreshOne = async (key: string): Promise<void> => {
-    let query = queries.getByKey(key)
-    if (!query) {
-      const dynamic = dynamicOfKey(key)
-      query = dynamic ? await dynamic.member(key) : undefined
-      if (!query) return
+    try {
+      let query = queries.getByKey(key)
+      if (!query) {
+        const dynamic = dynamicOfKey(key)
+        query = dynamic ? await resolveMemberWithin(dynamic, key, clock) : undefined
+        if (!query) return
+      }
+      const now = clock.now()
+      const row = (await schedule.readSchedule(key)) ?? virtualRow(key, now)
+      if (row.nextRunAt > now) return
+      await executeOne({ query, row }, now, emptyReport())
+    } catch {
+      // Nothing to report to and nobody to raise it with.
     }
-    const now = clock.now()
-    const row = (await schedule.readSchedule(key)) ?? virtualRow(key, now)
-    if (row.nextRunAt > now) return
-    await executeOne({ query, row }, now, emptyReport())
   }
 
   /**
@@ -349,7 +394,7 @@ export function createPoller(config: PollerConfig): Poller {
       // reconcile is the enforcer that removes departed variants.
       if (shaped !== null) return decodeRead(shaped, codec)
       if (!query) {
-        query = await dynamic!.member(key)
+        query = await resolveMemberWithin(dynamic!, key, clock)
         if (!query) throw new ConfigError(`unknown query '${name}'`)
       }
       return decodeRead(await readThrough<T>(query, key), codec)
@@ -363,28 +408,6 @@ function emptyReport(): RunReport {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
-}
-
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  promise.catch(() => {})
-  return new Promise<T>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason)
-      return
-    }
-    const onAbort = () => reject(signal.reason)
-    signal.addEventListener('abort', onAbort, { once: true })
-    promise.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (err) => {
-        signal.removeEventListener('abort', onAbort)
-        reject(err)
-      },
-    )
-  })
 }
 
 function validateDriver(driver: Driver): Driver {

@@ -25,6 +25,7 @@ export type {
   QueryDefinition,
   QueryParams,
   ReadResult,
+  ResolveCtx,
   ResolvedQuery,
   RunReport,
   ScheduleRow,

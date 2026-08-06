@@ -29,6 +29,15 @@ export interface ValidityCtx {
   now: number
 }
 
+/**
+ * Handed to a function-valued variant list. The signal aborts once the base's
+ * `timeout` is reached, so a list that lives behind a hung connection can be
+ * cancelled instead of holding it open.
+ */
+export interface ResolveCtx {
+  signal: AbortSignal
+}
+
 export interface ParameterizedFetchCtx<P extends QueryParams> extends FetchCtx {
   params: P
 }
@@ -54,7 +63,8 @@ export interface QueryDef<T = unknown> extends QuerySettings {
 }
 
 export type DimensionValues =
-  readonly QueryParams[] | (() => readonly QueryParams[] | Promise<readonly QueryParams[]>)
+  | readonly QueryParams[]
+  | ((ctx: ResolveCtx) => readonly QueryParams[] | Promise<readonly QueryParams[]>)
 
 interface ParameterizedBase<P extends QueryParams, T> extends QuerySettings {
   fetch(ctx: ParameterizedFetchCtx<P>): Promise<T>
@@ -70,7 +80,7 @@ interface ParameterizedBase<P extends QueryParams, T> extends QuerySettings {
  */
 export type ParameterizedQueryDef<P extends QueryParams = QueryParams, T = unknown> =
   | (ParameterizedBase<P, T> & {
-      variants: readonly P[] | (() => readonly P[] | Promise<readonly P[]>)
+      variants: readonly P[] | ((ctx: ResolveCtx) => readonly P[] | Promise<readonly P[]>)
       dimensions?: never
     })
   | (ParameterizedBase<P, T> & {
