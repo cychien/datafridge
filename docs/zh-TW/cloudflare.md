@@ -2,18 +2,23 @@
 
 [English](../cloudflare.md) | 繁體中文
 
-Cloudflare Wave 1 提供兩套完整組合。兩者都使用 D1 儲存 result envelopes，並遵守[六點語意契約](../../README.zh-TW.md#語意契約)。
+這份文件是 Cloudflare 各 module 的設定與營運指南：`PollerDO` 與 `ensureStarted` 負責 alarm 排程、`cronDriver` 與 `cronPoller` 負責 Cron Triggers、`d1` 負責儲存。每個 module 各自填哪個位置，見 [README 的 module 清單](../../README.zh-TW.md#接上-scheduler-與-store)。以下每一種組法都把 result envelope 存在 D1，並遵守[六點語意契約](./concepts.md#語意契約)。
 
 ## 安裝與初始化
 
 ```sh
 pnpm add @datafridge/core @datafridge/cloudflare
-pnpm exec datafridge init cloudflare
+pnpm exec datafridge init --scheduler durable-object --store d1
+# 或：--scheduler cron --store d1
 ```
 
-Init CLI 會 idempotently 把兩種組合的 declarations 加到 `wrangler.toml`。其他 TOML file 可使用 `--config <path>`。它會保留既有 declarations、列出需要手動放置的設定，並拒絕在既有 `wrangler.json` 或 `wrangler.jsonc` 旁建立 TOML。
+你指定 scheduler 和 store，CLI 只會 idempotently 加入那個組合需要的東西：Durable Object binding 加它的 SQLite class migration，或是 `[triggers]` 的 cron，再加上 D1 binding。不會寫出任何需要你事後刪掉的東西。其他 TOML file 可使用 `--config <path>`。它會保留既有 declarations、列出需要手動放置的設定，並拒絕在既有 `wrangler.json` 或 `wrangler.jsonc` 旁建立 TOML（這時它會把 declarations 印出來讓你自己放）。
 
-檢查輸出後，保留一種 scheduling 組合並刪除未使用的 declarations。建立或選擇 D1 database、替換產生的 `database_id`，再套用 package schema：
+使用 Durable Object scheduler 時，`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。
+
+`database_id` 是 CLI 唯一填不了的欄位，它會寫成 `TODO`。執行 `pnpm exec wrangler d1 create datafridge`，或選一個既有的 database，把它印出來的 ID 貼進去。
+
+設定到這裡就結束了。`d1()` 會在第一次寫入前自己建表，所以空的 database 直接就能用。如果你希望 schema 由自己的 pipeline 宣告，package 內附的 migration 是一模一樣的語句（有測試盯著兩邊不漂移），先套用它就會讓自動建表變成 no-op：
 
 ```sh
 pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
@@ -26,14 +31,14 @@ pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
 pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 ```
 
-## 組合 A：Durable Object alarms + D1 results
+## Durable Object alarms：`PollerDO`
 
-需要精確 due timestamp 的 alarm、可動態調整的 backoff，或 serialized schedule coordination 時，使用組合 A。
+這條路的 scheduler 就是你匯出的那個 class：`wrangler` 依 `class_name` 實例化它，它的 alarm 迴圈推動每一個 tick。`PollerDO` 是 serialized driver，而且自帶排程簿記，所以它只需要一個地方放 envelope。需要精確 due timestamp 的 alarm、可動態調整的 backoff，或 serialized schedule coordination 時，用它。
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
 import type { RunReport } from '@datafridge/core'
-import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -59,8 +64,8 @@ export class Poller extends PollerDO<Env> {
     },
   ])
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -76,7 +81,7 @@ export class Poller extends PollerDO<Env> {
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ results: d1Results(env.DB) })
+    const reader = createReader({ store: d1(env.DB) })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
@@ -101,7 +106,7 @@ Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 
 
 ### Alarm lifecycle
 
-`ensureStarted(namespace, instanceName?)` 會喚醒 object；目前 registry 還沒有 alarm 時，排定 immediate alarm。預設 instance name 是 `datafridge-poller`。每次 read 都呼叫是安全的，部署後也能重新啟動 alarm chain。
+`ensureStarted(namespace, instanceName?)` 會喚醒 object；目前 registry 還沒有 alarm 時，排定 immediate alarm。預設 instance name 是 `datafridge-poller`。每次 read 都呼叫是安全的，部署後也能重新啟動 alarm chain。若想讓 request path 完全不碰它，就別 await，改交給 handler 的 `ExecutionContext`：`ctx.waitUntil(ensureStarted(env.POLLER))`，或改在部署後的 hook 呼叫。
 
 每次 alarm 會：
 
@@ -111,17 +116,17 @@ Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 
 4. 呼叫 `onRunReport(report)`。
 5. 在 `finally` 排定下一個 alarm，即使 reconcile、storage 或 report hook 失敗也一樣。
 
-有限 parameter variants 改變時，從 `queries` getter 回傳重新建構的 registry。新增 variant 會建立 row；移除 variant 會刪除 row 與 envelope。詳見 [parameterized API](./api.md#parameterized-queries)。
+Variant 清單會在執行期改變時，把它宣告成函式 - 每次 alarm 都會重新解析，而且可以是 async。新增 variant 會建立 row；移除 variant 會刪除 row 與 envelope。詳見 [parameterized API](./api.md#parameterized-queries)。
 
 `onRunReport` 用於 operational evidence，不是 payload logging。建議只記錄 category count 或 allowlisted identity。Error message 來自 application fetcher，可能含有 sensitive data，寫 log 前必須 sanitize。
 
-## 組合 B：Cron Triggers + D1 full store
+## Cron Triggers：`cronPoller`
 
-可接受 scheduler 最低 1 分鐘，而且希望 D1 是唯一 stateful platform component 時，使用組合 B。
+這條路的 scheduler 就是你匯出的那個 handler：Cloudflare 的 cron trigger 會呼叫 `scheduled`，所以沒有東西需要自己點火，也沒有 `ensureStarted`。`cronDriver` 不是 serialized 的，所以它需要 atomic claim，而 `d1` 正好提供。可接受 scheduler 最低 1 分鐘，而且希望 D1 是唯一 stateful platform component 時，用這個配對。
 
 ```ts
 import { defineQueries } from '@datafridge/core'
-import { cronPoller, d1Store } from '@datafridge/cloudflare'
+import { cronPoller, d1 } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -140,7 +145,7 @@ const queries = defineQueries([
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
   }),
 }
@@ -156,32 +161,34 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-Cron invocation 可能重疊，因此 `cronPoller` 使用 non-serialized driver，並要求 atomic schedule store。`d1Store` 以 version-checked D1 update claim。只有 `results` 的非法設定會在 `cronPoller` 建構時失敗。
+Cron invocation 可能重疊，因此 `cronPoller` 使用 non-serialized driver，並要求 atomic schedule store。`d1` 以 version-checked D1 update claim。只有 `results` 的非法設定會在 `cronPoller` 建構時失敗。
 
-Scheduled handler 需要取得 `RunReport` 時，可直接搭配 `createPoller` 使用 `cronDriver(ctx)`：
+想觀察每個 tick 就傳 `onRunReport`，它與 `PollerDO` 的 hook 同一份「寫 log 前先 sanitize」契約。若 handler 需要對 `RunReport` 做的事超過觀察，可直接搭配 `createPoller` 使用 `cronDriver(ctx)`：
 
 ```ts
 const poller = createPoller({
   queries,
   driver: cronDriver(ctx),
-  store: d1Store(env.DB),
+  store: d1(env.DB),
 })
 const report = await poller.runDue()
 ctx.waitUntil(writeSanitizedOperations(report))
 ```
 
-## 選擇組合
+## 選擇 scheduler
 
-| | 組合 A | 組合 B |
+| | `PollerDO` | `cronPoller` |
 |---|---|---|
-| Scheduler | Durable Object alarms | Cron Triggers |
-| Schedule state | Durable Object SQLite | D1 |
+| Driver | Durable Object alarms | Cron Triggers |
+| Schedule plane | Durable Object SQLite | D1 |
 | Claims | Serialized actor | D1 compare-and-swap |
-| Result state | D1 | D1 |
-| Scheduler floor | 1 秒 safety floor | 1 分鐘 |
+| Result plane | D1 | D1 |
+| Scheduler 粒度 | 精確的 alarm timestamp，最低 1 秒 | 最低 1 分鐘 |
 | Dynamic due time | Alarm 移到下一筆 due row | Cron 固定，due check 維持動態 |
+| 平台元件 | Durable Object + D1 | 只有 D1 |
+| 何時選它 | 你要精確的到期時間與動態 backoff | 你不想多管一個 Durable Object |
 
-不要把 Cron Triggers 與 `d1Results` 單獨組合。它沒有 schedule plane，建構時會拒絕此設定。
+這兩組是 Cloudflare 上已完整出貨的組法，不是唯一合法的組法：只要 schedule plane 解析得出來，任何組合都成立。Cron Triggers 單獨搭一個只有 result 的 store 不成立 - 它沒有 schedule plane，建構時會直接拒絕，而不是默默重複 fetch。
 
 ## 建構時驗證
 
@@ -207,10 +214,10 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 
 ## 營運 checklist
 
-1. 第一次 invocation 前套用 D1 schema。
+1. 可選：套用內附的 D1 migration；不套的話第一次寫入就會建表。
 2. 把上游 credential 放入 Worker secrets。
 3. Query params 保持非機密且數量有限。
-4. 部署 Worker。組合 A 需呼叫一次會執行 `ensureStarted` 的 route。
+4. 部署 Worker。以 `PollerDO` 當 scheduler 時，需呼叫一次會執行 `ensureStarted` 的 route。
 5. 確認 result rows 出現，read 回傳 `{ data, fetchedAt, isStale, age }`。
 6. 記錄 sanitized `RunReport` categories、alarm continuity，以及 observation 開始時間與結束條件。
 7. 使用已授權且受控的上游條件測試 failure handling。確認舊 envelope 保留，後續 report 顯示失敗與恢復，且 log 不含 payload。
@@ -224,7 +231,7 @@ D1 是 single-region，remote PoP reader 可能產生跨區 latency。Result-pla
 
 ```ts
 import { PollerDO, ensureStarted } from '@datafridge/cloudflare/do'
-import { d1Results, d1Store } from '@datafridge/cloudflare/d1'
+import { d1 } from '@datafridge/cloudflare/d1'
 import { cronDriver, cronPoller } from '@datafridge/cloudflare/cron'
 ```
 

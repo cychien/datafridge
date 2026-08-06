@@ -9,7 +9,7 @@ datafridge 按 `source`（query 定義上的 `source` 欄位，預設 `'default'
 ```ts
 createPoller({
   driver: cronDriver(ctx),
-  store: d1Store(env.DB),
+  store: d1(env.DB),
   queries,
   sources: { posthog: { maxPerTick: 2 } },
 })
@@ -20,7 +20,9 @@ createPoller({
 兩個性質讓它成為正確的 v1：
 
 - **無狀態。** 預算不需要 counter、不需要共享狀態，所以在分散式併發執行者（含多實例 cron）之間天然安全。
-- **硬上限。** 上游速率永遠不會超過 `maxPerTick × tick 頻率`，不管你註冊了多少 queries。
+- **排程刷新的上限。** 不管你註冊了多少 query，tick 呼叫上游的次數永遠不會超過 `maxPerTick × tick 頻率`。
+
+這個預算涵蓋的是排程工作。讀取時發現什麼都沒有會當場去抓，那次抓取由 lease 保證同一個 key 只有一次 - 一百個讀者讀同一個冷 key 只產生一次呼叫 - 但它目前還沒有計入 source 的預算，所以一整批**不同的**冷 key 同時進來時，可能超過上面那個上限。把每一個上游呼叫都納入同一份 per-source 計數，就是下面的 v2 工作。
 
 Jitter 是另一半。首次註冊時，每個 query 的 `nextRunAt` 會加隨機偏移，讓整數倍週期的 queries（`5m`、`10m`、`1h`）永遠不會固定對齊同一個 tick、集體衝撞同一個 source 的預算。預算是保險絲，jitter 讓保險絲平常不用燒。
 

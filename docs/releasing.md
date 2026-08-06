@@ -1,6 +1,6 @@
 # Release process and package names
 
-English | [繁體中文](./zh-TW/releasing.md)
+English only: this one is for maintainers.
 
 This repository uses Changesets and a manually dispatched, post-merge GitHub Actions publish job that authenticates with npm Trusted Publishing. There is no npm token. The one exception is the first publication of `1.0.0`, which the captain performs locally because npm cannot register a trusted publisher for a package that does not exist yet. No release action should run from a feature branch.
 

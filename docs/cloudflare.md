@@ -2,18 +2,23 @@
 
 English | [繁體中文](./zh-TW/cloudflare.md)
 
-Cloudflare Wave 1 provides two complete combinations. Both use D1 for result envelopes and preserve the [six-point semantic contract](../README.md#the-semantic-contract).
+This page is the setup and operations home for the Cloudflare modules: `PollerDO` and `ensureStarted` for alarm-driven scheduling, `cronDriver` and `cronPoller` for Cron Triggers, and `d1` for storage. Which position each module fills is in the [README's module list](../README.md#wiring-a-scheduler-and-a-store). Every arrangement below stores result envelopes in D1 and preserves the [six-point semantic contract](./concepts.md#the-semantic-contract).
 
 ## Install and initialize
 
 ```sh
 pnpm add @datafridge/core @datafridge/cloudflare
-pnpm exec datafridge init cloudflare
+pnpm exec datafridge init --scheduler durable-object --store d1
+# or: --scheduler cron --store d1
 ```
 
-The init CLI idempotently adds declarations for both combinations to `wrangler.toml`. Pass `--config <path>` for another TOML file. It preserves existing declarations, reports declarations that need manual placement, and refuses to create TOML beside an existing `wrangler.json` or `wrangler.jsonc`.
+You name the scheduler and the store, and the CLI idempotently adds only what that combination needs: the Durable Object binding and its SQLite class migration, or the `[triggers]` cron, plus the D1 binding. Nothing is written for you to delete afterwards. Pass `--config <path>` for another TOML file. It preserves existing declarations, reports declarations that need manual placement, and refuses to create TOML beside an existing `wrangler.json` or `wrangler.jsonc` (it prints the declarations for you to place by hand instead).
 
-Review the output, keep one scheduling combination, and remove the unused declarations. Then create or select a D1 database, replace the generated `database_id`, and apply the packaged schema:
+With the Durable Object scheduler, `class_name` has to match the `PollerDO` subclass your Worker exports.
+
+The `database_id` is the one thing the CLI cannot fill in, so it writes `TODO` there. Run `pnpm exec wrangler d1 create datafridge`, or pick an existing database, and paste the ID it prints.
+
+That is all the setup there is. `d1()` applies its own tables before its first write, so an empty database works. If you would rather declare the schema in your own pipeline, the packaged migration holds exactly the same statements - a test keeps the two from drifting - and applying it makes the automatic step a no-op:
 
 ```sh
 pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
@@ -26,14 +31,14 @@ Use Worker secrets for upstream credentials. Never put a credential in a query n
 pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 ```
 
-## Combo A: Durable Object alarms + D1 results
+## Durable Object alarms: `PollerDO`
 
-Use Combo A when you want alarms scheduled at exact due timestamps, dynamic backoff without fixed cron wakeups, or serialized schedule coordination.
+The scheduler here is the class you export: `wrangler` instantiates it by `class_name` and its alarm loop drives every tick. `PollerDO` is a serialized driver that carries its own schedule bookkeeping, so it only needs somewhere to put envelopes. Use it when you want alarms scheduled at exact due timestamps, dynamic backoff without fixed cron wakeups, or serialized schedule coordination.
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
 import type { RunReport } from '@datafridge/core'
-import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -59,8 +64,8 @@ export class Poller extends PollerDO<Env> {
     },
   ])
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -76,7 +81,7 @@ export class Poller extends PollerDO<Env> {
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ results: d1Results(env.DB) })
+    const reader = createReader({ store: d1(env.DB) })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
@@ -101,7 +106,7 @@ The Durable Object stores only schedule rows in its own SQLite. Fetchers execute
 
 ### Alarm lifecycle
 
-`ensureStarted(namespace, instanceName?)` wakes the object and schedules an immediate alarm unless the current registry already has one. The default instance name is `datafridge-poller`. Calling it on every read is safe and also re-ignites the chain after a deployment.
+`ensureStarted(namespace, instanceName?)` wakes the object and schedules an immediate alarm unless the current registry already has one. The default instance name is `datafridge-poller`. Calling it on every read is safe and also re-ignites the chain after a deployment. To keep the request path clear of it, hand it to the handler's `ExecutionContext` with `ctx.waitUntil(ensureStarted(env.POLLER))` instead of awaiting it, or call it from a post-deploy hook.
 
 Every alarm:
 
@@ -111,17 +116,17 @@ Every alarm:
 4. Calls `onRunReport(report)`.
 5. Schedules the next alarm in `finally`, even if reconciliation, storage, or the report hook fails.
 
-For changing finite parameter variants, return a newly constructed registry from a `queries` getter. Added variants get new rows; removed variants lose both their row and envelope. See the [parameterized API](./api.md#parameterized-queries).
+For a variant list that changes at runtime, declare it as a function - it is resolved at every alarm, and may be async. Added variants get new rows; removed variants lose both their row and envelope. See the [parameterized API](./api.md#parameterized-queries).
 
 `onRunReport` is for operational evidence, not payload logging. Prefer category counts or allowlisted identities. Error messages originate in application fetchers and may be sensitive, so sanitize them before logging.
 
-## Combo B: Cron Triggers + D1 full store
+## Cron Triggers: `cronPoller`
 
-Use Combo B when a one-minute scheduler floor is acceptable and you prefer D1 as the only stateful platform component.
+The scheduler here is the handler you export: Cloudflare's cron trigger calls `scheduled`, so nothing has to ignite itself and there is no `ensureStarted`. `cronDriver` is not serialized, so it needs atomic claims - which `d1` provides. Use this pairing when a one-minute scheduler floor is acceptable and you prefer D1 as the only stateful platform component.
 
 ```ts
 import { defineQueries } from '@datafridge/core'
-import { cronPoller, d1Store } from '@datafridge/cloudflare'
+import { cronPoller, d1 } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -140,7 +145,7 @@ const queries = defineQueries([
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
   }),
 }
@@ -156,32 +161,34 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-Cron invocations can overlap, so `cronPoller` uses a non-serialized driver and requires an atomic schedule store. `d1Store` claims with a version-checked D1 update. Invalid `results`-only configurations fail when `cronPoller` is constructed.
+Cron invocations can overlap, so `cronPoller` uses a non-serialized driver and requires an atomic schedule store. `d1` claims with a version-checked D1 update. Invalid `results`-only configurations fail when `cronPoller` is constructed.
 
-Use `cronDriver(ctx)` with `createPoller` directly when the scheduled handler needs the returned `RunReport`:
+Pass `onRunReport` to observe each tick under the same sanitize-before-logging contract as the `PollerDO` hook. Use `cronDriver(ctx)` with `createPoller` directly when the handler needs to do more with the `RunReport` than observe it:
 
 ```ts
 const poller = createPoller({
   queries,
   driver: cronDriver(ctx),
-  store: d1Store(env.DB),
+  store: d1(env.DB),
 })
 const report = await poller.runDue()
 ctx.waitUntil(writeSanitizedOperations(report))
 ```
 
-## Choosing a combination
+## Choosing a scheduler
 
-| | Combo A | Combo B |
+| | `PollerDO` | `cronPoller` |
 |---|---|---|
-| Scheduler | Durable Object alarms | Cron Triggers |
-| Schedule state | Durable Object SQLite | D1 |
+| Driver | Durable Object alarms | Cron Triggers |
+| Schedule plane | Durable Object SQLite | D1 |
 | Claims | Serialized actor | D1 compare-and-swap |
-| Result state | D1 | D1 |
-| Scheduler floor | 1 second safety floor | 1 minute |
+| Result plane | D1 | D1 |
+| Scheduler floor | Exact alarm timestamp, 1-second safety floor | 1 minute |
 | Dynamic due time | Alarm moves to the next due row | Cron stays fixed; due checks remain dynamic |
+| Platform components | Durable Object + D1 | D1 only |
+| Pick it when | You want exact due times and dynamic backoff | You would rather not run a Durable Object |
 
-Do not combine Cron Triggers with `d1Results` alone. It has no schedule plane, and construction rejects the configuration.
+Those two are the arrangements that ship complete on Cloudflare, not the only legal ones: any composition works as long as the schedule plane resolves. Cron Triggers with a result-only store does not - it has no schedule plane, and construction rejects the configuration rather than quietly double-fetching.
 
 ## Construction-time validation
 
@@ -207,10 +214,10 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 
 ## Operational checklist
 
-1. Apply the D1 schema before the first invocation.
+1. Optionally apply the packaged D1 migration; otherwise the first write creates the tables.
 2. Put upstream credentials in Worker secrets.
 3. Keep query params non-secret and finite.
-4. Deploy the Worker and, for Combo A, call a route that invokes `ensureStarted` once.
+4. Deploy the Worker and, when `PollerDO` is the scheduler, call a route that invokes `ensureStarted` once.
 5. Confirm result rows appear and reads return `{ data, fetchedAt, isStale, age }`.
 6. Record sanitized `RunReport` categories, alarm continuity, and an observation start and end condition.
 7. Test failure handling with an authorized, controlled upstream condition. Verify the old envelope remains and subsequent reports show failure and recovery without logging payloads.
@@ -224,7 +231,7 @@ One `PollerDO` instance coordinates the entire registry. Sharding it by source i
 
 ```ts
 import { PollerDO, ensureStarted } from '@datafridge/cloudflare/do'
-import { d1Results, d1Store } from '@datafridge/cloudflare/d1'
+import { d1 } from '@datafridge/cloudflare/d1'
 import { cronDriver, cronPoller } from '@datafridge/cloudflare/cron'
 ```
 

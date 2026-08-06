@@ -4,6 +4,19 @@
 
 datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的本地讀取。第一次成功 refresh 後，stale-if-error 會讓它持續有資料。本頁說明支撐這個承諾的資料模型與語意。
 
+## 語意契約
+
+這六項保證就是產品本身。所有實作都必須遵守：
+
+1. **已經有資料的讀取永不等待。** 回答一次讀取只碰 result store，所以第一次之後的每次讀取都是本地的、立即的。完全沒有資料時它會等第一筆，上限是該 query 的 `timeout` - 若 store 有提供 `readSchedule` 且該列顯示重試已排到之後，就直接回答，不等。
+2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
+3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
+4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。
+5. **寫回一致性。** Version 檢查會拒絕 concurrent 或 zombie executor 的遲到寫回。
+6. **Fail at config time。** 非法 duration、重複名稱、不安全的 lease、不受平台支援的 timeout，以及無法安全 claim 的 store，都會在建構時拋錯。
+
+它們就是規格本身，而不是某份規格的摘要。本頁其餘部分說明實現它們的 lease、version、backoff 與 staleness model；每個 store adapter 都必須通過 `@datafridge/core/contract-tests` 的契約相容性套件，才算正確。
+
 ## 一張圖的架構
 
 ```
@@ -26,7 +39,7 @@ Core 的唯一入口是冪等的 `runDue(now)`。Core 永遠不擁有 event loop
 
 ## 兩個 plane
 
-每個 query 有兩類狀態，一致性需求完全不同，因此分屬兩個 plane。
+每個 query 有兩類狀態，一致性需求完全不同。一個 `Store` 同時持有兩者；這個區分仍然重要，因為它們的一致性需求不同，而且有狀態且 serialized 的 driver 可能自己保管排程那一半。
 
 ### Result plane - 產品本體
 
@@ -37,6 +50,7 @@ interface Envelope<T> {
   data: T
   fetchedAt: number            // epoch ms
   freshUntil: number           // fetchedAt + every; after this, isStale = true
+  validUntil?: number          // 資料自己的到期時間；過了它 status = 'invalid'
   lastError?: { at: number; message: string; count: number }
 }
 ```
@@ -57,12 +71,12 @@ interface ScheduleRow {
 }
 ```
 
-Schedule plane 只有兩個合法的家：
+這一半只有兩個合法的家：
 
-1. 一個具備原子條件寫入（CAS）能力的 store - 適用任何併發環境（多實例 cron、多機部署）。
-2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。
+1. store 本身，前提是它具備原子條件寫入（CAS）能力 - 適用任何併發環境（多實例 cron、多機部署）。
+2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。這時 store 的排程那一半就閒置。
 
-正式的 resolution 規則見 [writing-adapters.md](./writing-adapters.md)。
+正式規則見 [writing-adapters.md](./writing-adapters.md)。
 
 ## Parameter variants 與 identity
 

@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/api.md)
 
-This document describes the shipped Wave 1 API. The [six-guarantee semantic contract](../README.md#the-semantic-contract) is authoritative.
+This document describes the shipped Wave 1 API. The [six-guarantee semantic contract](./concepts.md#the-semantic-contract) is authoritative.
 
 ## `@datafridge/core`
 
@@ -29,26 +29,52 @@ Construction throws `ConfigError` for a non-array registry, an empty or duplicat
 - `now`: the tick timestamp in epoch milliseconds
 - `attempt`: one plus the current consecutive failure count
 
+Two more optional fields shape what gets stored:
+
+```ts
+{
+  name: 'lesson-engagement',
+  every: '15m',
+  codec: {
+    encode: (v) => ({ rows: [...v.byPath] }),
+    decode: (raw) => ({ byPath: new Map(raw.rows) }),
+  },
+  validUntil: ({ now }) => endOfTodayUtc(now),
+  fetch: ...,
+}
+```
+
+`codec` converts the fetched value to plain JSON on write and back on read, so a `Map`, `Set`, or `Date` needs no hand-rolled wrapper types. The stored row stays plain JSON - readable from any language - and only a reader holding the query registry decodes it; a bare reader sees the encoded form. An `encode` that throws counts as a fetch failure and keeps the previous result.
+
+`validUntil` is for data that expires on its own clock: "today's traffic" stops being today's at midnight however recently it was fetched. It returns that boundary in epoch ms (it receives `params` and `now`); the boundary is stored on the result, reads past it report `status: 'invalid'` while still serving the data, and the scheduler re-fetches at the boundary instead of a full period later - `nextRunAt` becomes `min(completion + every, validUntil)`. Freshness by age (`isStale`) and validity of the window are independent axes.
+
 ### Parameterized queries
 
-The accepted Wave 2 slice supports finite runtime variants without generating definitions manually:
+One definition covers a finite set of variants:
 
 ```ts
 const analytics = defineParameterizedQuery({
   name: 'course-analytics',
   every: '10m',
-  variants: () => courseIds.flatMap((courseId) =>
-    ['7d', '30d'].map((window) => ({ courseId, window })),
-  ),
+  dimensions: {
+    window: ['7d', '30d'],
+    courseId: async () => listCourseIds(db),
+  },
   fetch: ({ params, signal }) => fetchAnalytics(params, { signal }),
 })
 
 const queries = defineQueries([analytics])
 ```
 
-`variants` is an array or a synchronous function returning an array. It is evaluated whenever `defineQueries` constructs a registry. A `PollerDO` can return a newly constructed registry from its `queries` getter when its finite runtime set changes. Every variant gets an independent schedule row, lease, failure count, backoff, and result envelope. Normal registry reconciliation creates added variants and deletes removed variants and their envelopes.
+`dimensions` expands to the cartesian product of its entries, one param field per dimension; `variants` names the param objects directly. Pass exactly one of the two. Either way, every variant gets an independent schedule row, lease, failure count, backoff, and result envelope.
 
-Params must be JSON values containing finite numbers, strings, booleans, nulls, arrays, and plain objects. Object keys are sorted before hashing. Cycles, class instances, `undefined`, and non-finite numbers fail during registry construction. Duplicate canonical params fail as duplicate variants.
+**Arrays are static, functions are dynamic.** An array is expanded once at construction. A function - `variants` itself, or any single dimension - is resolved at every tick, may be async, and is where a list that lives in a database belongs. Reconciliation then creates rows for variants that appeared and deletes the row and result of variants that left. A resolution that throws removes nothing: the base keeps everything it already has, and the failure lands in that tick's `RunReport` under the base name.
+
+A resolver receives `{ signal }` exactly as `fetch` does - `courseId: ({ signal }) => listCourseIds(db, { signal })` - and is bound by the base's own `timeout`, so a list that hangs is aborted and treated as a resolution that failed. Bases resolve concurrently, so one hung list does not delay the others. On a cold read that budget is shared with the wait: resolving membership and waiting for the first result cost one `timeout` between them, never two.
+
+Reading a dynamic variant is asymmetric on purpose: a stored result is served without consulting the list, and only a miss resolves it - to fetch a member, or to reject params that are not one.
+
+Params must be JSON values containing finite numbers, strings, booleans, nulls, arrays, and plain objects. Object keys are sorted before hashing. Cycles, class instances, `undefined`, and non-finite numbers are rejected when the variant is expanded. Duplicate canonical params fail as duplicate variants - at construction for static lists, as that tick's failure for dynamic ones.
 
 `queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from schedule rows, D1 keys, and `RunReport`. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
 
@@ -72,11 +98,11 @@ const value = await poller.read<Result>('analytics-7d')
 
 - `queries`: a `Queries` registry or raw query definitions
 - `driver`: `{ serialized, defer(promise), schedule? }`
-- either `store`, or `results` with a resolvable schedule plane
+- `store`: one store holding both result envelopes and schedule rows
 
-Optional fields are `schedule`, `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [schedule plane resolution](./writing-adapters.md#schedule-plane-resolution-rules-fail-at-config-time).
+Optional fields are `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
 
-Construction rejects a missing or malformed driver, conflicting `store` and `results`, an invalid source budget, an unresolved schedule plane, or a non-atomic schedule store under a non-serialized driver.
+Construction rejects a missing or malformed driver, a store missing either half, an invalid source budget, or a store that cannot claim atomically under a non-serialized driver.
 
 `runDue(now?)` reconciles the registry, selects due work, applies per-source budgets, claims leases, runs fetchers concurrently, and returns:
 
@@ -91,27 +117,34 @@ interface RunReport {
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 
-`poller.read(name)` reads only the result store. It throws for a name or parameter variant outside the registry. Pass params and the optional SWR fallback through the options object:
+`poller.read(name, params?, options?)` reads the result store. It throws for a name or parameter variant outside the registry.
 
 ```ts
-await poller.read('course-analytics', {
-  params: { courseId: 'course-a', window: '7d' },
+await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
   swrRefresh: (refresh) => driver.defer(refresh),
 })
 ```
 
+`swrRefresh` receives a refresh promise when the result is stale or its window has expired, and the read returns without awaiting it. A miss needs no such hand-off: the read fetches it. That promise is gated by the schedule: it does nothing unless the query is due, so traffic cannot outpace a failing upstream's backoff, and the lease keeps concurrent refreshes to one upstream call.
+
+A read with **nothing** stored waits for the first result, for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take. An existing result, stale or not, always returns immediately.
+
+The poller fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
+
 ### Reader
 
-A reader has no fetchers or schedule plane:
+A reader has no fetchers: `readResult` is all it needs to answer, and where the store offers `readSchedule` a miss reads the schedule row once, to tell a fetch that is about to land from a retry already scheduled for later:
 
 ```ts
-const reader = createReader({ results })
+const reader = createReader({ store, queries })
 const fixed = await reader.read<Result>('analytics-7d')
 const variant = await reader.read<Result>('course-analytics', {
   courseId: 'course-a',
   window: '7d',
 })
 ```
+
+`queries` is optional, and it decides two things. A name outside the registry throws instead of reading as `null`, and a miss waits for whichever executor is fetching - a reader cannot fetch, but it can wait, for as long as that query's `timeout` allows. Without the registry a reader needs nothing but a store, which is what lets it live in another Worker, another service, or another language; a miss then answers `null` at once, because nothing tells it how long a first result may take.
 
 The result is:
 
@@ -121,6 +154,8 @@ interface ReadResult<T> {
   fetchedAt: number
   isStale: boolean
   age: number
+  status: 'ok' | 'invalid' // 'invalid' once the data's own window passed; data still served
+  validUntil?: number
   lastError?: { at: number; message: string; count: number }
 }
 ```
@@ -129,7 +164,7 @@ interface ReadResult<T> {
 
 ### Stores and test utilities
 
-- `memoryStore()` returns the reference full `Store` implementation.
+- `memoryStore()` returns the reference `Store` implementation.
 - `storeContractSuite(label, factory)` is exported from `@datafridge/core/contract-tests` for Vitest adapter compatibility tests.
 - `FakeClock` and `flushMicrotasks` support deterministic tests.
 - `parseDuration`, `queryKey`, `systemClock`, `ConfigError`, and `TimeoutError` are public utilities.
@@ -144,21 +179,21 @@ All runtime exports are available from the package root. Independent subpaths ar
 | Export | Subpath | Purpose |
 |---|---|---|
 | `PollerDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
-| `d1Results`, `d1Store` | `@datafridge/cloudflare/d1` | Result-only and full D1 stores |
+| `d1` | `@datafridge/cloudflare/d1` | The D1 store: result envelopes and atomic schedule claims |
 | `cronDriver`, `cronPoller` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
 | `INVOCATION_WALL_CLOCK_LIMIT_MS` | package root | Cloudflare timeout ceiling |
 
 ### Durable Object alarms
 
-Subclass `PollerDO<Env>`, provide `queries` and `results(env)`, and optionally provide `sources`. The schedule plane lives in the Durable Object's SQLite storage.
+Subclass `PollerDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps its own schedule bookkeeping in its SQLite storage, so only the store's result half is used.
 
 ```ts
 class Poller extends PollerDO<Env> {
   queries = queries
   sources = { analytics: { maxPerTick: 2 } }
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -175,10 +210,9 @@ The registry, source budgets, and Cloudflare timeout ceiling are validated when 
 
 ### D1 stores
 
-- `d1Results(db)` implements `ResultStore` for Combo A.
-- `d1Store(db)` implements the full atomic `Store` for Combo B.
+- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `PollerDO` carries its own schedule plane and simply leaves D1's unused.
 
-Both require the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
+It applies its own tables before the first write, so the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` is optional; a dropped table under a warm isolate is repaired and retried once. The read path never applies schema - a result table that does not exist yet reads as `null`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
 
 ### Cron Triggers
 
@@ -188,22 +222,23 @@ Both require the packaged migration at `@datafridge/cloudflare/migrations/0001_d
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
+    onRunReport: (report) => logSanitized(report),
   }),
 }
 ```
 
-It validates the query registry, timeout ceiling, and schedule-plane shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createPoller` directly and consume its `RunReport`.
+`onRunReport` carries the same contract as the `PollerDO` hook: sanitize before logging, and a throwing hook is absorbed so it cannot fail the tick. It validates the query registry, timeout ceiling, and store shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createPoller` directly and consume its `RunReport`.
 
 ### Init CLI
 
 The package installs a `datafridge` binary:
 
 ```sh
-pnpm exec datafridge init cloudflare [--config wrangler.toml]
+pnpm exec datafridge init --scheduler <durable-object|cron> --store <d1> [--config wrangler.toml]
 ```
 
-It adds the Durable Object binding and migration, a one-minute Cron Trigger, and a D1 binding. Existing declarations are preserved. The CLI only edits TOML and refuses to create a conflicting TOML file beside `wrangler.json` or `wrangler.jsonc`.
+Both flags are required: there is no default pairing, and only the selected combination's declarations are written. Existing declarations are preserved. The CLI only edits TOML and refuses to create a conflicting TOML file beside `wrangler.json` or `wrangler.jsonc`.
 
 See [Cloudflare setup and operations](./cloudflare.md) for the full deployment sequence.

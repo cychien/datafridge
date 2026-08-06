@@ -6,6 +6,7 @@ import { parse } from 'smol-toml'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { InitError, planInit } from '../src/cli/init-wrangler.js'
+import type { InitSelection } from '../src/cli/init-wrangler.js'
 import { runCli } from '../src/cli/run.js'
 import type { CliIo } from '../src/cli/run.js'
 
@@ -15,27 +16,48 @@ const fixture = readFileSync(
   'utf8',
 )
 
-const plan = (existing: string | null) => planInit(existing, TODAY)
+const DO_SELECTION: InitSelection = { scheduler: 'durable-object', store: 'd1' }
+const CRON_SELECTION: InitSelection = { scheduler: 'cron', store: 'd1' }
+
+const plan = (existing: string | null, selection: InitSelection = DO_SELECTION) =>
+  planInit(existing, TODAY, selection)
+
+const DO_ARGS = ['init', '--scheduler', 'durable-object', '--store', 'd1']
+const CRON_ARGS = ['init', '--scheduler', 'cron', '--store', 'd1']
 
 function parsed(content: string): Record<string, unknown> {
   return parse(content) as Record<string, unknown>
 }
 
 describe('planInit', () => {
-  it('creates a complete wrangler.toml covering both combos when none exists', () => {
+  it('writes exactly what the durable-object scheduler needs, and no cron', () => {
     const result = plan(null)
     expect(result.created).toBe(true)
     expect(result.changed).toBe(true)
-    expect(result.actions.map((a) => a.kind)).toEqual(['add', 'add', 'add', 'add'])
+    expect(result.actions.map((a) => a.kind)).toEqual(['add', 'add', 'add'])
 
     const root = parsed(result.content)
     expect(root).toMatchObject({
       durable_objects: { bindings: [{ name: 'POLLER', class_name: 'Poller' }] },
       migrations: [{ tag: 'v1', new_sqlite_classes: ['Poller'] }],
-      triggers: { crons: ['* * * * *'] },
       d1_databases: [{ binding: 'DB', database_name: 'datafridge', database_id: 'TODO' }],
       compatibility_date: TODAY,
     })
+    // Nothing to delete afterwards: the scheduler you did not pick is absent.
+    expect(root.triggers).toBeUndefined()
+  })
+
+  it('writes exactly what the cron scheduler needs, and no Durable Object', () => {
+    const result = plan(null, CRON_SELECTION)
+    expect(result.actions.map((a) => a.kind)).toEqual(['add', 'add'])
+
+    const root = parsed(result.content)
+    expect(root).toMatchObject({
+      triggers: { crons: ['* * * * *'] },
+      d1_databases: [{ binding: 'DB', database_name: 'datafridge', database_id: 'TODO' }],
+    })
+    expect(root.durable_objects).toBeUndefined()
+    expect(root.migrations).toBeUndefined()
   })
 
   it('is idempotent: a second run changes nothing and adds nothing', () => {
@@ -45,7 +67,7 @@ describe('planInit', () => {
     const second = plan(first.content)
     expect(second.changed).toBe(false)
     expect(second.content).toBe(first.content)
-    expect(second.actions.map((a) => a.kind)).toEqual(['skip', 'skip', 'skip', 'skip'])
+    expect(second.actions.map((a) => a.kind)).toEqual(['skip', 'skip', 'skip'])
   })
 
   it('preserves unrelated user content byte-for-byte and only appends', () => {
@@ -102,7 +124,7 @@ new_sqlite_classes = ["Poller"]
 [triggers]
 crons = ["*/5 * * * *"]
 `
-    const result = plan(existing)
+    const result = plan(existing, CRON_SELECTION)
     expect(result.actions.find((a) => a.subject === 'triggers.crons')?.kind).toBe('skip')
     expect(parsed(result.content).triggers).toEqual({ crons: ['*/5 * * * *'] })
   })
@@ -111,7 +133,7 @@ crons = ["*/5 * * * *"]
     const existing = `${fixture}
 [triggers]
 `
-    const result = plan(existing)
+    const result = plan(existing, CRON_SELECTION)
     expect(result.actions.find((a) => a.subject === 'triggers.crons')?.kind).toBe('add')
     expect(result.content.match(/\[triggers\]/g)).toHaveLength(1)
     expect(parsed(result.content).triggers).toMatchObject({ crons: ['* * * * *'] })
@@ -172,13 +194,13 @@ describe('runCli', () => {
     writeFileSync(path, fixture)
 
     const first = io(dir)
-    expect(runCli(['init', 'cloudflare'], first)).toBe(0)
+    expect(runCli(DO_ARGS, first)).toBe(0)
     const afterFirst = readFileSync(path, 'utf8')
     expect(afterFirst.startsWith(fixture)).toBe(true)
     expect(first.lines.join('\n')).toContain(`updated ${path}`)
 
     const second = io(dir)
-    expect(runCli(['init', 'cloudflare'], second)).toBe(0)
+    expect(runCli(DO_ARGS, second)).toBe(0)
     expect(readFileSync(path, 'utf8')).toBe(afterFirst)
     expect(second.lines.join('\n')).toContain('nothing written')
   })
@@ -186,7 +208,7 @@ describe('runCli', () => {
   it('creates the file when missing and honors --config', () => {
     dir = mkdtempSync(join(tmpdir(), 'datafridge-init-'))
     const cli = io(dir)
-    expect(runCli(['init', 'cloudflare', '--config', 'infra/wrangler.toml'], cli)).toBe(0)
+    expect(runCli([...CRON_ARGS, '--config', 'infra/wrangler.toml'], cli)).toBe(0)
     const written = readFileSync(join(dir, 'infra/wrangler.toml'), 'utf8')
     expect(parsed(written)).toMatchObject({ triggers: { crons: ['* * * * *'] } })
   })
@@ -198,15 +220,16 @@ describe('runCli', () => {
       writeFileSync(join(dir, siblingName), '{ "name": "my-app" }\n')
 
       const cli = io(dir)
-      expect(runCli(['init', 'cloudflare'], cli)).toBe(1)
+      expect(runCli(DO_ARGS, cli)).toBe(1)
       expect(existsSync(join(dir, 'wrangler.toml'))).toBe(false)
 
       const output = cli.errors.join('\n')
       expect(output).toContain(join(dir, siblingName))
       expect(output).toContain('[[durable_objects.bindings]]')
       expect(output).toContain('[[migrations]]')
-      expect(output).toContain('crons = ["* * * * *"]')
       expect(output).toContain('[[d1_databases]]')
+      // The snippets follow the selection too, so there is nothing extra to prune.
+      expect(output).not.toContain('crons =')
     },
   )
 
@@ -232,7 +255,7 @@ database_id = "1234"
     writeFileSync(path, configured)
 
     const cli = io(dir)
-    expect(runCli(['init', 'cloudflare'], cli)).toBe(1)
+    expect(runCli(CRON_ARGS, cli)).toBe(1)
     expect(readFileSync(path, 'utf8')).toBe(configured)
 
     const output = cli.lines.join('\n')
@@ -246,19 +269,48 @@ database_id = "1234"
     writeFileSync(path, 'name = "broken')
 
     const cli = io(dir)
-    expect(runCli(['init', 'cloudflare'], cli)).toBe(1)
+    expect(runCli(DO_ARGS, cli)).toBe(1)
     expect(readFileSync(path, 'utf8')).toBe('name = "broken')
     expect(cli.errors.join('\n')).toContain('not valid TOML')
   })
 
-  it('rejects unknown commands and targets with usage', () => {
+  it('requires the scheduler and the store to be chosen, with no default pairing', () => {
+    dir = mkdtempSync(join(tmpdir(), 'datafridge-init-'))
+
+    const bare = io(dir)
+    expect(runCli(['init'], bare)).toBe(1)
+    expect(bare.errors.join('\n')).toContain('requires --scheduler and --store')
+    expect(existsSync(join(dir, 'wrangler.toml'))).toBe(false)
+
+    const noStore = io(dir)
+    expect(runCli(['init', '--scheduler', 'cron'], noStore)).toBe(1)
+    expect(noStore.errors.join('\n')).toContain('requires --scheduler and --store')
+
+    const badScheduler = io(dir)
+    expect(runCli(['init', '--scheduler', 'quartz', '--store', 'd1'], badScheduler)).toBe(1)
+    expect(badScheduler.errors.join('\n')).toContain(
+      "unknown scheduler 'quartz'; supported: durable-object, cron",
+    )
+
+    const badStore = io(dir)
+    expect(runCli(['init', '--scheduler', 'cron', '--store', 'redis'], badStore)).toBe(1)
+    expect(badStore.errors.join('\n')).toContain("unknown store 'redis'; supported: d1")
+
+    const noValue = io(dir)
+    expect(runCli(['init', '--scheduler'], noValue)).toBe(1)
+    expect(noValue.errors.join('\n')).toContain('--scheduler requires a value')
+  })
+
+  it('rejects unknown commands with usage', () => {
     dir = mkdtempSync(join(tmpdir(), 'datafridge-init-'))
     expect(runCli([], io(dir))).toBe(1)
     expect(runCli(['frobnicate'], io(dir))).toBe(1)
-    expect(runCli(['init', 'aws'], io(dir))).toBe(1)
+    expect(runCli(['init', 'aws', '--scheduler', 'cron', '--store', 'd1'], io(dir))).toBe(1)
 
     const help = io(dir)
     expect(runCli(['--help'], help)).toBe(0)
-    expect(help.lines.join('\n')).toContain('Usage: datafridge init cloudflare')
+    const usage = help.lines.join('\n')
+    // The command shape stays the same as targets are added; only the list grows.
+    expect(usage).toContain('Usage: datafridge init --scheduler <durable-object|cron> --store <d1>')
   })
 })

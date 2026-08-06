@@ -1,12 +1,12 @@
 import { DurableObject } from 'cloudflare:workers'
-import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
+import { ConfigError, createPoller, defineQueries, Queries, variantBaseOf } from '@datafridge/core'
 import type {
   QueryDefinition,
-  ResultStore,
   RunReport,
+  SchedulePlane,
   ScheduleRow,
-  ScheduleStore,
   SourceBudget,
+  Store,
 } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
 
@@ -47,8 +47,8 @@ function toScheduleRow(record: ScheduleRecord): ScheduleRow {
 
 // The DO is a single-threaded actor and SqlStorage is synchronous, so every
 // method below is atomic without CAS gymnastics; claim is still implemented
-// with full version/lease semantics so core sees the exact Store contract.
-function sqliteScheduleStore(sql: SqlStorage): ScheduleStore {
+// with full version/lease semantics so core sees the exact contract.
+function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
   const readRecord = (name: string): ScheduleRecord | undefined =>
     sql.exec<ScheduleRecord>('SELECT * FROM datafridge_schedule WHERE name = ?', name).toArray()[0]
 
@@ -125,11 +125,12 @@ function validateSourceBudgets(sources: Record<string, SourceBudget> | undefined
 }
 
 function registrySignature(queries: Queries): string {
-  return JSON.stringify(
-    queries.all
-      .map((q) => [q.name, q.everyMs])
-      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
-  )
+  const names = (entries: Array<[string, number]>) =>
+    entries.sort((a, b) => a[0].localeCompare(b[0]))
+  return JSON.stringify([
+    names(queries.all.map((q) => [q.name, q.everyMs])),
+    names(queries.dynamic.map((d) => [d.baseName, d.everyMs])),
+  ])
 }
 
 /**
@@ -139,24 +140,24 @@ function registrySignature(queries: Queries): string {
  *
  *   export class Poller extends PollerDO<Env> {
  *     queries = defineQueries([...])
- *     results(env: Env) { return d1Results(env.DB) }
+ *     store(env: Env) { return d1(env.DB) }
  *   }
  */
 export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
   abstract queries: Queries | readonly QueryDefinition[]
-  abstract results(env: Env): ResultStore
+  abstract store(env: Env): Store
   sources?: Record<string, SourceBudget>
 
   protected onRunReport(_report: RunReport): void | Promise<void> {}
 
-  readonly #schedule: ScheduleStore
+  readonly #schedule: SchedulePlane
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     ctx.blockConcurrencyWhile(async () => {
       ctx.storage.sql.exec(BOOKKEEPING_SCHEMA)
     })
-    this.#schedule = sqliteScheduleStore(ctx.storage.sql)
+    this.#schedule = sqliteSchedulePlane(ctx.storage.sql)
   }
 
   /**
@@ -168,7 +169,11 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
     const signature = registrySignature(queries)
     const upToDate = this.#readMeta(REGISTRY_META_KEY) === signature
     if (upToDate && (await this.ctx.storage.getAlarm()) !== null) return
-    if (queries.all.length === 0 && this.#scheduleRowCount() === 0) {
+    if (
+      queries.all.length === 0 &&
+      queries.dynamic.length === 0 &&
+      this.#scheduleRowCount() === 0
+    ) {
       this.#writeMeta(REGISTRY_META_KEY, signature)
       return
     }
@@ -182,7 +187,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
       this.#writeMeta(REGISTRY_META_KEY, registrySignature(queries))
       const poller = createPoller({
         queries,
-        results: this.results(this.env),
+        store: this.store(this.env),
         driver: {
           serialized: true,
           defer: (promise) => this.ctx.waitUntil(promise),
@@ -210,16 +215,48 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
 
   async #scheduleNextAlarm(queries: Queries): Promise<void> {
     const now = Date.now()
+    const rows = this.ctx.storage.sql
+      .exec<{
+        name: string
+        next_run_at: number
+      }>('SELECT name, next_run_at FROM datafridge_schedule')
+      .toArray()
+    const byName = new Map(rows.map((row) => [row.name, row.next_run_at]))
+
     let next: number | null = null
-    for (const query of queries.all) {
-      const record = this.ctx.storage.sql
-        .exec<{
-          next_run_at: number
-        }>('SELECT next_run_at FROM datafridge_schedule WHERE name = ?', query.name)
-        .toArray()[0]
-      const at = record ? record.next_run_at : now
+    const consider = (at: number): void => {
       next = next === null ? at : Math.min(next, at)
     }
+    for (const query of queries.all) consider(byName.get(query.name) ?? now)
+
+    if (queries.dynamic.length > 0) {
+      // Dynamic variants exist only as rows, so the alarm has to come from the
+      // table. A base whose resolution failed carries its backoff in a row of
+      // its own: that retry time governs, and its variant rows are ignored
+      // however overdue they look, because none of them can run until the list
+      // resolves again. A base with no rows at all is woken on its own period.
+      const bases = new Set(queries.dynamic.map((entry) => entry.baseName))
+      const blocked = new Set<string>()
+      for (const entry of queries.dynamic) {
+        const retryAt = byName.get(entry.baseName)
+        if (retryAt === undefined) continue
+        consider(retryAt)
+        if (retryAt > now) blocked.add(entry.baseName)
+      }
+      const covered = new Set<string>()
+      for (const row of rows) {
+        const base = variantBaseOf(row.name)
+        if (base === undefined || !bases.has(base) || blocked.has(base)) continue
+        consider(row.next_run_at)
+        covered.add(base)
+      }
+      for (const entry of queries.dynamic) {
+        if (!covered.has(entry.baseName) && !byName.has(entry.baseName)) {
+          consider(now + entry.everyMs)
+        }
+      }
+    }
+
     if (next === null) return
     await this.ctx.storage.setAlarm(Math.max(next, now + MIN_ALARM_DELAY_MS))
   }

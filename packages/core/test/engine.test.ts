@@ -138,6 +138,7 @@ describe('runDue', () => {
       data: 'v1',
       fetchedAt: 0,
       isStale: true,
+      status: 'ok',
       age: 300_000,
       lastError: { at: 300_000, message: 'boom', count: 1 },
     })

@@ -4,6 +4,19 @@ English | [繁體中文](./zh-TW/concepts.md)
 
 datafridge turns slow or unreliable APIs into local reads that are always instant and always labeled with their age. After the first successful refresh, stale-if-error keeps them populated. This page explains the data model and the semantics behind that promise.
 
+## The semantic contract
+
+These six guarantees are the product. Every implementation must uphold them:
+
+1. **A read never waits on a result that exists.** Answering touches only the result store, so every read after the first is local and immediate. With nothing stored yet it waits for the first one, bounded by that query's `timeout` - or answers at once where the store offers `readSchedule` and the row says a retry is already scheduled for later.
+2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
+3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
+4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
+5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
+6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and a store that cannot claim safely throw during construction.
+
+They are the specification, not a summary of one. The rest of this page explains the lease, version, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
+
 ## Architecture in one picture
 
 ```
@@ -26,7 +39,7 @@ Core's single entry point is the idempotent `runDue(now)`. Core never owns an ev
 
 ## The two planes
 
-Every query has two kinds of state with completely different consistency needs, so they live on two planes.
+Every query has two kinds of state with completely different consistency needs. One `Store` holds both; the distinction still matters because their consistency requirements differ, and because a stateful serialized driver may keep the schedule half itself.
 
 ### Result plane - the product itself
 
@@ -37,6 +50,7 @@ interface Envelope<T> {
   data: T
   fetchedAt: number            // epoch ms
   freshUntil: number           // fetchedAt + every; after this, isStale = true
+  validUntil?: number          // the data's own expiry; past it, status = 'invalid'
   lastError?: { at: number; message: string; count: number }
 }
 ```
@@ -57,12 +71,12 @@ interface ScheduleRow {
 }
 ```
 
-The schedule plane has exactly two legitimate homes:
+This half has exactly two legitimate homes:
 
-1. A store with atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
-2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence).
+1. The store, when it has atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
+2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence). The store's schedule half then goes unused.
 
-The formal resolution rules are in [writing-adapters.md](./writing-adapters.md).
+The formal rules are in [writing-adapters.md](./writing-adapters.md).
 
 ## Parameter variants and identity
 

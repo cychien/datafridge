@@ -1,6 +1,6 @@
 import { createReader } from '@datafridge/core'
 import type { QueryDefinition, RunReport } from '@datafridge/core'
-import { d1Results } from '../src/d1.js'
+import { d1 } from '../src/d1.js'
 import { PollerDO } from '../src/do.js'
 
 export interface TestEnv {
@@ -16,8 +16,8 @@ export class TestPoller extends PollerDO<TestEnv> {
   reports: RunReport[] = []
   reportError: Error | undefined
 
-  results(env: TestEnv) {
-    return d1Results(env.DB)
+  store(env: TestEnv) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -33,7 +33,7 @@ export default {
     const url = new URL(request.url)
     if (url.pathname.startsWith('/read/')) {
       const name = url.pathname.slice('/read/'.length)
-      const reader = createReader({ results: d1Results(env.DB) })
+      const reader = createReader({ store: d1(env.DB) })
       return Response.json(await reader.read(name))
     }
     return new Response('not found', { status: 404 })

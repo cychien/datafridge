@@ -1,5 +1,5 @@
 import { createPoller, FakeClock, memoryStore } from '../src/index.js'
-import type { Driver, PollerConfig, ResultStore, ScheduleStore, Store } from '../src/index.js'
+import type { Driver, PollerConfig, SchedulePlane, Store } from '../src/index.js'
 
 export function makeDriver(overrides: Partial<Driver> = {}): Driver {
   return { serialized: false, defer: () => undefined, ...overrides }
@@ -15,15 +15,12 @@ export function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
-export function resultsOnly(store: Store): ResultStore {
-  return {
-    readResult: (name) => store.readResult(name),
-    writeResult: (name, env) => store.writeResult(name, env),
-    deleteResult: (name) => store.deleteResult(name),
-  }
+/** All a reader ever touches: proof that a read-only consumer needs nothing else. */
+export function resultsOnly(store: Store): Pick<Store, 'readResult'> {
+  return { readResult: (name) => store.readResult(name) }
 }
 
-export function scheduleOnly(store: Store): ScheduleStore {
+export function scheduleOnly(store: Store): SchedulePlane {
   return {
     readSchedule: (name) => store.readSchedule(name),
     writeSchedule: (row) => store.writeSchedule(row),

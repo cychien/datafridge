@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import { createReader, defineParameterizedQuery, defineQueries, queryKey } from '../src/index.js'
-import type { QueryParams } from '../src/index.js'
 import { makeHarness } from './helpers.js'
 
 type Params = {
@@ -10,7 +9,7 @@ type Params = {
 }
 
 function analyticsQuery(
-  variants: () => readonly Params[],
+  variants: readonly Params[] | (() => readonly Params[]),
   fetch: (params: Params) => Promise<unknown>,
 ) {
   return defineParameterizedQuery({
@@ -48,11 +47,11 @@ describe('parameterized queries', () => {
     })
     expect(seen).toEqual(variants)
 
-    const reader = createReader({ results: store })
+    const reader = createReader({ store })
     await expect(reader.read('course-analytics', variants[0])).resolves.toMatchObject({
       data: { label: 'alpha:7d' },
     })
-    await expect(poller.read('course-analytics', { params: variants[1]! })).resolves.toMatchObject({
+    await expect(poller.read('course-analytics', variants[1]!)).resolves.toMatchObject({
       data: { label: 'alpha:30d' },
     })
   })
@@ -145,13 +144,10 @@ describe('parameterized queries', () => {
     const params: Params = { courseId: 'alpha', window: '7d' }
     let fetched: Params | undefined
     const queries = defineQueries([
-      analyticsQuery(
-        () => [params],
-        async (value) => {
-          fetched = value
-          return value.courseId
-        },
-      ),
+      analyticsQuery([params], async (value) => {
+        fetched = value
+        return value.courseId
+      }),
     ])
     params.courseId = 'mutated'
 
@@ -160,39 +156,29 @@ describe('parameterized queries', () => {
     expect(fetched).toEqual({ courseId: 'alpha', window: '7d' })
     expect(Object.isFrozen(fetched)).toBe(true)
     await expect(
-      poller.read('course-analytics', {
-        params: { courseId: 'alpha', window: '7d' },
-      }),
+      poller.read('course-analytics', { courseId: 'alpha', window: '7d' }),
     ).resolves.toMatchObject({ data: 'alpha' })
   })
 
   it('rejects duplicate variants after canonicalization', () => {
     const first = { courseId: 'alpha', window: '7d' } as const
     const reordered = { window: '7d', courseId: 'alpha' } as const
-    expect(() =>
-      defineQueries([
-        analyticsQuery(
-          () => [first, reordered],
-          async () => null,
-        ),
-      ]),
-    ).toThrow("query 'course-analytics': duplicate variant params")
+    expect(() => defineQueries([analyticsQuery([first, reordered], async () => null)])).toThrow(
+      "query 'course-analytics': duplicate variant params",
+    )
   })
 
-  it('evaluates a runtime variant provider when the registry is constructed', () => {
-    let variants: QueryParams[] = [{ courseId: 'alpha', window: '7d' }]
+  it('keeps a function-valued provider out of the static registry: it is dynamic', () => {
     const definition = defineParameterizedQuery({
       name: 'runtime',
       every: '1m',
-      variants: () => variants,
+      variants: () => [{ courseId: 'alpha', window: '7d' }],
       fetch: async ({ params }) => params,
     })
 
-    expect(defineQueries([definition]).all).toHaveLength(1)
-    variants = [
-      { courseId: 'alpha', window: '7d' },
-      { courseId: 'beta', window: '30d' },
-    ]
-    expect(defineQueries([definition]).all).toHaveLength(2)
+    const queries = defineQueries([definition])
+    expect(queries.all).toHaveLength(0)
+    expect(queries.dynamic).toHaveLength(1)
+    expect(queries.dynamic[0]!.baseName).toBe('runtime')
   })
 })

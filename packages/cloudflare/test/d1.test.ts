@@ -2,11 +2,11 @@ import { env } from 'cloudflare:test'
 import type { Envelope } from '@datafridge/core'
 import { describe, expect, it } from 'vitest'
 
-import { d1Results } from '../src/d1.js'
+import { d1 } from '../src/d1.js'
 
-describe('d1Results.writeResult envelope size guard', () => {
+describe('d1.writeResult envelope size guard', () => {
   it('rejects an envelope above the D1 row limit and keeps the previous one', async () => {
-    const results = d1Results(env.DB)
+    const results = d1(env.DB)
     const good: Envelope = { data: { posts: ['hello'] }, fetchedAt: 1_000, freshUntil: 61_000 }
     await results.writeResult('posts', good)
 
