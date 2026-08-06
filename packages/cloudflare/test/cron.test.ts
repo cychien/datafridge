@@ -66,7 +66,7 @@ describe('cronPoller config-time validation', () => {
     )
   })
 
-  it('rejects results without a schedule plane (DESIGN rule 4 counterexample, at config time)', () => {
+  it('rejects results without a schedule plane (docs/writing-adapters.md rule 4 counterexample, at config time)', () => {
     expect(
       configErrorMessage(() => cronPoller<CronEnv>({ queries, results: (e) => d1Results(e.DB) })),
     ).toBe(

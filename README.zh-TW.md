@@ -24,7 +24,7 @@
 
 你有一個頁面要呼叫第三方 analytics API。順的時候四秒，而且對方有 rate limit，你不可能每個訪客都打一次。所以你加了 cache，結果每次過期後的第一個訪客都得吞下那四秒。接著上游掛掉，一個數字一小時內根本不會怎麼變的頁面，就這樣噴了錯誤。
 
-datafridge 把這件事反過來做。你只註冊一次 query，給它一個名字和一個間隔。背景的 scheduler 定期刷新，把結果寫進你自己的資料庫。你的 request handler 只做一次本地讀取，不管上游是快、是慢、被限流還是整個掛掉，成本都一樣。`bentocache`、`cachified` 這類 cache library 是 request-triggered：沒人來讀就不會刷新，所以總得有人付那筆延遲。datafridge 照排程刷新，所以沒有人要付。
+datafridge 把這件事反過來做。你只註冊一次 query，給它一個名字和一個間隔。背景的 scheduler 定期刷新，把結果寫進你自己的資料庫。你的 request handler 只做一次本地讀取，不管上游是快、是慢、被限流還是整個掛掉，成本都一樣。`bentocache`、`cachified` 這類 cache library 是 request-triggered。它們的 stale-while-revalidate 模式確實能在項目還熱的期間讓讀取的人不用等，但刷新終究只會因為有人來問才發生：沒人讀的項目會冷掉，而冷掉或完全過期的項目仍然要讓那個人等。datafridge 照排程刷新，所以永遠不會有讀取的人負責把它熱起來。
 
 - **讀取永遠不等上游。** `read()` 只碰你的 result store，沒有別的。不存在「第一個請求替所有人付延遲」的冷啟動。
 - **每次讀取都有日期。** `fetchedAt`、`age`、`isStale` 跟資料一起回來，「多舊算太舊」由你決定，不必用猜的。
@@ -97,7 +97,7 @@ pnpm exec datafridge init cloudflare
 
 這會把 Durable Object binding、SQLite class migration、一分鐘的 Cron Trigger 與 D1 binding 寫進 `wrangler.toml`。它是 idempotent 的，不會改寫你已有的宣告，也拒絕在既有的 `wrangler.json` 或 `wrangler.jsonc` 旁邊建立 TOML（這時它會把宣告印出來讓你自己放）。要指定別的檔案就用 `--config path/to/wrangler.toml`。它會把兩種組合都 scaffold 出來；保留你要用的那組，刪掉另一組。
 
-組合 A 只需要其中三段，短到可以自己手寫：
+組合 A 只需要其中三段，短到可以自己手寫。記得把 init 寫進去的 `[triggers]` 區塊刪掉：那是組合 B 的，下面的 Worker 沒有匯出 `scheduled` handler 可以讓 cron tick 呼叫。
 
 ```toml
 [[durable_objects.bindings]]
@@ -184,7 +184,7 @@ const result = await createReader({ results: d1Results(env.DB) }).read<Summary>(
 - `fetchedAt` 是資料實際被抓下來的時間，epoch 毫秒。
 - `age` 是它此刻多舊，讓你套用自己的門檻（「超過兩小時就顯示警告」）。
 - `age` 超過該 query 的 `every` 之後，`isStale` 為 `true`。它只是標籤、從不阻擋：stale 資料一樣立即回傳，跟 fresh 資料完全一樣。
-- `null` 代表第一次成功刷新還沒落地。這是唯一什麼都拿不到的情況。
+- `null` 代表那個 key 底下沒有 envelope。通常是第一次成功刷新還沒落地，但名稱拼錯、或傳入一組沒有註冊過的 params，同樣會讀到 `null`，因為 reader 身上沒有 registry 可以拿來核對名稱。
 
 如果同一個 process 裡已經有 poller，就用 `poller.read(name, options)`：它讀同一個 store，並且會額外拒絕 registry 之外的名稱。
 

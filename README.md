@@ -24,7 +24,7 @@
 
 You have a page that calls a third-party analytics API. It takes four seconds on a good day, the vendor rate-limits you, and you cannot call it once per visitor. So you cache it - and now the first visitor after every expiry eats the four seconds. Then the vendor has an outage, and a page whose numbers barely move in an hour renders an error.
 
-datafridge turns that around. You register a query once, with a name and an interval. A scheduler refreshes it in the background and writes the result into your own database. Your request handler does one local read, which costs the same whether the upstream is fast, slow, throttled, or gone. Cache libraries like `bentocache` or `cachified` are request-triggered: nothing refreshes until somebody asks, so somebody always pays. datafridge refreshes on a schedule, so nobody does.
+datafridge turns that around. You register a query once, with a name and an interval. A scheduler refreshes it in the background and writes the result into your own database. Your request handler does one local read, which costs the same whether the upstream is fast, slow, throttled, or gone. Cache libraries like `bentocache` or `cachified` are request-triggered. Their stale-while-revalidate modes do spare the reader while an entry is still warm, but a refresh only ever happens because somebody asked: an entry nobody reads goes cold, and a cold or fully expired one makes that caller wait. datafridge refreshes on a schedule, so no reader is ever the one warming it up.
 
 - **Reads never wait on upstream.** `read()` touches your result store and nothing else. There is no cold-start request that pays the latency for everyone else.
 - **Every read is dated.** `fetchedAt`, `age`, and `isStale` come back with the data, so you decide what "too old" means instead of guessing.
@@ -97,7 +97,7 @@ pnpm exec datafridge init cloudflare
 
 This writes the Durable Object binding, the SQLite class migration, a one-minute Cron Trigger, and a D1 binding into `wrangler.toml`. It is idempotent, never rewrites declarations you already have, and refuses to create a TOML file next to an existing `wrangler.json` or `wrangler.jsonc` (it prints the declarations for you to place by hand instead). Use `--config path/to/wrangler.toml` for a different file. It scaffolds both scheduling combinations; keep the one you use and delete the other.
 
-Combo A needs three of them, and they are short enough to write by hand:
+Combo A needs three of them, and they are short enough to write by hand. Delete the `[triggers]` block init wrote: it is combo B's, and the Worker below exports no `scheduled` handler for a cron tick to call.
 
 ```toml
 [[durable_objects.bindings]]
@@ -184,7 +184,7 @@ const result = await createReader({ results: d1Results(env.DB) }).read<Summary>(
 - `fetchedAt` is when the data was actually fetched, in epoch milliseconds.
 - `age` is how old it is right now, so you can apply your own threshold ("show a warning past two hours").
 - `isStale` is `true` once `age` exceeds the query's `every`. It is a label, never a block: stale data is served immediately, exactly like fresh data.
-- `null` means the first successful refresh has not landed yet. That is the only case where you get nothing.
+- `null` means there is no envelope under that key. Usually that is the first successful refresh not having landed yet, but a misspelled name or a params object no variant was registered with also reads as `null`, because a reader holds no registry to check the name against.
 
 If you already have a poller in the same process, use `poller.read(name, options)` instead - it reads the same store and additionally rejects names outside the registry.
 
