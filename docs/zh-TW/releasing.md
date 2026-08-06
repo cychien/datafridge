@@ -72,7 +72,7 @@ npm 只能為已經存在的 package 設定 trusted publisher，因此 `1.0.0` �
 
 **以這種方式發布的 `1.0.0` 不會有 provenance attestation。** npm 只在 GitHub Actions 或 GitLab CI 內產生 provenance；在其他環境 `libnpmpublish` 會丟出 `EUSAGE: Automatic provenance generation not supported for provider: null`。因此 provenance 是從第一個由 CI 發布的 release 開始，而不是從 `1.0.0` 開始。這是不用 token 做 bootstrap 所接受的一次性後果。
 
-目前 package versions 是 `0.0.0`。在執行以下任何步驟前，`1.0.0` 必須已透過 merge 的 version PR 進入 `main`。
+`1.0.0` 已經在 `main` 上：version PR 已於 [#6](https://github.com/cychien/datafridge/pull/6) merge，兩個 packages 都是 `1.0.0`，changeset queue 也是空的。這個前置條件已經滿足，確認即可，不要重跑一次。
 
 ```sh
 git checkout main
@@ -117,6 +117,8 @@ pnpm publish --no-provenance --access public
 
 注意 `pnpm publish --dry-run` 不會走到 npm 的認證與 provenance 程式碼，因此 dry run 乾淨只能證明 tarball 正確。
 
+`--no-provenance` 的處境相同：它只能靠一次真正的 publish 才能完全驗證。它的前提是 npm 會忽略同時出現在 command line 上的 `publishConfig` key，而這是從 npm 原始碼讀出來的、不是實際觀察到的，任何 dry run 都無法驗證。如果 npm 仍然在 provenance 上拒絕 - `EUSAGE: Automatic provenance generation not supported for provider: ...` - 就把兩個 package 的 `publishConfig` 裡的 `provenance` 改成 `false`，作為**不 commit 的本機修改**，發布完再用 `git checkout -- packages/*/package.json` 還原。絕對不要 commit 這個修改：CI 路徑需要的是 `publishConfig.provenance: true`。
+
 完成後在 npmjs.com 上，替 `@datafridge/core` 與 `@datafridge/cloudflare` **各自**進入 Settings，以上面列出的 owner、repository、workflow filename 與 environment 新增 GitHub Actions trusted publisher。只有在這之後才可以 dispatch workflow。
 
 同時也要在 git 上為 `1.0.0` 建立 tag 與 release，因為本機發布不會產生 action 原本會建立的那些 tags。
@@ -124,7 +126,7 @@ pnpm publish --no-provenance --access public
 ## Release sequence
 
 1. Feature changes 與 changeset 通過 review 後 merge 到 `main`。
-2. 讓 workflow 建立 version PR。
+2. 讓 workflow 建立 version PR。在 repository 設定 `can_approve_pull_request_reviews` 還是 `false` 的期間，`version` job 會推出 `changeset-release/main` 但在建立 PR 那步失敗，因此要從那個已推出的 branch 手動開 PR。
 3. Review versions、changelogs、peer range 與 lockfile，再 merge。
 4. 取得 captain 對精確 package versions 與 npm public names 的批准。
 5. 僅 `1.0.0` 依照上面的本機首次發布 runbook 執行，然後設定 trusted publishers。

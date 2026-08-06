@@ -72,7 +72,7 @@ npm can only accept a trusted-publisher configuration for a package that already
 
 **`1.0.0` published this way carries no provenance attestation.** npm only generates provenance inside GitHub Actions or GitLab CI; anywhere else `libnpmpublish` throws `EUSAGE: Automatic provenance generation not supported for provider: null`. Provenance therefore starts with the first CI-published release, not with `1.0.0`. That is an accepted, one-time consequence of bootstrapping without a token.
 
-Package versions are `0.0.0` today. `1.0.0` must already be on `main` through a merged version PR before any of this runs.
+`1.0.0` is already on `main`: the version PR landed in [#6](https://github.com/cychien/datafridge/pull/6), so both packages read `1.0.0` and the changeset queue is empty. This precondition is met; confirm it rather than re-create it.
 
 ```sh
 git checkout main
@@ -117,6 +117,8 @@ If your npm account requires 2FA on writes, add `--otp <code>` to each publish c
 
 Note that `pnpm publish --dry-run` never reaches npm's authentication or provenance code, so a clean dry run proves only that the tarball is right.
 
+`--no-provenance` is in the same position: it can only be fully proven by a real publish. It rests on npm ignoring a `publishConfig` key that also appears on the command line, which is read out of npm's source rather than observed, and no dry run can exercise it. If npm still refuses on provenance - `EUSAGE: Automatic provenance generation not supported for provider: ...` - set `provenance` to `false` in each package's `publishConfig` as an **uncommitted local edit**, publish, then revert it with `git checkout -- packages/*/package.json`. Never commit that edit: `publishConfig.provenance: true` is what the CI path needs.
+
 Afterwards, on npmjs.com, for **each** of `@datafridge/core` and `@datafridge/cloudflare`, open Settings and add a GitHub Actions trusted publisher with the owner, repository, workflow filename, and environment listed above. Only then may the workflow be dispatched.
 
 Tag and release `1.0.0` in git as well, since the local publish does not create the tags the action would.
@@ -124,7 +126,7 @@ Tag and release `1.0.0` in git as well, since the local publish does not create 
 ## Release sequence
 
 1. Merge feature changes and their changeset to `main` after review.
-2. Let the workflow open the version PR.
+2. Let the workflow open the version PR. While the repository setting `can_approve_pull_request_reviews` is `false`, the `version` job pushes `changeset-release/main` but fails at PR creation, so open that PR by hand from the pushed branch.
 3. Review its versions, changelogs, peer range, and lockfile, then merge it.
 4. Obtain captain approval for the exact package versions and npm public names.
 5. For `1.0.0` only, follow the local first-publication runbook above and then configure trusted publishers.
