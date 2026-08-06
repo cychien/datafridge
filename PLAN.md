@@ -81,7 +81,7 @@ DESIGN.md 裡走過的每一條時間軸都變成一個測試案例：
 - README（語意契約放最前面）、API docs、npm publish with provenance
 - Dogfood 發現並由 captain 接受一個提前交付的 Wave 2 slice：finite parameterized queries。支援 runtime variants、canonical SHA-256 identity、每個 variant 獨立 schedule/lease/backoff/envelope、增刪 reconcile，以及 base name + params direct read；identity 與 evidence 不含 raw params 或 secrets
 - **測試**：deterministic variant identity、canonical collision/非法 params、獨立成功/失敗/lease state、added/removed reconcile、direct read，以及 PollerDO + D1 variant lifecycle
-- **驗收**：dogfood 期間 zero 手動介入；RunReport log 裡 lease/backoff 行為與設計一致
+- **驗收**：captain 已接受 accelerated production observation 取代 multi-day window；sanitized RunReport evidence 證明 alarm continuity、parameter variants、serialized lease/concurrency、stale-if-error/backoff 與自動 recovery，見 [docs/m4-acceptance.md](./docs/m4-acceptance.md)
 
 ## 里程碑依賴
 
