@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/releasing.md)
 
-This repository uses Changesets and a manually dispatched, post-merge GitHub Actions publish job. No release action should run from a feature branch.
+This repository uses Changesets and a manually dispatched, post-merge GitHub Actions publish job that authenticates with npm Trusted Publishing. There is no npm token. The one exception is the first publication of `1.0.0`, which the captain performs locally because npm cannot register a trusted publisher for a package that does not exist yet. No release action should run from a feature branch.
 
 ## Package strategy
 
@@ -46,9 +46,16 @@ Never put credentials, private analytics, or private consumer wiring into tarbal
 1. `version` runs only on a push to `main`. If changesets are pending it creates or updates the version PR; that PR must be reviewed and merged normally. If none are pending it succeeds as a no-op. The job passes no publish script, so it cannot publish.
 2. `publish` runs only on a `workflow_dispatch` against `main`, which a captain triggers once the versioned packages are on `main`. Only that event can enter the `npm` environment.
 
-The publish job checks out `main`, installs with the lockfile, refuses to continue while any changeset is still pending, runs lint, typecheck, tests, and package verification, then calls Changesets publish. It uses a GitHub-hosted runner, Node 24 with npm 11.5.1 or newer, `id-token: write`, public `publishConfig`, and provenance. Actions are pinned by commit SHA with the corresponding tag noted alongside. The action creates package tags and GitHub releases only after publication.
+The publish job checks out `main`, pins npm, installs with the lockfile, refuses to continue while any changeset is still pending, runs lint, typecheck, tests, and package verification, then calls Changesets publish. It uses a GitHub-hosted runner, Node 24, `id-token: write`, public `publishConfig`, and provenance. Actions are pinned by commit SHA with the corresponding tag noted alongside. The action creates package tags and GitHub releases only after publication.
 
 `changesets/action` is pinned to `v1`, the line that supports the `@changesets/cli` v2 this repository installs. The `v2` action line requires `@changesets/cli` v3 and fails immediately against a v2 CLI, so the two must be upgraded together or not at all.
+
+### Authentication is npm Trusted Publishing
+
+There is no npm token, and no Actions secret of any kind. The workflow authenticates with OIDC: `id-token: write` lets npm exchange a GitHub-issued id token for a short-lived publishing token. Two consequences shape the workflow:
+
+- **npm is pinned.** `changeset publish` shells out to `pnpm publish`, which packs a tarball and hands the registry call to the npm CLI. Trusted publishing arrived in npm 11.5.0, and Node releases 24.0.0 through 24.4.1 shipped npm older than that, so the job installs a fixed npm rather than inheriting whatever the runner resolves for `node-version: 24`. `scripts/assert-npm-supports-trusted-publishing.mjs` then checks the npm that `pnpm publish` will actually invoke, which is the one next to the running node executable rather than the first `npm` on `PATH`.
+- **`registry-url` is deliberately absent** from `actions/setup-node`. It writes an `.npmrc` whose `_authToken` expands to the literal string `${NODE_AUTH_TOKEN}` when no such variable exists. npm reads that as a credential, so a failed OIDC exchange would surface as an opaque `401` instead of a clear `ENEEDAUTH`. With no `.npmrc`, OIDC is the only credential source and its absence fails loudly.
 
 Configure the GitHub `npm` environment with required reviewers. Configure npm trusted publishers for both scoped packages with:
 
@@ -56,18 +63,72 @@ Configure the GitHub `npm` environment with required reviewers. Configure npm tr
 - repository: `datafridge`
 - workflow filename: `release.yml`
 - environment: `npm`
-- allowed action: `npm publish`
 
-Trusted publishing requires an existing npm package. If npm does not permit trusted-publisher setup before the first release, the captain must explicitly approve a one-time bootstrap and provide a short-lived, least-privilege `NPM_TOKEN` through the protected `npm` environment. The same reviewed `release.yml` run must perform the initial publish with provenance. Immediately afterward, remove the token, configure trusted publishing for both packages, and keep future releases OIDC-only. Never place a token in repository configuration, logs, commands, or PR evidence.
+**Do not dispatch the workflow until trusted publishing is configured for both packages.** There is no token to fall back on, so the publish step will simply fail.
+
+## First publication of 1.0.0 (captain, local, one time only)
+
+npm can only accept a trusted-publisher configuration for a package that already exists, so `1.0.0` has to be published by hand. Everything after `1.0.0` goes through the dispatched workflow.
+
+**`1.0.0` published this way carries no provenance attestation.** npm only generates provenance inside GitHub Actions or GitLab CI; anywhere else `libnpmpublish` throws `EUSAGE: Automatic provenance generation not supported for provider: null`. Provenance therefore starts with the first CI-published release, not with `1.0.0`. That is an accepted, one-time consequence of bootstrapping without a token.
+
+Package versions are `0.0.0` today. `1.0.0` must already be on `main` through a merged version PR before any of this runs.
+
+```sh
+git checkout main
+git pull --ff-only
+git status --porcelain   # must be empty
+```
+
+Authenticate; you are not currently logged in locally:
+
+```sh
+npm login
+npm whoami
+```
+
+Run the same gates CI would, then publish each package from inside its own directory:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm lint && pnpm typecheck && pnpm test && pnpm release:check
+
+cd packages/core
+pnpm publish --no-provenance --access public
+
+cd ../cloudflare
+pnpm publish --no-provenance --access public
+```
+
+Each part of that command is load-bearing:
+
+- **`pnpm publish`, never `npm publish`.** `@datafridge/cloudflare` declares `"@datafridge/core": "workspace:^"`. pnpm rewrites that to a real semver range while packing; npm does not. Verify it yourself before publishing - `pnpm pack` yields `"@datafridge/core": "^1.0.0"`, whereas `npm pack` leaves the literal `workspace:^`, which no consumer can resolve:
+
+  ```sh
+  pnpm -C packages/cloudflare pack --pack-destination /tmp/datafridge-pack
+  tar -xzOf /tmp/datafridge-pack/datafridge-cloudflare-1.0.0.tgz package/package.json | grep datafridge/core
+  ```
+
+- **`--no-provenance`.** Both packages set `publishConfig.provenance: true`, which is correct for CI and fatal locally. npm ignores a `publishConfig` key that was also given on the command line, so this flag is what turns provenance off; editing the committed `package.json` is not the way to do it.
+- **`cd` into each package, not `pnpm -C` or `pnpm --filter`.** `pnpm -C packages/core publish` leaks `packages/core publish` into npm's argv and dies with `EUSAGE`. `pnpm --filter @datafridge/core publish` takes pnpm's recursive path, which silently drops `--no-provenance` and so fails on provenance instead.
+- **No `--no-git-checks`.** On a clean `main` pnpm's own guard passes, and leaving it on means pnpm refuses to publish from the wrong branch or a dirty tree.
+
+If your npm account requires 2FA on writes, add `--otp <code>` to each publish command.
+
+Note that `pnpm publish --dry-run` never reaches npm's authentication or provenance code, so a clean dry run proves only that the tarball is right.
+
+Afterwards, on npmjs.com, for **each** of `@datafridge/core` and `@datafridge/cloudflare`, open Settings and add a GitHub Actions trusted publisher with the owner, repository, workflow filename, and environment listed above. Only then may the workflow be dispatched.
+
+Tag and release `1.0.0` in git as well, since the local publish does not create the tags the action would.
 
 ## Release sequence
 
 1. Merge feature changes and their changeset to `main` after review.
-2. Let the workflow open the version PR for `1.0.0`.
+2. Let the workflow open the version PR.
 3. Review its versions, changelogs, peer range, and lockfile, then merge it.
-4. Obtain captain approval for the exact package versions, npm public names, workflow dispatch, tags, releases, and any bootstrap credential step.
-5. Approve the protected `npm` environment and dispatch `release.yml` on `main`.
-6. Verify npm provenance, package contents, tags, releases, and clean consumer imports.
-7. Remove any bootstrap token and enforce trusted publishing.
+4. Obtain captain approval for the exact package versions and npm public names.
+5. For `1.0.0` only, follow the local first-publication runbook above and then configure trusted publishers.
+6. For every later release, approve the protected `npm` environment and dispatch `release.yml` on `main`.
+7. Verify npm provenance (from the first CI-published release onward), package contents, tags, releases, and clean consumer imports.
 
 Do not publish, tag, reserve a name, create a GitHub release, or dispatch the workflow from a feature branch.

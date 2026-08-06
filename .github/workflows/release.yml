@@ -33,8 +33,9 @@ jobs:
           commit: 'chore: version packages'
 
   # Manual dispatch on main only. The single job that can publish: it is the only one
-  # that enters the protected npm environment and receives NODE_AUTH_TOKEN. A push
+  # that enters the protected npm environment and requests an OIDC id token. A push
   # never satisfies this condition, and a dispatch on any other ref never satisfies it.
+  # There is no npm token anywhere: authentication is npm Trusted Publishing (OIDC).
   publish:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -45,10 +46,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      # Deliberately no registry-url: it writes an .npmrc whose _authToken expands to the
+      # literal '${NODE_AUTH_TOKEN}' when no token exists, which reads as a credential and
+      # would turn a failed OIDC exchange into an opaque 401 instead of a clear ENEEDAUTH.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+      # node-version 24 floats, and Node 24.0.0 through 24.4.1 shipped npm older than the
+      # 11.5.x that introduced trusted publishing, so pin npm rather than inherit it.
+      - name: Pin npm for trusted publishing
+        run: |
+          npm install -g npm@11.19.0
+          node scripts/assert-npm-supports-trusted-publishing.mjs
       - run: pnpm install --frozen-lockfile
       # changesets/action versions instead of publishing while changesets are pending,
       # so fail loudly on a dispatch that arrives before the version PR is merged.
@@ -63,5 +72,3 @@ jobs:
         with:
           publish: pnpm release
           createGithubReleases: true
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
