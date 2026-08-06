@@ -41,13 +41,14 @@ Tarball 或 release evidence 絕不能包含 credential、private analytics 或 
 
 ## Automation
 
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) 有三個 least-privilege stages：
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) 有兩個 least-privilege jobs，各自以觸發 event 作為 gate：
 
-1. Push 到 `main` 時選擇 Changesets mode。
-2. 有 changesets 時，version job 可建立或更新 version PR。該 PR 必須經過一般 review 與 merge。
-3. Versioned packages 位於 `main` 後，由 captain 手動 dispatch workflow。只有此 event 能進入 `npm` environment 並執行 publish job。
+1. `version` 只在 push 到 `main` 時執行。有 pending changesets 時建立或更新 version PR，該 PR 必須經過一般 review 與 merge；沒有時則以 no-op 成功結束。此 job 不傳入 publish script，因此無法 publish。
+2. `publish` 只在針對 `main` 的 `workflow_dispatch` 時執行，由 captain 在 versioned packages 進入 `main` 後手動觸發。只有此 event 能進入 `npm` environment。
 
-Publish job 會 checkout `main`、依 lockfile 安裝、執行 lint、typecheck、tests 與 package verification，再呼叫 Changesets publish。它使用 GitHub-hosted runner、Node 24 與 npm 11.5.1 以上版本、`id-token: write`、public `publishConfig` 與 provenance。Actions 都 pin 到 commit SHA。只有 publication 成功後，action 才建立 package tags 與 GitHub releases。
+Publish job 會 checkout `main`、依 lockfile 安裝、在還有任何 pending changeset 時拒絕繼續、執行 lint、typecheck、tests 與 package verification，再呼叫 Changesets publish。它使用 GitHub-hosted runner、Node 24 與 npm 11.5.1 以上版本、`id-token: write`、public `publishConfig` 與 provenance。Actions 都 pin 到 commit SHA，並在旁註明對應的 tag。只有 publication 成功後，action 才建立 package tags 與 GitHub releases。
+
+`changesets/action` pin 在 `v1`，也就是支援本 repository 所安裝的 `@changesets/cli` v2 的那條線。`v2` action 線要求 `@changesets/cli` v3，對著 v2 CLI 會立刻失敗，因此兩者必須一起升級，否則都不要動。
 
 GitHub `npm` environment 必須設定 required reviewers。兩個 scoped packages 的 npm trusted publisher 設定為：
 
