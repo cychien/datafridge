@@ -40,7 +40,7 @@ datafridge 幫你處理這件事。你只需要註冊一次 query，設定 sched
    ┌─────────────────────────────────────────────┐
    │ your store                                  │
    └──────┬──────────────────────────────────────┘
-          │ read() - 一次本地查詢，永遠不等上游
+          │ read() - 一次本地查詢
           ▼
    { data, fetchedAt, isStale, age }
 ```
@@ -155,7 +155,7 @@ const result = await reader.read<Summary>('weekly-summary')
 `queries` 是選填的。
 
 ```ts
-{ data: Summary, fetchedAt: number, isStale: boolean, age: number, lastError?: { at, message, count } } | null
+{ data: Summary, fetchedAt, isStale, age, status: 'ok' | 'invalid', validUntil?, lastError? } | null
 ```
 
 - `fetchedAt` 是資料實際被抓下來的時間，epoch 毫秒。
@@ -214,7 +214,7 @@ export default {
 }
 ```
 
-不論你註冊多少 query，上游呼叫都不會超過 `maxPerTick × tick 頻率`。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
+不論你註冊多少 query，排程刷新都不會超過 `maxPerTick × tick 頻率`。冷讀取在 miss 時觸發的抓取由 lease 保證同一個 key 只有一次，但目前還不計入這個預算。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
 
 Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` 加上隨機偏移，所以 `5m`、`10m`、`1h` 的 query 不會永遠對齊在同一個 tick、一次擠爆同一個 source。預算是保險絲，jitter 讓保險絲平常不用燒。
 

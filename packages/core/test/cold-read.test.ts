@@ -8,7 +8,7 @@ import {
   flushMicrotasks,
   memoryStore,
 } from '../src/index.js'
-import { deferred, makeDriver } from './helpers.js'
+import { deferred, makeDriver, resultsOnly } from './helpers.js'
 
 const queries = defineQueries([{ name: 'q', every: '5m', timeout: '30s', fetch: async () => 'v1' }])
 
@@ -214,6 +214,85 @@ describe('reader.read on a cold query', () => {
     await clock.advance(999)
     expect(await Promise.race([read, Promise.resolve('pending')])).toBe('pending')
     await clock.advance(1)
+    await expect(read).resolves.toBeNull()
+  })
+})
+
+describe('a reader that can see the schedule stops waiting for a backoff', () => {
+  const failing = defineQueries([
+    {
+      name: 'q',
+      every: '5m',
+      timeout: '30s',
+      fetch: async () => {
+        throw new Error('upstream down')
+      },
+    },
+  ])
+
+  it('answers a backing-off query at once instead of polling out the timeout', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const poller = createPoller({
+      queries: failing,
+      store,
+      driver: makeDriver({ serialized: true }),
+      clock,
+      random: () => 0,
+    })
+    await poller.runDue()
+    expect((await store.readSchedule('q'))!.nextRunAt).toBeGreaterThan(clock.now())
+
+    // The full store gives the reader readSchedule, so it can tell a scheduled
+    // retry from a fetch that is about to land.
+    const reader = createReader({ store, queries: failing, clock })
+    await expect(reader.read('q')).resolves.toBeNull()
+    expect(clock.now()).toBe(0)
+  })
+
+  it('still waits while another executor holds the lease', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const queries = defineQueries([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    const poller = createPoller({
+      queries,
+      store,
+      driver: makeDriver({ serialized: true }),
+      clock,
+      random: () => 0,
+    })
+    const reader = createReader({ store, queries, clock })
+
+    await store.claim('q', 0, clock.now() + 60_000, clock.now())
+    const waiting = reader.read<string>('q')
+    await flushMicrotasks()
+
+    await store.writeResult('q', {
+      data: 'v1',
+      fetchedAt: clock.now(),
+      freshUntil: clock.now() + 1,
+    })
+    await clock.advance(50)
+    await expect(waiting).resolves.toMatchObject({ data: 'v1' })
+    void poller
+  })
+
+  it('a store without readSchedule keeps the old behaviour', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const poller = createPoller({
+      queries: failing,
+      store,
+      driver: makeDriver({ serialized: true }),
+      clock,
+      random: () => 0,
+    })
+    await poller.runDue()
+
+    const reader = createReader({ store: resultsOnly(store), queries: failing, clock })
+    const read = reader.read('q')
+    await flushMicrotasks()
+    await clock.advance(30_000)
     await expect(read).resolves.toBeNull()
   })
 })

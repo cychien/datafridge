@@ -40,7 +40,7 @@ datafridge handles it for you. You register a query once and configure a schedul
    ┌─────────────────────────────────────────────┐
    │ your store                                  │
    └──────┬──────────────────────────────────────┘
-          │ read() - one local query, never waits on upstream
+          │ read() - one local query
           ▼
    { data, fetchedAt, isStale, age }
 ```
@@ -155,7 +155,7 @@ const result = await reader.read<Summary>('weekly-summary')
 `queries` is optional.
 
 ```ts
-{ data: Summary, fetchedAt: number, isStale: boolean, age: number, lastError?: { at, message, count } } | null
+{ data: Summary, fetchedAt, isStale, age, status: 'ok' | 'invalid', validUntil?, lastError? } | null
 ```
 
 - `fetchedAt` is when the data was actually fetched, in epoch milliseconds.
@@ -214,7 +214,7 @@ export default {
 }
 ```
 
-However many queries you register, upstream calls can never exceed `maxPerTick × tick frequency`. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+However many queries you register, scheduled refreshes can never exceed `maxPerTick × tick frequency`. A cold read that fetches on a miss is deduplicated per key by the lease but does not yet count against that budget. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
 
 Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
 

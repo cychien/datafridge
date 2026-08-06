@@ -20,7 +20,9 @@ Each `runDue` tick groups due queries by source and runs at most `maxPerTick` pe
 Two properties make this the right v1:
 
 - **Stateless.** The budget needs no counters and no shared state, so it is trivially safe across distributed, concurrent executors (multi-instance cron included).
-- **A hard ceiling.** The upstream rate can never exceed `maxPerTick × tick frequency`, regardless of how many queries you register.
+- **A ceiling on scheduled refreshes.** However many queries you register, the ticks can never call upstream more than `maxPerTick × tick frequency` times.
+
+The budget covers scheduled work. A read that finds nothing stored fetches on the spot, and that fetch is deduplicated per key by the lease - a hundred readers of one cold key make one call - but it is not yet counted against a source's budget, so a burst of *distinct* cold keys can exceed the ceiling above. Bringing every upstream call under one shared per-source accounting is the v2 work below.
 
 Jitter is the other half. On first registration, each query's `nextRunAt` gets a random offset, so queries with integer-multiple periods (`5m`, `10m`, `1h`) never permanently align on the same tick and collectively slam one source's budget. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
 

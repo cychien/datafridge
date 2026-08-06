@@ -64,8 +64,13 @@ export async function waitForEnvelope(
 }
 
 export interface ReaderConfig {
-  /** Only readResult is ever called, so a read-only consumer can supply just that. */
-  store: Pick<Store, 'readResult'>
+  /**
+   * readResult is the only method a read needs. A store that also offers
+   * readSchedule - `d1()` does - lets a miss tell "nothing is coming yet" from
+   * "a retry is already scheduled for later" and answer the second one at once
+   * instead of waiting it out.
+   */
+  store: Pick<Store, 'readResult'> & Partial<Pick<Store, 'readSchedule'>>
   /**
    * Rejects names outside it, and carries the timeout a miss waits for. Without
    * it a reader needs nothing but a store, and a miss answers null immediately
@@ -108,6 +113,15 @@ export function createReader(config: ReaderConfig): Reader {
         const found = await dynamic!.member(key)
         if (!found) throw new ConfigError(`unknown query '${name}'`)
         timeoutMs = found.timeoutMs
+      }
+      // Waiting is for a fetch that is happening or about to. A row scheduled
+      // into the future with no live lease means the query is backing off after
+      // a failure, so nothing will land inside this budget.
+      if (store.readSchedule) {
+        const now = clock.now()
+        const row = await store.readSchedule(key)
+        const leaseHeld = row !== null && row.leaseUntil !== null && row.leaseUntil > now
+        if (row !== null && !leaseHeld && row.nextRunAt > now) return null
       }
       const deadline = clock.now() + timeoutMs
       const waited = await waitForEnvelope((k) => store.readResult(k), key, deadline, clock)

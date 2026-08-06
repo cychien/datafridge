@@ -139,6 +139,21 @@ describe('a cold read over a real D1', () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(250)
   })
 
+  it('refuses a dynamic base whose timeout cannot fit an invocation', () => {
+    const tooSlow = defineQueries([
+      {
+        name: 'per-course',
+        every: '30m',
+        timeout: '20m',
+        variants: async () => [{ courseId: 'alpha' }],
+        fetch: async () => ({ ok: true }),
+      },
+    ])
+    expect(() => cronPoller<SchemaEnv>({ queries: tooSlow, store: (e) => d1(e.DB) })).toThrow(
+      /query 'per-course': timeout \(1200000ms\) must be shorter than the 900000ms/,
+    )
+  })
+
   it('refuses a name outside the registry instead of waiting it out', async () => {
     const reader = createReader({ store: d1(env.DB), queries })
     await expect(reader.read('metriks')).rejects.toThrow(/unknown query 'metriks'/)

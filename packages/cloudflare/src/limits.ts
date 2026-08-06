@@ -5,10 +5,17 @@ import { ConfigError, Queries } from '@datafridge/core'
 export const INVOCATION_WALL_CLOCK_LIMIT_MS = 900_000
 
 export function assertTimeoutsFitInvocation(queries: Queries, invocation: string): void {
-  for (const query of queries.all) {
-    if (query.timeoutMs >= INVOCATION_WALL_CLOCK_LIMIT_MS) {
+  // Dynamic bases are checked by name too: their variants only exist as rows, so
+  // queries.all never carries them and an over-long timeout would otherwise be
+  // found by the platform killing the invocation instead of by construction.
+  const named: Array<[string, number]> = [
+    ...queries.all.map((query): [string, number] => [query.name, query.timeoutMs]),
+    ...queries.dynamic.map((entry): [string, number] => [entry.baseName, entry.timeoutMs]),
+  ]
+  for (const [name, timeoutMs] of named) {
+    if (timeoutMs >= INVOCATION_WALL_CLOCK_LIMIT_MS) {
       throw new ConfigError(
-        `query '${query.name}': timeout (${query.timeoutMs}ms) must be shorter than the ` +
+        `query '${name}': timeout (${timeoutMs}ms) must be shorter than the ` +
           `${INVOCATION_WALL_CLOCK_LIMIT_MS}ms wall-clock limit of a Cloudflare ${invocation} ` +
           'invocation; lower the timeout',
       )
