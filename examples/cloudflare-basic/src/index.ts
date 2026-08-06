@@ -7,19 +7,26 @@ export interface Env {
   API: Fetcher
 }
 
+// The fetcher needs a binding, so the registry is a function of env rather than
+// a module constant. Both the scheduler and the read route build it from here,
+// which is how the two sides share one definition.
+const queriesFor = (env: Env) =>
+  defineQueries([
+    {
+      name: 'fake-weather',
+      every: '15s',
+      timeout: '5s',
+      fetch: async ({ signal }) => {
+        const res = await env.API.fetch('https://fake-api.internal/fake-api', { signal })
+        if (!res.ok) throw new Error(`upstream responded ${res.status}`)
+        return res.json()
+      },
+    },
+  ])
+
 export class Poller extends PollerDO<Env> {
   get queries() {
-    return defineQueries([
-      {
-        name: 'fake-weather',
-        every: '15s',
-        fetch: async ({ signal }) => {
-          const res = await this.env.API.fetch('https://fake-api.internal/fake-api', { signal })
-          if (!res.ok) throw new Error(`upstream responded ${res.status}`)
-          return res.json()
-        },
-      },
-    ])
+    return queriesFor(this.env)
   }
 
   store(env: Env) {
@@ -42,7 +49,9 @@ export default {
 
     if (pathname === '/read') {
       await ensureStarted(env.POLLER)
-      const reader = createReader({ store: d1(env.DB) })
+      const reader = createReader({ store: d1(env.DB), queries: queriesFor(env) })
+      // The fake API takes 400ms, so a cold first request waits for it rather
+      // than answering null; every later request is a plain D1 read.
       return Response.json(await reader.read('fake-weather'))
     }
 

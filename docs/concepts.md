@@ -8,7 +8,7 @@ datafridge turns slow or unreliable APIs into local reads that are always instan
 
 These six guarantees are the product. Every implementation must uphold them:
 
-1. **Reads always return immediately.** `read()` only touches the result store and never waits on upstream.
+1. **A read never waits on a result that exists.** `read()` only touches the result store. With nothing stored yet it waits for the first one, bounded by that query's `timeout`; from then on every read is local and immediate.
 2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
 3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
 4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.

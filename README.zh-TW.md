@@ -58,8 +58,6 @@ npm install @datafridge/core @datafridge/cloudflare
 
 ## 定義 query
 
-定義你想 poll 的內容：
-
 ```ts
 import { defineQueries } from '@datafridge/core'
 
@@ -81,31 +79,23 @@ const queries = defineQueries([
 
 ## 接上 scheduler 與 store
 
-誰定時去抓，以及資料放哪。
-
-**誰定時去抓**
+**scheduler**
 
 - `PollerDO` - 用 Cloudflare Durable Object 當排程，到期時間精確。
 - `cronPoller` - 用 Cloudflare Cron Trigger 當排程，最細一分鐘。
 
-**資料放哪**
+**store**
 
 - `d1(env.DB)` - 放進你的 D1。
 
-兩邊可自由搭配，也都可以換成你自己的實作。
+兩邊可自由搭配，也可以自訂義 adapters。
 
 ## 初始化
-
-`datafridge init` 會把你選的那些零件需要的宣告寫好，並把它替你填不了的部分印出來。你指定 scheduler 和 store，它只寫那個組合。
 
 ```sh
 npx --no-install datafridge init --scheduler durable-object --store d1
 # 或：--scheduler cron --store d1
 ```
-
-它是 idempotent 的，不會改寫你已有的設定。
-
-沒有 migration 要先跑：store 會在第一次寫入前自己把需要的儲存空間建好。剩下那些跟你的平台有關的事 - 要建哪個 database、binding 叫什麼名字 - 在該平台自己的文件裡。
 
 Scheduler：`durable-object`、`cron`。Store：`d1`。平台指南：[Cloudflare](./docs/zh-TW/cloudflare.md)。
 
@@ -122,18 +112,20 @@ interface Env {
   POLLER: DurableObjectNamespace<Poller>
 }
 
-export class Poller extends PollerDO<Env> {
-  queries = defineQueries([
-    {
-      name: 'weekly-summary',
-      every: '10m',
-      fetch: async ({ signal }) => {
-        const response = await fetch('https://api.example.com/weekly-summary', { signal })
-        if (!response.ok) throw new Error(`upstream status ${response.status}`)
-        return response.json()
-      },
+const queries = defineQueries([
+  {
+    name: 'weekly-summary',
+    every: '10m',
+    fetch: async ({ signal }) => {
+      const response = await fetch('https://api.example.com/weekly-summary', { signal })
+      if (!response.ok) throw new Error(`upstream status ${response.status}`)
+      return response.json()
     },
-  ])
+  },
+])
+
+export class Poller extends PollerDO<Env> {
+  queries = queries
 
   store(env: Env) {
     return d1(env.DB)
@@ -143,25 +135,24 @@ export class Poller extends PollerDO<Env> {
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ store: d1(env.DB) })
+    const reader = createReader({ store: d1(env.DB), queries })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
 ```
 
-Durable Object 就是這裡的 scheduler，`ensureStarted()` 點燃它 - 沒有這行不會有任何 tick。讀取則直接查 D1，完全不經過 Durable Object。
-
-第一次讀取會回 `null`，因為還沒 fetch 過任何東西。
+`ensureStarted()` 負責啟動 scheduler (只有 durable-object scheduler 需要) - 沒有這行不會有任何 tick。讀取則直接查 D1。
 
 [`examples/cloudflare-basic`](./examples/cloudflare-basic) 是可以跑的版本，在 `wrangler dev` 下輪詢一個故意做慢的假 API。
 
 ## 讀取結果
 
-Reader 只需要一個 result store，沒有 fetcher、也沒有 schedule，所以你可以把它放在另一個 Worker、另一個服務，甚至完全不用 TypeScript：存進去的就是普通的 JSON row。
-
 ```ts
-const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
+const reader = createReader({ store: d1(env.DB), queries })
+const result = await reader.read<Summary>('weekly-summary')
 ```
+
+`queries` 是選填的。
 
 ```ts
 { data: Summary, fetchedAt: number, isStale: boolean, age: number, lastError?: { at, message, count } } | null
@@ -170,13 +161,11 @@ const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-s
 - `fetchedAt` 是資料實際被抓下來的時間，epoch 毫秒。
 - `age` 是它此刻多舊，讓你套用自己的門檻（「超過兩小時就顯示警告」）。
 - `age` 超過該 query 的 `every` 之後，`isStale` 為 `true`。它只是標籤、從不阻擋：stale 資料一樣立即回傳，跟 fresh 資料完全一樣。
-- `null` 代表那個 key 底下什麼都沒有。通常是第一次成功刷新還沒落地，但名稱拼錯、或傳入一組沒有註冊過的 params，同樣會讀到 `null`，因為 reader 身上沒有 registry 可以拿來核對名稱。
-
-如果同一個 process 裡已經有 poller，就用 `poller.read(name, options)`：它讀同一個 store，並且會額外拒絕 registry 之外的名稱。
+- `null` 代表什麼都沒有、而且在時間內也沒等到：上游失敗了，或正在重試之間。沒有給 `queries` 時，冷讀取和拼錯的名字也都會讀到 `null`，因為 reader 沒有 registry 可以參照。
 
 ## 上游失敗時
 
-什麼都不會被丟掉。刷新失敗會保留先前的 cache、把 `lastError` 附在上面，並以帶 jitter 的 exponential backoff 重排：`min(every, 1m * 2^(failCount - 1))`。上限收在 `every`，因為重試得比正常間隔還慢對誰都沒好處。一次成功就把計數歸零。
+什麼都不會被丟掉。刷新失敗會保留先前的 cache、把 `lastError` 附在上面，並以帶 jitter 的 exponential backoff 重排：`min(every, 1m * 2^(failCount - 1))`。
 
 | 發生了什麼 | Scheduler 怎麼做 | `read()` 回什麼 |
 |---|---|---|

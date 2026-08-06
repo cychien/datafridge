@@ -8,7 +8,7 @@ datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的�
 
 這六項保證就是產品本身。所有實作都必須遵守：
 
-1. **讀取永遠立即回傳。** `read()` 只存取 result store，絕不等待上游。
+1. **已經有資料的讀取永不等待。** `read()` 只存取 result store。完全沒有資料時它會等第一筆，上限是該 query 的 `timeout`；從此之後每次讀取都是本地的、立即的。
 2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
 3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
 4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。

@@ -5,7 +5,7 @@ import { ConfigError, TimeoutError } from './errors.js'
 import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
 import { queryKey } from './query-key.js'
-import { shapeRead } from './reader.js'
+import { shapeRead, waitForEnvelope } from './reader.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
@@ -13,6 +13,7 @@ import type {
   QueryDefinition,
   QueryParams,
   ReadResult,
+  ResolvedQuery,
   RunReport,
   SchedulePlane,
   SourceBudget,
@@ -29,13 +30,17 @@ export interface PollerConfig {
 }
 
 export interface PollerReadOptions {
-  params?: QueryParams
+  /** Hand the returned refresh somewhere that outlives the read, e.g. ctx.waitUntil. */
   swrRefresh?: (refresh: Promise<void>) => void
 }
 
 export interface Poller {
   runDue(now?: number): Promise<RunReport>
-  read<T = unknown>(name: string, options?: PollerReadOptions): Promise<ReadResult<T> | null>
+  read<T = unknown>(
+    name: string,
+    params?: QueryParams,
+    options?: PollerReadOptions,
+  ): Promise<ReadResult<T> | null>
 }
 
 export function createPoller(config: PollerConfig): Poller {
@@ -155,6 +160,66 @@ export function createPoller(config: PollerConfig): Poller {
     await executeOne({ query, row }, now, emptyReport())
   }
 
+  /**
+   * Nothing is stored yet and the caller is willing to wait. Fetch it here when
+   * nobody else is on it, otherwise wait for whoever is - the lease keeps that
+   * to one upstream call however many readers arrive at once. The query's own
+   * timeout bounds the wait; a fetch that outlives it keeps going and lands for
+   * the next read.
+   */
+  const readThrough = async <T>(
+    query: ResolvedQuery,
+    key: string,
+  ): Promise<ReadResult<T> | null> => {
+    const start = clock.now()
+    const deadline = start + query.timeoutMs
+    const row = (await schedule.readSchedule(key)) ?? virtualRow(key, start)
+    const leaseHeld = row.leaseUntil !== null && row.leaseUntil > start
+
+    if (!leaseHeld) {
+      // Backoff after a failed attempt: nothing is running and nothing is due,
+      // so waiting would only spend the budget.
+      if (row.nextRunAt > start) return null
+
+      const report = emptyReport()
+      let threw = false
+      const refresh = executeOne({ query, row }, start, report).catch(() => {
+        threw = true
+      })
+      driver.defer(refresh)
+      const settled = await within(refresh, deadline)
+      if (!settled || threw || report.failed.length > 0) return null
+      if (report.ran.length > 0) {
+        return shapeRead<T>(await store.readResult(key), clock.now())
+      }
+      // Lost the claim to an executor that got there first: wait for it.
+    }
+
+    const waited = await waitForEnvelope((k) => store.readResult(k), key, deadline, clock)
+    return shapeRead<T>(waited, clock.now())
+  }
+
+  const within = (promise: Promise<unknown>, deadline: number): Promise<boolean> =>
+    new Promise((resolve) => {
+      let done = false
+      const finish = (settled: boolean): void => {
+        if (done) return
+        done = true
+        resolve(settled)
+      }
+      const handle = clock.setTimeout(() => finish(false), Math.max(0, deadline - clock.now()))
+      promise.then(
+        () => {
+          clock.clearTimeout(handle)
+          finish(true)
+        },
+        () => {
+          clock.clearTimeout(handle)
+          finish(true)
+        },
+      )
+    })
+
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
       const now = nowArg ?? clock.now()
@@ -171,15 +236,24 @@ export function createPoller(config: PollerConfig): Poller {
       return report
     },
 
-    async read<T>(name: string, options?: PollerReadOptions): Promise<ReadResult<T> | null> {
-      const key = queryKey(name, options?.params)
-      if (!queries.getByKey(key)) throw new ConfigError(`unknown query '${name}'`)
-      const env = await store.readResult(key)
-      const shaped = shapeRead<T>(env, clock.now())
-      if (options?.swrRefresh && (shaped === null || shaped.isStale)) {
+    async read<T>(
+      name: string,
+      params?: QueryParams,
+      options?: PollerReadOptions,
+    ): Promise<ReadResult<T> | null> {
+      const key = queryKey(name, params)
+      const query = queries.getByKey(key)
+      if (!query) throw new ConfigError(`unknown query '${name}'`)
+      const shaped = shapeRead<T>(await store.readResult(key), clock.now())
+      // Only staleness needs a background refresh: a miss is served by the read
+      // itself below, so handing out a second refresh would be redundant.
+      if (options?.swrRefresh && shaped?.isStale) {
         options.swrRefresh(refreshOne(key))
       }
-      return shaped
+      // A hit never waits; a miss fetches or waits for whoever is, bounded by
+      // this query's own timeout.
+      if (shaped !== null) return shaped
+      return readThrough<T>(query, key)
     },
   }
 }

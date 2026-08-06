@@ -58,8 +58,6 @@ Both packages are ESM-only and need Node.js 20 or newer for tooling.
 
 ## Defining queries
 
-Define what you want polled:
-
 ```ts
 import { defineQueries } from '@datafridge/core'
 
@@ -81,31 +79,23 @@ const queries = defineQueries([
 
 ## Wiring a scheduler and a store
 
-Who fetches on a timer, and where the data goes.
-
-**Who fetches**
+**scheduler**
 
 - `PollerDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
 - `cronPoller` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
 
-**Where the data goes**
+**store**
 
 - `d1(env.DB)` - your D1.
 
-Either side mixes freely with the other, and either can be your own implementation.
+Either side mixes freely with the other, and you can write your own adapters.
 
 ## Initialization
-
-`datafridge init` writes the declarations your pieces need and prints whatever it could not fill in for you. You name the scheduler and the store, and it writes only that combination.
 
 ```sh
 npx --no-install datafridge init --scheduler durable-object --store d1
 # or: --scheduler cron --store d1
 ```
-
-It is idempotent and never rewrites configuration you already have.
-
-There is no migration to run first: a store creates the storage it needs before its first write. Anything left that is specific to your platform - a database to create, a binding to name - is in that platform's guide.
 
 Schedulers: `durable-object`, `cron`. Stores: `d1`. Platform guides: [Cloudflare](./docs/cloudflare.md).
 
@@ -122,18 +112,20 @@ interface Env {
   POLLER: DurableObjectNamespace<Poller>
 }
 
-export class Poller extends PollerDO<Env> {
-  queries = defineQueries([
-    {
-      name: 'weekly-summary',
-      every: '10m',
-      fetch: async ({ signal }) => {
-        const response = await fetch('https://api.example.com/weekly-summary', { signal })
-        if (!response.ok) throw new Error(`upstream status ${response.status}`)
-        return response.json()
-      },
+const queries = defineQueries([
+  {
+    name: 'weekly-summary',
+    every: '10m',
+    fetch: async ({ signal }) => {
+      const response = await fetch('https://api.example.com/weekly-summary', { signal })
+      if (!response.ok) throw new Error(`upstream status ${response.status}`)
+      return response.json()
     },
-  ])
+  },
+])
+
+export class Poller extends PollerDO<Env> {
+  queries = queries
 
   store(env: Env) {
     return d1(env.DB)
@@ -143,25 +135,24 @@ export class Poller extends PollerDO<Env> {
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ store: d1(env.DB) })
+    const reader = createReader({ store: d1(env.DB), queries })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
 ```
 
-The Durable Object is the scheduler and `ensureStarted()` lights it - without that call nothing ever ticks. Reads go straight to D1 and never touch the Durable Object.
-
-The very first read returns `null`, because nothing has been fetched yet.
+`ensureStarted()` starts the scheduler, which only the durable-object scheduler needs - without that call nothing ever ticks. Reads go straight to D1.
 
 [`examples/cloudflare-basic`](./examples/cloudflare-basic) is this as a runnable app, polling a deliberately slow fake API under `wrangler dev`.
 
 ## Reading a result
 
-A reader needs nothing but a result store. It has no fetchers and no schedule, so you can put one in a different Worker, a different service, or no TypeScript at all - what is stored is a plain JSON row.
-
 ```ts
-const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
+const reader = createReader({ store: d1(env.DB), queries })
+const result = await reader.read<Summary>('weekly-summary')
 ```
+
+`queries` is optional.
 
 ```ts
 { data: Summary, fetchedAt: number, isStale: boolean, age: number, lastError?: { at, message, count } } | null
@@ -170,13 +161,11 @@ const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-s
 - `fetchedAt` is when the data was actually fetched, in epoch milliseconds.
 - `age` is how old it is right now, so you can apply your own threshold ("show a warning past two hours").
 - `isStale` is `true` once `age` exceeds the query's `every`. It is a label, never a block: stale data is served immediately, exactly like fresh data.
-- `null` means there is nothing stored under that key. Usually that is the first successful refresh not having landed yet, but a misspelled name or a params object no variant was registered with also reads as `null`, because a reader holds no registry to check the name against.
-
-If you already have a poller in the same process, use `poller.read(name, options)` instead - it reads the same store and additionally rejects names outside the registry.
+- `null` means there is nothing stored and none arrived in time: the upstream failed, or it is between retries. Without `queries`, a cold read and a misspelled name both read as `null` too, because the reader has no registry to consult.
 
 ## When the upstream fails
 
-Nothing is thrown away. A failed refresh keeps the previously cached result, attaches `lastError` to it, and reschedules with jittered exponential backoff: `min(every, 1m * 2^(failCount - 1))`. The cap is `every`, because retrying slower than the normal interval helps nobody. One success clears the counter.
+Nothing is thrown away. A failed refresh keeps the previously cached result, attaches `lastError` to it, and reschedules with jittered exponential backoff: `min(every, 1m * 2^(failCount - 1))`.
 
 | What happened | What the scheduler does | What `read()` returns |
 |---|---|---|

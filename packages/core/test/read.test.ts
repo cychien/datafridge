@@ -4,9 +4,9 @@ import { ConfigError, createReader } from '../src/index.js'
 import { makeHarness, resultsOnly } from './helpers.js'
 
 describe('read() contract', () => {
-  it('returns null before the first successful fetch', async () => {
+  it('serves the first read itself rather than answering null', async () => {
     const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    expect(await poller.read('q')).toBeNull()
+    expect(await poller.read<string>('q')).toMatchObject({ data: 'v1', isStale: false })
   })
 
   it('throws at once for a query name that is not registered', async () => {
@@ -93,7 +93,7 @@ describe('read() SWR fallback mode', () => {
     await clock.advance(300_000)
 
     const deferredRefreshes: Promise<void>[] = []
-    const stale = await poller.read<string>('q', {
+    const stale = await poller.read<string>('q', undefined, {
       swrRefresh: (p) => deferredRefreshes.push(p),
     })
     expect(stale).toMatchObject({ data: 'v1', isStale: true })
@@ -110,18 +110,24 @@ describe('read() SWR fallback mode', () => {
     await poller.runDue()
 
     const deferredRefreshes: Promise<void>[] = []
-    await poller.read('q', { swrRefresh: (p) => deferredRefreshes.push(p) })
+    await poller.read('q', undefined, {
+      swrRefresh: (p: Promise<void>) => deferredRefreshes.push(p),
+    })
     expect(deferredRefreshes).toHaveLength(0)
     expect(calls).toBe(1)
   })
 
-  it('triggers a refresh when no result exists yet', async () => {
+  it('leaves a miss to the read itself instead of handing out a second refresh', async () => {
     let calls = 0
     const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => `v${++calls}` }])
 
     const deferredRefreshes: Promise<void>[] = []
-    expect(await poller.read('q', { swrRefresh: (p) => deferredRefreshes.push(p) })).toBeNull()
-    expect(deferredRefreshes).toHaveLength(1)
+    expect(
+      await poller.read<string>('q', undefined, {
+        swrRefresh: (p: Promise<void>) => deferredRefreshes.push(p),
+      }),
+    ).toMatchObject({ data: 'v1' })
+    expect(deferredRefreshes).toHaveLength(0)
 
     await Promise.all(deferredRefreshes)
     expect(await poller.read('q')).toMatchObject({ data: 'v1' })

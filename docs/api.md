@@ -91,27 +91,34 @@ interface RunReport {
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 
-`poller.read(name)` reads only the result store. It throws for a name or parameter variant outside the registry. Pass params and the optional SWR fallback through the options object:
+`poller.read(name, params?, options?)` reads the result store. It throws for a name or parameter variant outside the registry.
 
 ```ts
-await poller.read('course-analytics', {
-  params: { courseId: 'course-a', window: '7d' },
+await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
   swrRefresh: (refresh) => driver.defer(refresh),
 })
 ```
+
+`swrRefresh` receives a refresh promise when the result is stale, and the read returns without awaiting it. A miss needs no such hand-off: the read fetches it. That promise is gated by the schedule: it does nothing unless the query is due, so traffic cannot outpace a failing upstream's backoff, and the lease keeps concurrent refreshes to one upstream call.
+
+A read with **nothing** stored waits for the first result, for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take. An existing result, stale or not, always returns immediately.
+
+The poller fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
 
 ### Reader
 
 A reader has no fetchers and never touches the schedule half - `readResult` is the only method it calls:
 
 ```ts
-const reader = createReader({ store })
+const reader = createReader({ store, queries })
 const fixed = await reader.read<Result>('analytics-7d')
 const variant = await reader.read<Result>('course-analytics', {
   courseId: 'course-a',
   window: '7d',
 })
 ```
+
+`queries` is optional, and it decides two things. A name outside the registry throws instead of reading as `null`, and a miss waits for whichever executor is fetching - a reader cannot fetch, but it can wait, for as long as that query's `timeout` allows. Without the registry a reader needs nothing but a store, which is what lets it live in another Worker, another service, or another language; a miss then answers `null` at once, because nothing tells it how long a first result may take.
 
 The result is:
 

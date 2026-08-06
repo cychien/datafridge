@@ -52,7 +52,7 @@ describe('parameterized queries', () => {
     await expect(reader.read('course-analytics', variants[0])).resolves.toMatchObject({
       data: { label: 'alpha:7d' },
     })
-    await expect(poller.read('course-analytics', { params: variants[1]! })).resolves.toMatchObject({
+    await expect(poller.read('course-analytics', variants[1]!)).resolves.toMatchObject({
       data: { label: 'alpha:30d' },
     })
   })
@@ -160,9 +160,7 @@ describe('parameterized queries', () => {
     expect(fetched).toEqual({ courseId: 'alpha', window: '7d' })
     expect(Object.isFrozen(fetched)).toBe(true)
     await expect(
-      poller.read('course-analytics', {
-        params: { courseId: 'alpha', window: '7d' },
-      }),
+      poller.read('course-analytics', { courseId: 'alpha', window: '7d' }),
     ).resolves.toMatchObject({ data: 'alpha' })
   })
 

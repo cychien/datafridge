@@ -1,5 +1,5 @@
 import { createScheduledController, createExecutionContext, env } from 'cloudflare:test'
-import { createReader } from '@datafridge/core'
+import { createReader, defineQueries } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { cronPoller } from '../src/cron.js'
@@ -102,5 +102,45 @@ describe('d1 applies its own schema', () => {
     } as unknown as D1Database
 
     await expect(d1(broken).readResult('metrics')).rejects.toThrow(/network unreachable/)
+  })
+})
+
+describe('a cold read over a real D1', () => {
+  const queries = defineQueries([
+    { name: 'metrics', every: '5m', timeout: '10s', fetch: async () => ({ ok: true }) },
+  ])
+
+  it('a cold read waits for the tick that fills it instead of answering null', async () => {
+    // No tick has run and no tables exist: the cold first request, on the
+    // scheduler whose next tick could be a minute away.
+    const reader = createReader({ store: d1(env.DB), queries })
+    const waiting = reader.read<{ ok: boolean }>('metrics')
+
+    const handler = cronPoller<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
+    await invoke(handler)
+
+    const result = await waiting
+    expect(result).not.toBeNull()
+    expect(result!.data).toEqual({ ok: true })
+  })
+
+  it('a store-only reader answers a cold read immediately, having no timeout to respect', async () => {
+    const bare = createReader({ store: d1(env.DB) })
+    expect(await bare.read('metrics')).toBeNull()
+  })
+
+  it("gives up at the query's own timeout when nothing writes", async () => {
+    const impatient = defineQueries([
+      { name: 'metrics', every: '5m', timeout: '300ms', fetch: async () => ({ ok: true }) },
+    ])
+    const reader = createReader({ store: d1(env.DB), queries: impatient })
+    const started = Date.now()
+    expect(await reader.read('metrics')).toBeNull()
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250)
+  })
+
+  it('refuses a name outside the registry instead of waiting it out', async () => {
+    const reader = createReader({ store: d1(env.DB), queries })
+    await expect(reader.read('metriks')).rejects.toThrow(/unknown query 'metriks'/)
   })
 })

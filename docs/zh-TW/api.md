@@ -91,26 +91,34 @@ interface RunReport {
 
 成功 refresh 會從完成時間排定下一次執行。失敗會保留舊 envelope，並以有 jitter 的 exponential backoff 重試，上限為 `every`。
 
-`poller.read(name)` 只讀 result store。Registry 不存在該 name 或 parameter variant 時會拋錯。Params 與選用 SWR fallback 都放在 options object：
+`poller.read(name, params?, options?)` 讀 result store。Registry 不存在該 name 或 parameter variant 時會拋錯。
 
 ```ts
-await poller.read('course-analytics', {
-  params: { courseId: 'course-a', window: '7d' },
+await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
   swrRefresh: (refresh) => driver.defer(refresh),
 })
 ```
+
+結果 stale 時，`swrRefresh` 會收到一個刷新 promise，而 read 不會等它。Miss 不需要這種交接：讀取自己會去抓。那個 promise 受排程節制：query 沒到期時它什麼都不做，所以流量無法超越失敗上游的 backoff；lease 則讓併發刷新只產生一次上游呼叫。
+
+完全沒有資料的讀取會等第一筆結果，最多等該 query 自己的 `timeout` 那麼久。沒有東西要設定：一個 query，一個「最多多久」的答案。已經有結果時（不論 stale）一律立刻回傳。
+
+Poller 在沒有人持有 lease 時自己抓，有人持有就等那個人，所以同時來多少讀者都只有一次上游呼叫 - 和讓併發 tick 只跑一次的是同一個 lease。Query 正處於 backoff 之間時直接回 `null`，不為一個不會來的東西等待；到達 timeout 時，那次抓取會像在排程 tick 上一樣被 abort 並記為失敗，讀取則回 `null`。
 
 ### Reader
 
 Reader 沒有 fetcher，也從不碰排程那一半 - 它唯一呼叫的方法是 `readResult`：
 
 ```ts
+const reader = createReader({ store, queries })
 const fixed = await reader.read<Result>('analytics-7d')
 const variant = await reader.read<Result>('course-analytics', {
   courseId: 'course-a',
   window: '7d',
 })
 ```
+
+`queries` 是選填的，而它決定兩件事：registry 之外的名字會拋錯而不是讀成 `null`；以及 miss 時會等那個正在抓的 executor - reader 不能自己抓，但它可以等，最多等該 query 的 `timeout` 那麼久。不給 registry 時，reader 只需要一個 store，這正是它能活在另一個 Worker、另一個服務、另一個語言裡的原因；此時 miss 會立刻回 `null`，因為沒有東西告訴它第一筆資料可能要多久。
 
 結果格式為：
 
