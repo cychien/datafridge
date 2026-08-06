@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/api.md)
 
-This document describes the shipped Wave 1 API. The six guarantees in [DESIGN.md section 2](../DESIGN.md#2-語意契約) are authoritative.
+This document describes the shipped Wave 1 API. The [six-guarantee semantic contract](../README.md#the-semantic-contract) is authoritative.
 
 ## `@datafridge/core`
 

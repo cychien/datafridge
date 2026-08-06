@@ -218,6 +218,8 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 
 D1 是 single-region，remote PoP reader 可能產生跨區 latency。Result-plane replica 不在已發布範圍內。
 
+單一 `PollerDO` instance 負責協調整個 registry。依 source 分片是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限，而數十個 query 的 registry 距離那個門檻還很遠。
+
 ## Subpath imports
 
 ```ts

@@ -83,7 +83,7 @@ Driver 是 integration shell，它的義務：
 
 ## 驗收標準：contract compatibility test suite
 
-`@datafridge/core` 附帶一份 Store contract compatibility test suite，首先由內建的 `memoryStore` 參考實作驗證通過。它把設計中的每一條語意時間軸都編成確定性的測試（注入假時鐘、零 sleep）：claim/lease 行為、租約過期重撿、zombie 寫回被拒、兩個併發 `runDue` 對每個 query 恰好 fetch 一次，等等。
+`@datafridge/core` 附帶一份 Store contract compatibility test suite，首先由內建的 `memoryStore` 參考實作驗證通過。它把[概念](./concepts.md)中的每一條語意時間軸都編成確定性的測試（注入假時鐘、零 sleep）：claim/lease 行為、租約過期重撿、zombie 寫回被拒、兩個併發 `runDue` 對每個 query 恰好 fetch 一次，等等。
 
 一個 adapter 通過這份套件對真實後端的完整執行，即為驗收 - 例如 Cloudflare 的 `d1Store` 對真的 D1 binding 跑完整套件，含併發 CAS claim 案例。任何 adapter 都不重寫自己的正確性測試；這份套件就是 adapter 生態的規格書。
 
