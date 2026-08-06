@@ -18,15 +18,19 @@
   /></a>
 </p>
 
-<h3 align="center">A fridge for your API data. Always stocked, always dated.</h3>
+<h3 align="center">Data always on hand. Never at the vendor's mercy.</h3>
 
 <p align="center"><strong>English</strong> · <a href="./README.zh-TW.md">繁體中文</a></p>
 
-You have a page that calls a third-party analytics API. It takes four seconds on a good day, the vendor rate-limits you, and you cannot call it once per visitor. So you cache it - and now the first visitor after every expiry eats the four seconds. Then the vendor has an outage, and a page whose numbers barely move in an hour renders an error.
+When your system depends on third-party data, the third party's bad day looks like your bad day. Their API is what wobbles, and your product is what gets called unreliable.
 
-datafridge turns that around. You register a query once, with a name and an interval. A scheduler refreshes it in the background and writes the result into your own database. Your request handler does one local read, which costs the same whether the upstream is fast, slow, throttled, or gone. Cache libraries like `bentocache` or `cachified` are request-triggered. Their stale-while-revalidate modes do spare the reader while an entry is still warm, but a refresh only ever happens because somebody asked: an entry nobody reads goes cold, and a cold or fully expired one makes that caller wait. datafridge refreshes on a schedule, so no reader is ever the one warming it up.
+That instability has a few shapes: slow responses, data that is sometimes simply not there, and rate limits you hit as soon as traffic grows or calls get frequent. Leave them unhandled and what the user sees is numbers that fail to load - and you are the one they complain to.
 
-- **Reads never wait on upstream.** `read()` touches your result store and nothing else. There is no cold-start request that pays the latency for everyone else.
+datafridge handles it for you. You register a query once and configure a scheduler, a result store, and metadata such as the refresh interval and rate limits. From then on the scheduler writes the latest third-party data into your own database in the background.
+
+Your request handler does one local read, which costs the same whether the upstream is fast, slow, throttled, or gone. Cache libraries like `bentocache` or `cachified` are request-triggered. Their stale-while-revalidate modes do spare the reader while an entry is still warm, but a refresh only ever happens because somebody asked: an entry nobody reads goes cold, and a cold or fully expired one makes that caller wait. datafridge refreshes on a schedule, so no reader is ever the one warming it up.
+
+- **Reads do not wait on upstream.** `read()` touches your result store and nothing else. There is no cold-start request that pays the latency for everyone else.
 - **Every read is dated.** `fetchedAt`, `age`, and `isStale` come back with the data, so you decide what "too old" means instead of guessing.
 - **The vendor's outage is not your outage.** A failed refresh keeps the last good value and records the error next to it. The page keeps rendering.
 - **The rate limit is a config field.** Group queries by `source`, cap how many run per tick, and that ceiling holds no matter how many queries you register.

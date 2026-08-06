@@ -18,15 +18,19 @@
   /></a>
 </p>
 
-<h3 align="center">資料的冰箱。永遠有貨，而且都標好日期。</h3>
+<h3 align="center">資料隨時即拿，穩定可靠</h3>
 
 <p align="center"><a href="./README.md">English</a> · <strong>繁體中文</strong></p>
 
-你有一個頁面要呼叫第三方 analytics API。順的時候四秒，而且對方有 rate limit，你不可能每個訪客都打一次。所以你加了 cache，結果每次過期後的第一個訪客都得吞下那四秒。接著上游掛掉，一個數字一小時內根本不會怎麼變的頁面，就這樣噴了錯誤。
+當系統依賴第三方資料，第三方一不穩，看起來不可靠的卻是我們自己的系統。
 
-datafridge 把這件事反過來做。你只註冊一次 query，給它一個名字和一個間隔。背景的 scheduler 定期刷新，把結果寫進你自己的資料庫。你的 request handler 只做一次本地讀取，不管上游是快、是慢、被限流還是整個掛掉，成本都一樣。`bentocache`、`cachified` 這類 cache library 是 request-triggered。它們的 stale-while-revalidate 模式確實能在項目還熱的期間讓讀取的人不用等，但刷新終究只會因為有人來問才發生：沒人讀的項目會冷掉，而冷掉或完全過期的項目仍然要讓那個人等。datafridge 照排程刷新，所以永遠不會有讀取的人負責把它熱起來。
+這種不穩有幾種樣子：回應慢、資料時有時無、使用量一大或呼叫太頻繁就撞上 rate limit。我們沒有處理這些狀況時，使用者看到的就是數字出不來，而抱怨的對象是我們。
 
-- **讀取永遠不等上游。** `read()` 只碰你的 result store，沒有別的。不存在「第一個請求替所有人付延遲」的冷啟動。
+datafridge 幫你把這件事處理掉。你只要註冊一次 query，設定 scheduler、result store，以及抓取頻率和 rate limit 這類 metadata，背景的 scheduler 就會定期把最新的第三方資料寫進你自己的資料庫。
+
+你的 request handler 只做一次本地讀取，不管上游是快、是慢、被限流還是整個掛掉，成本都一樣。`bentocache`、`cachified` 這類 cache library 是 request-triggered。它們的 stale-while-revalidate 模式確實能在項目還熱的期間讓讀取的人不用等，但刷新終究只會因為有人來問才發生：沒人讀的項目會冷掉，而冷掉或完全過期的項目仍然要讓那個人等。datafridge 則是照排程刷新，所以永遠不會有讀取的人負責把它熱起來。
+
+- **讀取不等上游。** `read()` 只碰你的 result store，沒有別的。不存在「第一個請求替所有人付延遲」的冷啟動。
 - **每次讀取都有日期。** `fetchedAt`、`age`、`isStale` 跟資料一起回來，「多舊算太舊」由你決定，不必用猜的。
 - **上游的 outage 不是你的 outage。** 刷新失敗會保留最後一筆成功值，並把錯誤記在旁邊。頁面照常渲染。
 - **Rate limit 是一個設定欄位。** 用 `source` 分組、限制每個 tick 最多跑幾個，不管你註冊了多少 query，這個上限都成立。
