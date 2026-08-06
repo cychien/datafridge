@@ -28,6 +28,8 @@
 
 datafridge 幫你處理這件事。你只需要註冊一次 query，設定 scheduler、result store，以及抓取頻率和 rate limit 這類 metadata，背景的 scheduler 就會定期把最新的第三方資料寫進你自己的資料庫。
 
+整個 library 就是一個承諾：**你的 app 要資料的時候，永遠拿得到。** 不一定是最新的 - 但永遠有，而且在上游允許的範圍內盡可能新。
+
 ```
    scheduler tick（Durable Object alarm 或 cron）
         │

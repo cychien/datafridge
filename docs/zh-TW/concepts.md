@@ -2,20 +2,42 @@
 
 [English](../concepts.md) | 繁體中文
 
-datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的本地讀取。第一次成功 refresh 後，stale-if-error 會讓它持續有資料。本頁說明支撐這個承諾的資料模型與語意。
+整個 library 就是一條不變量：
+
+> **App 要資料的時候，永遠拿得到。** 不一定是最新的 - 但永遠有，而且在上游允許的範圍內盡可能新。
+
+以下的一切都是從它推導出來的。
+
+## 解法，以及解法欠你的東西
+
+只有兩個機制，也只需要兩個：
+
+- **提前 polling。** Scheduler 依各自的週期刷新每個 query，所以等到有人來問的時候，答案已經在本地了。讀到東西的讀取直接回傳、完全不碰上游，不論它多 stale - 刷新既有資料是 scheduler 的職責，而一個會觸發抓取的讀取，會剛好在上游最撐不住的時候給它最大的壓力。
+- **Miss 時去抓。** 什麼都沒有就沒有東西可回，所以那次讀取自己去抓，上限是該 query 自己的 `timeout`。這是讀取唯一能造成的上游呼叫。
+
+決定替你呼叫上游，就製造了四個問題，而這個 library 四個都自己扛：
+
+| 問題 | 機制 |
+|---|---|
+| Rate limit | 每個 source 一份 quota ledger，記在 store 裡，所有呼叫不論起因都遵守它 |
+| 失敗 | 保留 last-known-good、帶 jitter 的 exponential backoff，供應商指定時間時就照它的 `Retry-After` |
+| 同一個呼叫送兩次 | per-key lease：第一個到的去抓，其他人等寫回 |
+| 一個窗口塞不下的工作量 | 以過期比例排優先序讓沒有東西餓死，並保留一部分額度避免讀者被排程擠掉 |
+
+四個都在同一個地方被回答。排程刷新與讀取 miss 是同一種工作走不同的門進來，而且從同一個 dispatcher 出去：沒有第二條路可以讓其中任何一項失效。
 
 ## 語意契約
 
 這六項保證就是產品本身。所有實作都必須遵守：
 
-1. **已經有資料的讀取永不等待。** 回答一次讀取只碰 result store，所以第一次之後的每次讀取都是本地的、立即的。完全沒有資料時它會等第一筆，上限是該 query 的 `timeout` - 若 store 有提供 `readSchedule` 且該列顯示重試已排到之後，就直接回答，不等。
-2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
-3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
-4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。
-5. **寫回一致性。** Version 檢查會拒絕 concurrent 或 zombie executor 的遲到寫回。
-6. **Fail at config time。** 非法 duration、重複名稱、不安全的 lease、不受平台支援的 timeout，以及無法安全 claim 的 store，都會在建構時拋錯。
+1. **有資料的讀取永不等待、也永不觸碰上游。** 回答一筆已存的結果就是一次本地讀取，fresh、stale、`invalid` 一律如此。
+2. **沒資料的讀取觸發恰好一次上游抓取。** 同時到達的讀者透過 per-key lease 合流成那一次呼叫，等待上限是該 query 的 `timeout`。
+3. **上游呼叫永不超過該 source 宣告的速率，不論是誰引起的。** 排程刷新與讀取觸發的抓取花的是同一份 quota ledger。
+4. **被 rate limit 推遲的工作永不餓死、也不會白白失敗。** 被拒絕的刷新維持到期並以過期比例升權；被拒絕的讀取在自己的 timeout 內等窗口輪轉，並回 `throttled` 而不是假裝沒有這個東西。
+5. **失敗會保留 last-known-good 並以帶 jitter 的 backoff 重試。** 死掉的 executor 的工作在 lease 到期後被接手，遲到的寫回會被 version 拒絕。
+6. **非法設定在建構時拋錯**，不會拖到某個 tick 才爆。
 
-它們就是規格本身，而不是某份規格的摘要。本頁其餘部分說明實現它們的 lease、version、backoff 與 staleness model；每個 store adapter 都必須通過 `@datafridge/core/contract-tests` 的契約相容性套件，才算正確。
+它們就是規格本身，而不是某份規格的摘要。本頁其餘部分說明實現它們的 lease、version、quota、backoff 與 staleness model；每個 store adapter 都必須通過 `@datafridge/core/contract-tests` 的契約相容性套件，才算正確。
 
 ## 一張圖的架構
 

@@ -2,20 +2,42 @@
 
 English | [繁體中文](./zh-TW/concepts.md)
 
-datafridge turns slow or unreliable APIs into local reads that are always instant and always labeled with their age. After the first successful refresh, stale-if-error keeps them populated. This page explains the data model and the semantics behind that promise.
+The whole library is one invariant:
+
+> **When the app wants data, it always has some.** Not necessarily current - but always there, and as current as the upstream will allow.
+
+Everything below is derived from it.
+
+## The solution, and what it owes you
+
+Two mechanisms, and only two:
+
+- **Polling ahead of time.** A scheduler refreshes each query on its own period, so by the time anyone asks, the answer is already local. A read that finds something returns it and touches nothing upstream, however stale it is - refreshing what is already there is the scheduler's job, and a read that could trigger a fetch would put the most load on an upstream exactly when it is least able to take it.
+- **Fetching on a miss.** With nothing stored there is nothing to serve, so that read fetches, bounded by the query's own `timeout`. This is the only upstream call a read can cause.
+
+Choosing to call upstream on your behalf creates four problems, and this library owns all four:
+
+| Problem | Mechanism |
+|---|---|
+| Rate limits | one quota ledger per source, counted in the store, obeyed by every call whatever caused it |
+| Failure | last-known-good kept, jittered exponential backoff, `Retry-After` honoured when a vendor names one |
+| The same call twice | a per-key lease: the first arrival fetches, everyone else waits for the write-back |
+| Too much work for one window | overdue-ratio priority so nothing starves, and a reserve so a reader is not crowded out by the scheduler |
+
+All of them are answered in one place. Scheduled refreshes and read misses are the same work arriving through different doors, and both leave through a single dispatcher: there is no second path along which one of these could fail to apply.
 
 ## The semantic contract
 
 These six guarantees are the product. Every implementation must uphold them:
 
-1. **A read never waits on a result that exists.** Answering touches only the result store, so every read after the first is local and immediate. With nothing stored yet it waits for the first one, bounded by that query's `timeout` - or answers at once where the store offers `readSchedule` and the row says a retry is already scheduled for later.
-2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
-3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
-4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
-5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
-6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and a store that cannot claim safely throw during construction.
+1. **A read that has data never waits and never touches upstream.** Answering an existing result is one local read, fresh, stale or `invalid` alike.
+2. **A read with no data triggers exactly one upstream fetch.** Readers arriving together coalesce into that one call through a per-key lease, and wait no longer than that query's `timeout`.
+3. **Upstream calls never exceed the rate a source declares, whatever caused them.** Scheduled refreshes and read-triggered fetches spend the same quota ledger.
+4. **Work the rate limit pushed back never starves and never fails for nothing.** A refused refresh stays due and climbs by overdue ratio; a refused read waits for the window inside its own timeout, and says `throttled` rather than pretending there is nothing.
+5. **A failure keeps the last-known-good result and retries with jittered backoff.** A dead executor's work is re-claimed once its lease expires, and a late write-back is rejected on version.
+6. **Invalid configuration throws at construction**, never on a tick.
 
-They are the specification, not a summary of one. The rest of this page explains the lease, version, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
+They are the specification, not a summary of one. The rest of this page explains the lease, version, quota, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
 
 ## Architecture in one picture
 

@@ -28,6 +28,8 @@ That instability comes as slow responses, data that is sometimes simply not ther
 
 datafridge handles it for you. You register a query once and configure a scheduler, a result store, and metadata such as the refresh interval and rate limits. From then on the scheduler writes the latest third-party data into your own database in the background.
 
+The whole library is one promise: **when your app wants data, it always has some.** Not necessarily current - but always there, and as current as the upstream will allow.
+
 ```
    scheduler tick (Durable Object alarm, or cron)
         │
