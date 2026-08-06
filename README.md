@@ -114,7 +114,7 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-`class_name` has to match the `PollerDO` subclass your Worker exports.
+`class_name` has to match the `PollerDO` subclass your Worker exports. The `database_id` is the one thing the CLI cannot fill in (it writes `TODO` there): run `pnpm exec wrangler d1 create datafridge`, or pick an existing database, and paste the ID it prints.
 
 **2. Apply the packaged D1 schema.**
 
@@ -161,9 +161,9 @@ export default {
 }
 ```
 
-The Durable Object is the scheduler: it wakes itself with alarms, runs each tick's due queries without ever overlapping two ticks, and keeps its schedule bookkeeping in its own SQLite. Envelopes go to your D1. The read path goes straight to D1 and never touches the Durable Object, so datafridge has no moving parts on the request path at all.
+The Durable Object is the scheduler: it wakes itself with alarms, runs each tick's due queries without ever overlapping two ticks, and keeps its schedule bookkeeping in its own SQLite. Envelopes go to your D1. The read itself goes straight to D1 and never touches the Durable Object - no scheduler, no lock, and no coordinator sits between your handler and the row.
 
-`ensureStarted()` is a cheap idempotent RPC. It lights the alarm chain the first time and re-lights it after a deploy, so hanging it on a read route is fine. It also notices a changed registry: the next tick creates rows for queries you added and drops both the row and the envelope for queries you deleted.
+`ensureStarted()` is a cheap idempotent RPC, and it is the one Durable Object hop in the sample above. It lights the alarm chain the first time and re-lights it after a deploy, so awaiting it on a read route is fine. To keep the request path clear of it entirely, hand it to the handler's `ExecutionContext` instead of awaiting it - `ctx.waitUntil(ensureStarted(env.POLLER))` - or call it from a post-deploy hook. It also notices a changed registry: the next tick creates rows for queries you added and drops both the row and the envelope for queries you deleted.
 
 The very first read returns `null`, because nothing has been fetched yet. Every read after the first successful refresh returns data.
 

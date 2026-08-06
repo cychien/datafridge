@@ -114,7 +114,7 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。
+`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。`database_id` 是 CLI 唯一填不了的欄位（它會寫成 `TODO`）：執行 `pnpm exec wrangler d1 create datafridge`，或選一個既有的 database，把它印出來的 ID 貼進去。
 
 **2. 套用 package 內附的 D1 schema。**
 
@@ -161,9 +161,9 @@ export default {
 }
 ```
 
-Durable Object 在這裡的身分是 scheduler：用 alarm 喚醒自己、執行每個 tick 到期的 query 且兩個 tick 永不重疊、把 schedule 簿記放在自己的 SQLite。Envelope 寫進你的 D1。讀取路徑直接查 D1，完全不經過 Durable Object，所以 request path 上沒有任何 datafridge 的運行元件。
+Durable Object 在這裡的身分是 scheduler：用 alarm 喚醒自己、執行每個 tick 到期的 query 且兩個 tick 永不重疊、把 schedule 簿記放在自己的 SQLite。Envelope 寫進你的 D1。讀取本身直接查 D1，完全不經過 Durable Object - 你的 handler 與那一列資料之間，沒有 scheduler、沒有鎖、也沒有 coordinator。
 
-`ensureStarted()` 是便宜且 idempotent 的 RPC。它第一次會點燃 alarm chain，部署後會重新點燃，所以掛在讀取路由上完全沒問題。它也會察覺 registry 的變動：下一個 tick 會替新增的 query 建立 row，並把刪掉的 query 連 row 與 envelope 一起移除。
+`ensureStarted()` 是便宜且 idempotent 的 RPC，也是上面範例中唯一一次 Durable Object 呼叫。它第一次會點燃 alarm chain，部署後會重新點燃，所以在讀取路由上 await 它完全沒問題。若想讓 request path 完全不碰它，就別 await，改交給 handler 的 `ExecutionContext`：`ctx.waitUntil(ensureStarted(env.POLLER))`，或改在部署後的 hook 呼叫。它也會察覺 registry 的變動：下一個 tick 會替新增的 query 建立 row，並把刪掉的 query 連 row 與 envelope 一起移除。
 
 第一次讀取會回 `null`，因為還沒 fetch 過任何東西。第一次成功刷新之後，每次讀取都會有資料。
 
