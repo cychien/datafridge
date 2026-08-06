@@ -2,7 +2,7 @@ import type { Clock } from './clock.js'
 import { ConfigError } from './errors.js'
 import { queryKey } from './query-key.js'
 import { systemClock } from './system-clock.js'
-import type { Envelope, QueryParams, ReadResult, ResultStore } from './types.js'
+import type { Envelope, QueryParams, ReadResult, Store } from './types.js'
 
 export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> | null {
   if (!env) return null
@@ -16,7 +16,8 @@ export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> |
 }
 
 export interface ReaderConfig {
-  results: ResultStore
+  /** Only readResult is ever called, so a read-only consumer can supply just that. */
+  store: Pick<Store, 'readResult'>
   clock?: Clock
 }
 
@@ -25,11 +26,11 @@ export interface Reader {
 }
 
 export function createReader(config: ReaderConfig): Reader {
-  const { results, clock = systemClock } = config
-  if (!results) throw new ConfigError('createReader requires a results store')
+  const { store, clock = systemClock } = config
+  if (!store) throw new ConfigError('createReader requires a store')
   return {
     async read<T>(name: string, params?: QueryParams): Promise<ReadResult<T> | null> {
-      return shapeRead<T>(await results.readResult(queryKey(name, params)), clock.now())
+      return shapeRead<T>(await store.readResult(queryKey(name, params)), clock.now())
     },
   }
 }

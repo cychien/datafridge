@@ -22,7 +22,7 @@ function parsed(content: string): Record<string, unknown> {
 }
 
 describe('planInit', () => {
-  it('creates a complete wrangler.toml covering both combos when none exists', () => {
+  it('creates a complete wrangler.toml covering both schedulers when none exists', () => {
     const result = plan(null)
     expect(result.created).toBe(true)
     expect(result.changed).toBe(true)

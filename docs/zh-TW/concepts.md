@@ -26,7 +26,7 @@ Core 的唯一入口是冪等的 `runDue(now)`。Core 永遠不擁有 event loop
 
 ## 兩個 plane
 
-每個 query 有兩類狀態，一致性需求完全不同，因此分屬兩個 plane。
+每個 query 有兩類狀態，一致性需求完全不同。一個 `Store` 同時持有兩者；這個區分仍然重要，因為它們的一致性需求不同，而且有狀態且 serialized 的 driver 可能自己保管排程那一半。
 
 ### Result plane - 產品本體
 
@@ -57,12 +57,12 @@ interface ScheduleRow {
 }
 ```
 
-Schedule plane 只有兩個合法的家：
+這一半只有兩個合法的家：
 
-1. 一個具備原子條件寫入（CAS）能力的 store - 適用任何併發環境（多實例 cron、多機部署）。
-2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。
+1. store 本身，前提是它具備原子條件寫入（CAS）能力 - 適用任何併發環境（多實例 cron、多機部署）。
+2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。這時 store 的排程那一半就閒置。
 
-正式的 resolution 規則見 [writing-adapters.md](./writing-adapters.md)。
+正式規則見 [writing-adapters.md](./writing-adapters.md)。
 
 ## Parameter variants 與 identity
 

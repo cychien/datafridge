@@ -72,11 +72,11 @@ const value = await poller.read<Result>('analytics-7d')
 
 - `queries`：`Queries` registry 或 raw query definitions
 - `driver`：`{ serialized, defer(promise), schedule? }`
-- `store`，或可解析 schedule plane 的 `results`
+- `store`：一個同時持有 result envelopes 與 schedule rows 的 store
 
-選用欄位為 `schedule`、`sources`、`clock` 與 `random`。`clock` 和 `random` 供 deterministic adapter 與 test 使用。解析規則見 [schedule plane resolution](./writing-adapters.md#schedule-plane-的-resolution-規則fail-at-config-time)。
+選用欄位為 `sources`、`clock` 與 `random`。`clock` 和 `random` 供 deterministic adapter 與 test 使用。規則見 [排程那一半從哪來](./writing-adapters.md#排程那一半從哪來建構時就決定)。
 
-Missing 或 malformed driver、同時提供 `store` 與 `results`、非法 source budget、無法解析的 schedule plane，以及 non-serialized driver 搭配 non-atomic schedule store，都會在建構時被拒絕。
+Missing 或 malformed driver、缺少任一半的 store、非法 source budget，以及在 non-serialized driver 下無法原子 claim 的 store，都會在建構時被拒絕。
 
 `runDue(now?)` 會 reconcile registry、選擇到期工作、套用 per-source budgets、claim leases、concurrently 執行 fetchers，並回傳：
 
@@ -102,7 +102,7 @@ await poller.read('course-analytics', {
 
 ### Reader
 
-Reader 沒有 fetcher 或 schedule plane：
+Reader 沒有 fetcher，也從不碰排程那一半 - 它唯一呼叫的方法是 `readResult`：
 
 ```ts
 const fixed = await reader.read<Result>('analytics-7d')
@@ -143,21 +143,21 @@ Runtime exports 都可從 package root 使用，也提供獨立 subpaths：
 | Export | Subpath | 用途 |
 |---|---|---|
 | `PollerDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
-| `d1Results`, `d1Store` | `@datafridge/cloudflare/d1` | Result-only 與 full D1 stores |
+| `d1` | `@datafridge/cloudflare/d1` | D1 store：result envelopes 與 atomic schedule claims |
 | `cronDriver`, `cronPoller` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
 | `INVOCATION_WALL_CLOCK_LIMIT_MS` | package root | Cloudflare timeout ceiling |
 
 ### Durable Object alarms
 
-Subclass `PollerDO<Env>`、提供 `queries` 與 `results(env)`，並可選擇提供 `sources`。Schedule plane 位於 Durable Object SQLite storage。
+Subclass `PollerDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提供 `sources`。Durable Object 把自己的排程簿記放在它的 SQLite storage，所以 store 只有 result 那一半會被用到。
 
 ```ts
 class Poller extends PollerDO<Env> {
   queries = queries
   sources = { analytics: { maxPerTick: 2 } }
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -174,8 +174,7 @@ Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及
 
 ### D1 stores
 
-- `d1Results(db)` 實作組合 A 使用的 `ResultStore`。
-- `d1Store(db)` 實作組合 B 使用的 full atomic `Store`。
+- `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。`PollerDO` 自帶 schedule plane，會直接把 D1 的那一半閒置。
 
 兩者都需要 `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`。超過 D1 2,000,000-byte row limit 的寫入會被拒絕，舊 envelope 保持不變。
 
@@ -187,7 +186,7 @@ Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
   }),
 }

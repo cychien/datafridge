@@ -5,12 +5,12 @@ import {
   waitOnExecutionContext,
 } from 'cloudflare:test'
 import { ConfigError, createReader } from '@datafridge/core'
-import type { QueryDef } from '@datafridge/core'
+import type { QueryDef, Store } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { cronPoller } from '../src/cron.js'
 import type { CronScheduledHandler } from '../src/cron.js'
-import { d1Results, d1Store } from '../src/d1.js'
+import { d1 } from '../src/d1.js'
 
 interface CronEnv {
   DB: D1Database
@@ -44,36 +44,23 @@ describe('cronPoller config-time validation', () => {
     return expect.unreachable('expected a ConfigError')
   }
 
-  it('accepts the combo B shape without touching env', () => {
-    expect(() => cronPoller<CronEnv>({ queries, store: (e) => d1Store(e.DB) })).not.toThrow()
-  })
-
-  it('rejects passing both store and results', () => {
-    expect(
-      configErrorMessage(() =>
-        cronPoller<CronEnv>({
-          queries,
-          store: (e) => d1Store(e.DB),
-          results: (e) => d1Results(e.DB),
-        }),
-      ),
-    ).toBe('cronPoller: pass either store or results, not both')
+  it('accepts the cron trigger plus full store shape without touching env', () => {
+    expect(() => cronPoller<CronEnv>({ queries, store: (e) => d1(e.DB) })).not.toThrow()
   })
 
   it('rejects a missing store', () => {
-    expect(configErrorMessage(() => cronPoller<CronEnv>({ queries }))).toBe(
-      'cronPoller requires a store: pass store: (env) => d1Store(env.DB), or results plus schedule',
+    expect(configErrorMessage(() => cronPoller<CronEnv>({ queries } as never))).toBe(
+      'cronPoller requires a store: pass store: (env) => d1(env.DB)',
     )
   })
 
-  it('rejects results without a schedule plane (docs/writing-adapters.md rule 4 counterexample, at config time)', () => {
-    expect(
-      configErrorMessage(() => cronPoller<CronEnv>({ queries, results: (e) => d1Results(e.DB) })),
-    ).toBe(
-      'no valid schedule plane: the cron driver is not serialized and results alone cannot ' +
-        'host schedule bookkeeping; pass a full store with atomic claims ' +
-        '(store: (env) => d1Store(env.DB)) or an explicit schedule factory',
-    )
+  it('rejects a store that cannot claim atomically, since cron invocations overlap', () => {
+    const withoutAtomicClaim = (env: CronEnv): Store => {
+      const store = d1(env.DB)
+      return { ...store, capabilities: { ...store.capabilities, atomicClaim: false } }
+    }
+    const handler = cronPoller<CronEnv>({ queries, store: withoutAtomicClaim })
+    return expect(invoke(handler)).rejects.toThrow(/lacks atomicClaim/)
   })
 
   it('rejects a timeout that cannot fit a cron invocation', () => {
@@ -81,7 +68,7 @@ describe('cronPoller config-time validation', () => {
       configErrorMessage(() =>
         cronPoller<CronEnv>({
           queries: [{ name: 'slow', every: '1h', timeout: '15m', fetch: async () => 1 }],
-          store: (e) => d1Store(e.DB),
+          store: (e) => d1(e.DB),
         }),
       ),
     ).toBe(
@@ -94,26 +81,24 @@ describe('cronPoller config-time validation', () => {
     expect(() =>
       cronPoller<CronEnv>({
         queries: [{ name: 'slow', every: '1h', timeout: '14m', fetch: async () => 1 }],
-        store: (e) => d1Store(e.DB),
+        store: (e) => d1(e.DB),
       }),
     ).not.toThrow()
   })
 })
 
-describe('cron shell e2e (combo B: scheduled handler + d1Store)', () => {
+describe('cron shell e2e (scheduled handler + d1)', () => {
   it('a scheduled invocation fetches due queries into D1 and reschedules them', async () => {
     let ticks = 0
     const handler = cronPoller<CronEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ tick: ++ticks }) }],
-      store: (e) => d1Store(e.DB),
+      store: (e) => d1(e.DB),
     })
 
     await invoke(handler)
     expect(ticks).toBe(1)
 
-    const read = await createReader({ results: d1Results(env.DB) }).read<{ tick: number }>(
-      'metrics',
-    )
+    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ tick: 1 })
     expect(read!.isStale).toBe(false)
@@ -148,7 +133,7 @@ describe('cron shell e2e (combo B: scheduled handler + d1Store)', () => {
     })
     const handler = cronPoller<CronEnv>({
       queries: [query('a'), query('b'), query('c')],
-      store: (e) => d1Store(e.DB),
+      store: (e) => d1(e.DB),
     })
 
     const ctx1 = createExecutionContext()

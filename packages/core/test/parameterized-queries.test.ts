@@ -48,7 +48,7 @@ describe('parameterized queries', () => {
     })
     expect(seen).toEqual(variants)
 
-    const reader = createReader({ results: store })
+    const reader = createReader({ store })
     await expect(reader.read('course-analytics', variants[0])).resolves.toMatchObject({
       data: { label: 'alpha:7d' },
     })

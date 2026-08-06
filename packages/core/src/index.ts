@@ -23,11 +23,10 @@ export type {
   QueryParams,
   ReadResult,
   ResolvedQuery,
-  ResultStore,
   RunReport,
   ScheduleRow,
-  ScheduleStore,
-  ScheduleStoreCapabilities,
+  SchedulePlane,
   SourceBudget,
   Store,
+  StoreCapabilities,
 } from './types.js'

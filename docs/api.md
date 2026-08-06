@@ -72,11 +72,11 @@ const value = await poller.read<Result>('analytics-7d')
 
 - `queries`: a `Queries` registry or raw query definitions
 - `driver`: `{ serialized, defer(promise), schedule? }`
-- either `store`, or `results` with a resolvable schedule plane
+- `store`: one store holding both result envelopes and schedule rows
 
-Optional fields are `schedule`, `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [schedule plane resolution](./writing-adapters.md#schedule-plane-resolution-rules-fail-at-config-time).
+Optional fields are `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
 
-Construction rejects a missing or malformed driver, conflicting `store` and `results`, an invalid source budget, an unresolved schedule plane, or a non-atomic schedule store under a non-serialized driver.
+Construction rejects a missing or malformed driver, a store missing either half, an invalid source budget, or a store that cannot claim atomically under a non-serialized driver.
 
 `runDue(now?)` reconciles the registry, selects due work, applies per-source budgets, claims leases, runs fetchers concurrently, and returns:
 
@@ -102,10 +102,10 @@ await poller.read('course-analytics', {
 
 ### Reader
 
-A reader has no fetchers or schedule plane:
+A reader has no fetchers and never touches the schedule half - `readResult` is the only method it calls:
 
 ```ts
-const reader = createReader({ results })
+const reader = createReader({ store })
 const fixed = await reader.read<Result>('analytics-7d')
 const variant = await reader.read<Result>('course-analytics', {
   courseId: 'course-a',
@@ -129,7 +129,7 @@ interface ReadResult<T> {
 
 ### Stores and test utilities
 
-- `memoryStore()` returns the reference full `Store` implementation.
+- `memoryStore()` returns the reference `Store` implementation.
 - `storeContractSuite(label, factory)` is exported from `@datafridge/core/contract-tests` for Vitest adapter compatibility tests.
 - `FakeClock` and `flushMicrotasks` support deterministic tests.
 - `parseDuration`, `queryKey`, `systemClock`, `ConfigError`, and `TimeoutError` are public utilities.
@@ -144,21 +144,21 @@ All runtime exports are available from the package root. Independent subpaths ar
 | Export | Subpath | Purpose |
 |---|---|---|
 | `PollerDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
-| `d1Results`, `d1Store` | `@datafridge/cloudflare/d1` | Result-only and full D1 stores |
+| `d1` | `@datafridge/cloudflare/d1` | The D1 store: result envelopes and atomic schedule claims |
 | `cronDriver`, `cronPoller` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
 | `INVOCATION_WALL_CLOCK_LIMIT_MS` | package root | Cloudflare timeout ceiling |
 
 ### Durable Object alarms
 
-Subclass `PollerDO<Env>`, provide `queries` and `results(env)`, and optionally provide `sources`. The schedule plane lives in the Durable Object's SQLite storage.
+Subclass `PollerDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps its own schedule bookkeeping in its SQLite storage, so only the store's result half is used.
 
 ```ts
 class Poller extends PollerDO<Env> {
   queries = queries
   sources = { analytics: { maxPerTick: 2 } }
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 
   protected override onRunReport(report: RunReport) {
@@ -175,10 +175,9 @@ The registry, source budgets, and Cloudflare timeout ceiling are validated when 
 
 ### D1 stores
 
-- `d1Results(db)` implements `ResultStore` for Combo A.
-- `d1Store(db)` implements the full atomic `Store` for Combo B.
+- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `PollerDO` carries its own schedule plane and simply leaves D1's unused.
 
-Both require the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
+It requires the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
 
 ### Cron Triggers
 
@@ -188,7 +187,7 @@ Both require the packaged migration at `@datafridge/cloudflare/migrations/0001_d
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
   }),
 }

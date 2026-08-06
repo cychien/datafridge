@@ -38,7 +38,7 @@ describe('read() contract', () => {
     ])
     await poller.runDue()
 
-    const reader = createReader({ results: resultsOnly(store), clock })
+    const reader = createReader({ store: resultsOnly(store), clock })
     expect(await reader.read('q')).toEqual({
       data: { nested: [1, 2, 3] },
       fetchedAt: 0,
@@ -52,7 +52,7 @@ describe('read() contract', () => {
     const { store, poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
     await poller.runDue()
 
-    const reader = createReader({ results: resultsOnly(store) })
+    const reader = createReader({ store: resultsOnly(store) })
     const result = await reader.read<string>('q')
     expect(result).toMatchObject({ data: 'v1', fetchedAt: 0 })
     expect(result!.age).toBeGreaterThan(0)

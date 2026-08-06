@@ -26,7 +26,7 @@ Core's single entry point is the idempotent `runDue(now)`. Core never owns an ev
 
 ## The two planes
 
-Every query has two kinds of state with completely different consistency needs, so they live on two planes.
+Every query has two kinds of state with completely different consistency needs. One `Store` holds both; the distinction still matters because their consistency requirements differ, and because a stateful serialized driver may keep the schedule half itself.
 
 ### Result plane - the product itself
 
@@ -57,12 +57,12 @@ interface ScheduleRow {
 }
 ```
 
-The schedule plane has exactly two legitimate homes:
+This half has exactly two legitimate homes:
 
-1. A store with atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
-2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence).
+1. The store, when it has atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
+2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence). The store's schedule half then goes unused.
 
-The formal resolution rules are in [writing-adapters.md](./writing-adapters.md).
+The formal rules are in [writing-adapters.md](./writing-adapters.md).
 
 ## Parameter variants and identity
 

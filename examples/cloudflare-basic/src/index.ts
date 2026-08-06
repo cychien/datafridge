@@ -1,5 +1,5 @@
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 export interface Env {
   DB: D1Database
@@ -22,8 +22,8 @@ export class Poller extends PollerDO<Env> {
     ])
   }
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 }
 
@@ -42,7 +42,7 @@ export default {
 
     if (pathname === '/read') {
       await ensureStarted(env.POLLER)
-      const reader = createReader({ results: d1Results(env.DB) })
+      const reader = createReader({ store: d1(env.DB) })
       return Response.json(await reader.read('fake-weather'))
     }
 

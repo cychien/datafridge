@@ -13,9 +13,8 @@ import type {
   QueryDefinition,
   QueryParams,
   ReadResult,
-  ResultStore,
   RunReport,
-  ScheduleStore,
+  SchedulePlane,
   SourceBudget,
   Store,
 } from './types.js'
@@ -23,10 +22,8 @@ import type {
 export interface PollerConfig {
   queries: Queries | readonly QueryDefinition[]
   driver: Driver
+  store: Store
   clock?: Clock
-  store?: Store
-  results?: ResultStore
-  schedule?: ScheduleStore
   sources?: Record<string, SourceBudget>
   random?: () => number
 }
@@ -46,7 +43,7 @@ export function createPoller(config: PollerConfig): Poller {
   const driver = validateDriver(config.driver)
   const clock = validateClock(config.clock ?? systemClock)
   const sources = validateSources(config.sources)
-  const { results, schedule } = resolveStores(config, driver)
+  const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
 
   const isOwner = async (name: string, token: number): Promise<boolean> => {
@@ -84,7 +81,7 @@ export function createPoller(config: PollerConfig): Poller {
         return
       }
       const envelope: Envelope = { data, fetchedAt: done, freshUntil: done + query.everyMs }
-      await results.writeResult(name, envelope)
+      await store.writeResult(name, envelope)
       const jitter = token === 1 ? firstRunJitterMs(query.everyMs, random) : 0
       await schedule.writeSchedule({
         name,
@@ -101,9 +98,9 @@ export function createPoller(config: PollerConfig): Poller {
       try {
         if (await isOwner(name, token)) {
           const failCount = row.failCount + 1
-          const old = await results.readResult(name)
+          const old = await store.readResult(name)
           if (old) {
-            await results.writeResult(name, {
+            await store.writeResult(name, {
               ...old,
               lastError: { at: done, message, count: failCount },
             })
@@ -131,7 +128,7 @@ export function createPoller(config: PollerConfig): Poller {
       for (const row of all) {
         if (queries.getByKey(row.name)) continue
         await schedule.deleteSchedule(row.name)
-        await results.deleteResult(row.name)
+        await store.deleteResult(row.name)
       }
     }
     for (const query of queries.all) {
@@ -141,7 +138,7 @@ export function createPoller(config: PollerConfig): Poller {
       // Only an `every` shrink needs fixing here; growth self-heals with one
       // early run that reschedules at the new period.
       if (row.nextRunAt <= now + query.everyMs * (1 + MAX_JITTER_RATIO)) continue
-      const env = await results.readResult(query.name)
+      const env = await store.readResult(query.name)
       await schedule.writeSchedule({
         ...row,
         nextRunAt: (env ? env.fetchedAt : now) + query.everyMs,
@@ -177,7 +174,7 @@ export function createPoller(config: PollerConfig): Poller {
     async read<T>(name: string, options?: PollerReadOptions): Promise<ReadResult<T> | null> {
       const key = queryKey(name, options?.params)
       if (!queries.getByKey(key)) throw new ConfigError(`unknown query '${name}'`)
-      const env = await results.readResult(key)
+      const env = await store.readResult(key)
       const shaped = shapeRead<T>(env, clock.now())
       if (options?.swrRefresh && (shaped === null || shaped.isStale)) {
         options.swrRefresh(refreshOne(key))
@@ -256,57 +253,27 @@ function validateSources(
 function resolveStores(
   config: PollerConfig,
   driver: Driver,
-): { results: ResultStore; schedule: ScheduleStore } {
-  if (config.store && config.results) {
-    throw new ConfigError('pass either store or results, not both')
+): { store: Store; schedule: SchedulePlane } {
+  const store = config.store
+  if (!store || typeof store.readResult !== 'function' || typeof store.claim !== 'function') {
+    throw new ConfigError('createPoller requires a store that holds results and schedule rows')
   }
-  const results = config.store ?? config.results
-  if (!results) {
-    throw new ConfigError('createPoller requires a result store (results or store)')
-  }
-
-  if (config.schedule) {
-    requireClaimSafety(config.schedule, driver, 'the explicit schedule store')
-    return { results, schedule: config.schedule }
-  }
-  if (driver.schedule) {
-    requireClaimSafety(driver.schedule, driver, "the driver's schedule store")
-    return { results, schedule: driver.schedule }
-  }
-  if (isScheduleStore(results)) {
-    if (results.capabilities.atomicClaim || driver.serialized) {
-      return { results, schedule: results }
-    }
-    throw new ConfigError(
-      'no valid schedule plane: the store implements ScheduleStore but lacks atomicClaim ' +
-        'and the driver is not serialized; use a store with atomic claims, a serialized ' +
-        'driver, or an explicit schedule store',
-    )
-  }
-  throw new ConfigError(
-    'no valid schedule plane: pass an explicit schedule store, use a driver that provides ' +
-      'one, or use a full Store (with atomicClaim, or under a serialized driver); ' +
-      'refusing to silently degrade',
+  // A stateful serialized driver keeps its own bookkeeping (a Durable Object's
+  // SQLite, for example); then the store's schedule half simply goes unused.
+  const schedule = driver.schedule ?? store
+  requireClaimSafety(
+    schedule,
+    driver,
+    driver.schedule ? "the driver's schedule bookkeeping" : 'the store',
   )
+  return { store, schedule }
 }
 
-function requireClaimSafety(schedule: ScheduleStore, driver: Driver, which: string): void {
+function requireClaimSafety(schedule: SchedulePlane, driver: Driver, which: string): void {
   if (!schedule.capabilities.atomicClaim && !driver.serialized) {
     throw new ConfigError(
       `${which} lacks atomicClaim and the driver is not serialized, so concurrent runDue ` +
-        'calls could double-fetch; use a schedule store with atomic claims or a serialized driver',
+        'calls could double-fetch; use a store with atomic claims or a serialized driver',
     )
   }
-}
-
-function isScheduleStore(value: object): value is ScheduleStore {
-  const candidate = value as Partial<ScheduleStore>
-  return (
-    typeof candidate.readSchedule === 'function' &&
-    typeof candidate.writeSchedule === 'function' &&
-    typeof candidate.deleteSchedule === 'function' &&
-    typeof candidate.claim === 'function' &&
-    typeof candidate.capabilities === 'object' &&
-    candidate.capabilities !== null
-  )
 }

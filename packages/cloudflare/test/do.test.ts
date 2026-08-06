@@ -3,7 +3,7 @@ import { createReader, defineParameterizedQuery, queryKey } from '@datafridge/co
 import type { QueryDef, QueryDefinition } from '@datafridge/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { d1Results } from '../src/d1.js'
+import { d1 } from '../src/d1.js'
 import type { TestPoller } from './worker.js'
 
 const fetchCounts = new Map<string, number>()
@@ -25,7 +25,7 @@ function pollerStub(id: string) {
 }
 
 function reader() {
-  return createReader({ results: d1Results(env.DB) })
+  return createReader({ store: d1(env.DB) })
 }
 
 type Stub = ReturnType<typeof pollerStub>

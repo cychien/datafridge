@@ -5,9 +5,10 @@ import type { InitAction, InitPlan } from './init-wrangler.js'
 
 const USAGE = `Usage: datafridge init cloudflare [--config <path>]
 
-Adds the wrangler.toml declarations for both datafridge combos:
-  combo A: Durable Object alarms scheduler (DO binding + SQLite class migration) + D1 results
-  combo B: cron trigger + D1 full store (CAS-protected concurrent ticks)
+Adds the wrangler.toml declarations for both datafridge schedulers:
+  Durable Object alarms (DO binding + SQLite class migration)
+  cron trigger (1-minute floor, CAS-protected concurrent ticks)
+Both store results in D1.
 
 Idempotent: declarations already present are detected and never duplicated;
 existing configuration is never rewritten. --config defaults to ./wrangler.toml.`
@@ -16,8 +17,8 @@ const NEXT_STEPS = `
 Next steps:
   1. wrangler d1 create ${D1_DATABASE_NAME}, then paste the database_id into wrangler.toml
   2. apply the schema: wrangler d1 execute ${D1_DATABASE_NAME} --remote --file node_modules/@datafridge/cloudflare/migrations/0001_datafridge_init.sql
-  3. combo A: export a PollerDO subclass named Poller; combo B: wire cronPoller as your scheduled handler
-  4. keep the combo you use and delete the other declarations`
+  3. alarms: export a PollerDO subclass named Poller; cron: wire cronPoller as your scheduled handler
+  4. keep the scheduler you use and delete the other declarations`
 
 export interface CliIo {
   cwd: string

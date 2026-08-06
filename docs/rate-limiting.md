@@ -9,7 +9,7 @@ datafridge groups queries by `source` (the `source` field on a query definition,
 ```ts
 createPoller({
   driver: cronDriver(ctx),
-  store: d1Store(env.DB),
+  store: d1(env.DB),
   queries,
   sources: { posthog: { maxPerTick: 2 } },
 })

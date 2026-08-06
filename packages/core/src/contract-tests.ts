@@ -17,7 +17,7 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  * Compatibility suite every Store adapter must pass. Adapters call this from
  * their own vitest file:
  *
- *   storeContractSuite('d1Store', () => d1Store(env.DB))
+ *   storeContractSuite('d1', () => d1(env.DB))
  *
  * Contract points beyond the type signatures:
  * - reads return isolated copies; mutating a returned object never mutates the store

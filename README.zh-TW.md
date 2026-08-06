@@ -18,23 +18,15 @@
   /></a>
 </p>
 
-<h3 align="center">資料隨時即拿，穩定可靠</h3>
+<h3 align="center">資料隨時拿取，穩定可靠</h3>
 
 <p align="center"><a href="./README.md">English</a> · <strong>繁體中文</strong></p>
 
-當系統依賴第三方資料，第三方一不穩，看起來不可靠的卻是我們自己的系統。
+當我們的系統依賴第三方資料，很容易因為第三方來源不穩，使得我們系統看起來不可靠。
 
-這種不穩有幾種樣子：回應慢、資料時有時無、使用量一大或呼叫太頻繁就撞上 rate limit。我們沒有處理這些狀況時，使用者看到的就是數字出不來，而抱怨的對象是我們。
+這些不穩包括回應慢、資料時有時無、使用量一大或呼叫太頻繁就撞上 rate limit 等，一旦 user 遇到這些問題，而我們系統又沒處理時，user 就會抱怨我們。
 
-datafridge 幫你把這件事處理掉。你只要註冊一次 query，設定 scheduler、result store，以及抓取頻率和 rate limit 這類 metadata，背景的 scheduler 就會定期把最新的第三方資料寫進你自己的資料庫。
-
-你的 request handler 只做一次本地讀取，不管上游是快、是慢、被限流還是整個掛掉，成本都一樣。`bentocache`、`cachified` 這類 cache library 是 request-triggered。它們的 stale-while-revalidate 模式確實能在項目還熱的期間讓讀取的人不用等，但刷新終究只會因為有人來問才發生：沒人讀的項目會冷掉，而冷掉或完全過期的項目仍然要讓那個人等。datafridge 則是照排程刷新，所以永遠不會有讀取的人負責把它熱起來。
-
-- **讀取不等上游。** `read()` 只碰你的 result store，沒有別的。不存在「第一個請求替所有人付延遲」的冷啟動。
-- **每次讀取都有日期。** `fetchedAt`、`age`、`isStale` 跟資料一起回來，「多舊算太舊」由你決定，不必用猜的。
-- **上游的 outage 不是你的 outage。** 刷新失敗會保留最後一筆成功值，並把錯誤記在旁邊。頁面照常渲染。
-- **Rate limit 是一個設定欄位。** 用 `source` 分組、限制每個 tick 最多跑幾個，不管你註冊了多少 query，這個上限都成立。
-- **設定寫錯在建構時就炸，而不是半夜三點。** timeout 比 lease 長、名稱重複、scheduler 的簿記無處可放，全部在你建立 poller 的當下就報錯。
+datafridge 幫你處理這件事。你只需要註冊一次 query，設定 scheduler、result store，以及抓取頻率和 rate limit 這類 metadata，背景的 scheduler 就會定期把最新的第三方資料寫進你自己的資料庫。
 
 ```
    scheduler tick（Durable Object alarm 或 cron）
@@ -46,27 +38,27 @@ datafridge 幫你把這件事處理掉。你只要註冊一次 query，設定 sc
           │ { data, fetchedAt }        失敗時：保留最後一筆成功值、
           ▼                            記錄錯誤、以 backoff 重試
    ┌─────────────────────────────────────────────┐
-   │ your store (D1)                             │
+   │ your store                                  │
    └──────┬──────────────────────────────────────┘
           │ read() - 一次本地查詢，永遠不等上游
           ▼
    { data, fetchedAt, isStale, age }
 ```
 
-`@datafridge/core` 是引擎：純邏輯、時鐘注入、零 runtime 依賴。`@datafridge/cloudflare` 是 adapter package，讓它跑在 Durable Object alarms、Cron Triggers 與 D1 上。Fetcher 永遠是你的 code，datafridge 不會代替你去跟任何 vendor 講話。
+`@datafridge/core` 是引擎：純邏輯，零 runtime 依賴。`@datafridge/cloudflare` 是 adapter package，讓它能使用 Cloudflare infra 例如 Durable Object alarms、Cron Triggers 或 D1。
 
 ## 安裝
 
 ```sh
-pnpm add @datafridge/core @datafridge/cloudflare
-# 或：npm install @datafridge/core @datafridge/cloudflare
+npm install @datafridge/core @datafridge/cloudflare
+# 或：pnpm add @datafridge/core @datafridge/cloudflare
 ```
 
-兩個 package 都只提供 ESM，開發工具需要 Node.js 20 以上。Worker code 跑在 Cloudflare Workers runtime。
+兩個 package 都只提供 ESM，開發工具需要 Node.js 20 以上。
 
-## 設定就是一個陣列
+## 定義 query
 
-一個 query 就是一個名字、一個間隔，加上一個負責 fetch 的 function。這就是全部的設定面：
+定義你想 poll 的內容：
 
 ```ts
 import { defineQueries } from '@datafridge/core'
@@ -74,6 +66,9 @@ import { defineQueries } from '@datafridge/core'
 const queries = defineQueries([
   {
     name: 'weekly-summary',
+    timeout: '30s',            // 選填，預設 30s，超過時間會終止 fetch
+    lease: '1m',               // 選填，預設 timeout + 30s
+    source: 'default',         // 選填，預設 'default'，rate limit 的分組單位
     every: '10m',
     fetch: async ({ signal }) => {
       const response = await fetch('https://api.example.com/weekly-summary', { signal })
@@ -84,54 +79,28 @@ const queries = defineQueries([
 ])
 ```
 
-`every` 接受 `'30s'`、`'10m'`、`'1h'`、`'1d'` 或毫秒數字。`signal` 會在 timeout（預設 30 秒）時 abort，所以卡住的上游不會永久佔住一個名額。在 `fetch` 裡 throw，stale-if-error 就會接手。
+## 接上 scheduler 與 store
 
-每個 query 可選的欄位：`timeout`、`lease`、`source`。接下來的一切，都只是把這個陣列接到 scheduler 與 store 上。
+誰定時去抓，以及資料放哪。
 
-## Cloudflare quick start
+**誰定時去抓**
 
-三個步驟：宣告 infrastructure、套用 schema、寫 Worker。
+- `PollerDO` - 用 Cloudflare Durable Object 當排程，到期時間精確。
+- `cronPoller` - 用 Cloudflare Cron Trigger 當排程，最細一分鐘。
 
-**1. Scaffold wrangler 宣告。**
+**資料放哪**
 
-```sh
-pnpm exec datafridge init cloudflare
-# npm：npx --no-install datafridge init cloudflare
-```
+- `d1(env.DB)` - 放進你的 D1。
 
-這會把 Durable Object binding、SQLite class migration、一分鐘的 Cron Trigger 與 D1 binding 寫進 `wrangler.toml`。它是 idempotent 的，不會改寫你已有的宣告，也拒絕在既有的 `wrangler.json` 或 `wrangler.jsonc` 旁邊建立 TOML（這時它會把宣告印出來讓你自己放）。要指定別的檔案就用 `--config path/to/wrangler.toml`。它會把兩種組合都 scaffold 出來；保留你要用的那組，刪掉另一組。
+兩邊可自由搭配，也都可以換成你自己的實作。
 
-組合 A 只需要其中三段，短到可以自己手寫。記得把 init 寫進去的 `[triggers]` 區塊刪掉：那是組合 B 的，下面的 Worker 沒有匯出 `scheduled` handler 可以讓 cron tick 呼叫。
+## 完整範例
 
-```toml
-[[durable_objects.bindings]]
-name = "POLLER"
-class_name = "Poller"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Poller"]
-
-[[d1_databases]]
-binding = "DB"
-database_name = "datafridge"
-database_id = "..."
-```
-
-`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。`database_id` 是 CLI 唯一填不了的欄位（它會寫成 `TODO`）：執行 `pnpm exec wrangler d1 create datafridge`，或選一個既有的 database，把它印出來的 ID 貼進去。
-
-**2. 套用 package 內附的 D1 schema。**
-
-```sh
-pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
-  --file node_modules/@datafridge/cloudflare/migrations/0001_datafridge_init.sql
-```
-
-**3. 寫 Worker。**
+`PollerDO` 當 scheduler、`d1` 當 store，加上一個負責讀取的 route：
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -151,15 +120,15 @@ export class Poller extends PollerDO<Env> {
     },
   ])
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 }
 
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ results: d1Results(env.DB) })
+    const reader = createReader({ store: d1(env.DB) })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
@@ -171,6 +140,8 @@ Durable Object 在這裡的身分是 scheduler：用 alarm 喚醒自己、執行
 
 第一次讀取會回 `null`，因為還沒 fetch 過任何東西。第一次成功刷新之後，每次讀取都會有資料。
 
+這個 Worker 需要的 infra - `wrangler` 宣告、`datafridge init` scaffold、package 內附的 D1 schema、Cron Trigger 設定，以及營運 checklist - 都在 [docs/zh-TW/cloudflare.md](./docs/zh-TW/cloudflare.md)。
+
 [`examples/cloudflare-basic`](./examples/cloudflare-basic) 就是這套設定的可執行版本，在 `wrangler dev` 下輪詢一個故意做慢的假 API。
 
 ## 讀取結果
@@ -178,7 +149,7 @@ Durable Object 在這裡的身分是 scheduler：用 alarm 喚醒自己、執行
 Reader 只需要一個 result store，沒有 fetcher、也沒有 schedule，所以你可以把它放在另一個 Worker、另一個服務，甚至完全不用 TypeScript：envelope 就是純 JSON row。
 
 ```ts
-const result = await createReader({ results: d1Results(env.DB) }).read<Summary>('weekly-summary')
+const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
 ```
 
 ```ts
@@ -208,55 +179,6 @@ const result = await createReader({ results: d1Results(env.DB) }).read<Summary>(
 支撐這一切的是三道各自獨立的關卡：`nextRunAt` 決定「該不該跑」、lease 決定「誰在跑」、version 決定「誰的結果算數」。慢速 fetch、暴斃的 executor、zombie 寫回各自打穿一關，下一關接住。
 
 每個 tick 回傳一份 `RunReport`：`{ ran, skippedLeased, deferredBudget, failed }`。在 `PollerDO` subclass 上 override `onRunReport(report)` 就能記錄它 - 只記數量與允許清單內的名稱，因為錯誤訊息來自你的 fetcher，可能帶有上游細節。
-
-## 選擇 scheduler
-
-Cloudflare 提供兩套完整組合。兩者都把 envelope 存在 D1，也都完整遵守語意契約。
-
-| | 組合 A | 組合 B |
-|---|---|---|
-| Scheduler | Durable Object alarms | Cron Triggers |
-| Schedule state | Durable Object SQLite | D1，使用 atomic compare-and-swap claim |
-| Result state | D1 | D1 |
-| 粒度 | 精確的 alarm timestamp，最低 1 秒 | 最低 1 分鐘 |
-| 平台元件 | Durable Object + D1 | 只有 D1 |
-| 何時選它 | 你要精確的到期時間與動態 backoff | 你不想多管一個 Durable Object |
-
-組合 A 就是上面的 quick start。組合 B 只有一個 export：
-
-```ts
-import { defineQueries } from '@datafridge/core'
-import { cronPoller, d1Store } from '@datafridge/cloudflare'
-
-interface Env {
-  DB: D1Database
-}
-
-const queries = defineQueries([
-  {
-    name: 'weekly-summary',
-    every: '10m',
-    source: 'analytics',
-    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
-  },
-])
-
-export default {
-  scheduled: cronPoller<Env>({
-    queries,
-    store: (env) => d1Store(env.DB),
-  }),
-}
-```
-
-```toml
-[triggers]
-crons = ["* * * * *"]
-```
-
-Scheduled invocation 可能重疊，所以組合 B 不是 serialized 的，schedule plane 必須具備原子性。`d1Store` 用檢查 version 的 `UPDATE` 來 claim，這既是這個配對安全的原因，也是 `cronPoller` 只給 `d1Results` 會在建構時直接報錯、而不是默默重複 fetch 的原因。
-
-兩種組合的讀取方式完全相同：`createReader({ results: d1Results(env.DB) })`。
 
 ## 同一個 query 的 preset variants
 
@@ -292,7 +214,7 @@ Params 是身分，不是儲存空間。它們在建構時被快照，必須是�
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { posthog: { maxPerTick: 2 } },
   }),
 }
@@ -301,35 +223,6 @@ export default {
 同樣的 `sources` 欄位也能當作 `PollerDO` subclass 的 property。它是無狀態的，所以在併發 executor 之間依然正確，而且給你一個硬上限：不論你註冊多少 query，上游呼叫都不會超過 `maxPerTick × tick 頻率`。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
 
 Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` 加上隨機偏移，所以 `5m`、`10m`、`1h` 的 query 不會永遠對齊在同一個 tick、一次擠爆同一個 source。預算是保險絲，jitter 讓保險絲平常不用燒。
-
-## 語意契約
-
-這六項保證就是產品本身。所有實作都必須遵守：
-
-1. **讀取永遠立即回傳。** `read()` 只存取 result store，絕不等待上游。
-2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
-3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
-4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。
-5. **寫回一致性。** Version 檢查會拒絕 concurrent 或 zombie executor 的遲到寫回。
-6. **Fail at config time。** 非法 duration、重複名稱、不安全的 lease、不受平台支援的 timeout，以及無法解析的 schedule plane，都會在建構時拋錯。
-
-它們就是規格本身，而不是某份規格的摘要。[docs/zh-TW/concepts.md](./docs/zh-TW/concepts.md) 說明實現它們的 lease、version、backoff 與 staleness model；每個 store adapter 都必須通過 `@datafridge/core/contract-tests` 的契約相容性套件，才算正確。
-
-## datafridge 不是什麼
-
-- **不是 API connector。** Fetcher 永遠是你的 code，沒有 vendor 整合需要你跟著維護。
-- **不是 proxy。** 只服務你以名稱註冊過的 query，不會因為有人來要就去抓。
-- **不是 dashboard，也不是 config DSL。** 設定就是 code，放在你的 repo 裡，有型別檢查。
-- **不是 request-triggered caching。** 不管有沒有人來讀，刷新都照排程發生。
-
-1.0 尚未提供（文件中稱已出貨的範圍為 Wave 1）：
-
-- Node timer、Redis、SQLite、Postgres、KV 或 Cache API adapters
-- 不在有限 registry 內的 unbounded、on-demand 或任意 custom-range variants
-- 精確的 shared quota-window accounting
-- Metrics exporters 與 dashboards
-- QStash 或 Inngest provisioning drivers
-- Documentation website
 
 ## 文件
 

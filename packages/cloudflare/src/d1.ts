@@ -1,4 +1,4 @@
-import type { Envelope, ResultStore, ScheduleRow, Store } from '@datafridge/core'
+import type { Envelope, ScheduleRow, Store } from '@datafridge/core'
 
 // D1's documented maximum string/BLOB/row size (developers.cloudflare.com/d1/platform/limits).
 const D1_MAX_ROW_BYTES = 2_000_000
@@ -21,8 +21,10 @@ function toScheduleRow(record: ScheduleRecord): ScheduleRow {
   }
 }
 
-export function d1Results(db: D1Database): ResultStore {
+export function d1(db: D1Database): Store {
   return {
+    capabilities: { atomicClaim: true, listDue: true },
+
     async readResult(name) {
       const record = await db
         .prepare('SELECT envelope FROM datafridge_results WHERE name = ?')
@@ -52,14 +54,6 @@ export function d1Results(db: D1Database): ResultStore {
     async deleteResult(name) {
       await db.prepare('DELETE FROM datafridge_results WHERE name = ?').bind(name).run()
     },
-  }
-}
-
-export function d1Store(db: D1Database): Store {
-  return {
-    ...d1Results(db),
-
-    capabilities: { atomicClaim: true, listDue: true },
 
     async readSchedule(name) {
       const record = await db

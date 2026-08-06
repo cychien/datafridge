@@ -72,32 +72,36 @@ export interface ScheduleRow {
   version: number
 }
 
-export interface ResultStore {
-  readResult(name: string): Promise<Envelope | null>
-  writeResult(name: string, env: Envelope): Promise<void>
-  deleteResult(name: string): Promise<void>
-}
-
-export interface ScheduleStoreCapabilities {
+export interface StoreCapabilities {
   atomicClaim: boolean
   listDue: boolean
 }
 
-export interface ScheduleStore {
+/**
+ * Schedule bookkeeping on its own. Adapter-level: the only implementors are
+ * stateful serialized drivers that keep their own (a Durable Object's SQLite,
+ * a long-lived process's memory). Applications pass a Store, never this.
+ */
+export interface SchedulePlane {
   readSchedule(name: string): Promise<ScheduleRow | null>
   writeSchedule(row: ScheduleRow): Promise<void>
   deleteSchedule(name: string): Promise<void>
   claim(name: string, expectedVersion: number, leaseUntil: number, now: number): Promise<boolean>
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
-  capabilities: ScheduleStoreCapabilities
+  capabilities: StoreCapabilities
 }
 
-export type Store = ResultStore & ScheduleStore
+/** Where datafridge keeps everything: result envelopes and schedule bookkeeping. */
+export interface Store extends SchedulePlane {
+  readResult(name: string): Promise<Envelope | null>
+  writeResult(name: string, env: Envelope): Promise<void>
+  deleteResult(name: string): Promise<void>
+}
 
 export interface Driver {
   serialized: boolean
   defer(promise: Promise<unknown>): void
-  schedule?: ScheduleStore
+  schedule?: SchedulePlane
 }
 
 export interface RunReport {

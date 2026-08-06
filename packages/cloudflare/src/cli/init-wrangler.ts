@@ -26,19 +26,19 @@ export class InitError extends Error {
 
 type TomlTable = Record<string, unknown>
 
-const DO_BLOCK = `# datafridge combo A: Durable Object alarms scheduler.
+const DO_BLOCK = `# datafridge: Durable Object alarms scheduler.
 # class_name must match your PollerDO subclass exported by the Worker.
 [[durable_objects.bindings]]
 name = "${DO_BINDING}"
 class_name = "${POLLER_CLASS}"`
 
-const TRIGGERS_BLOCK = `# datafridge combo B: cron tick driving the scheduled handler (1-minute floor).
+const TRIGGERS_BLOCK = `# datafridge: cron tick driving the scheduled handler (1-minute floor).
 [triggers]
 crons = ["${CRON_SCHEDULE}"]`
 
-const CRONS_LINE = `crons = ["${CRON_SCHEDULE}"] # datafridge combo B: cron tick driving the scheduled handler`
+const CRONS_LINE = `crons = ["${CRON_SCHEDULE}"] # datafridge: cron tick driving the scheduled handler`
 
-const D1_BLOCK = `# datafridge: D1 database holding results (and combo B schedule bookkeeping).
+const D1_BLOCK = `# datafridge: D1 database holding results (and schedule bookkeeping under the cron scheduler).
 # TODO: run \`wrangler d1 create ${D1_DATABASE_NAME}\` and paste its database_id here.
 [[d1_databases]]
 binding = "${D1_BINDING}"
@@ -46,7 +46,7 @@ database_name = "${D1_DATABASE_NAME}"
 database_id = "TODO"`
 
 function migrationsBlock(tag: string): string {
-  return `# datafridge combo A: SQLite-backed Durable Object class.
+  return `# datafridge: SQLite-backed Durable Object class.
 [[migrations]]
 tag = "${tag}"
 new_sqlite_classes = ["${POLLER_CLASS}"]`
@@ -91,7 +91,7 @@ export function planInit(existing: string | null, today: string): InitPlan {
       detail: `a ${DO_BINDING} / ${POLLER_CLASS} binding is already declared`,
     })
   } else {
-    add('durable_objects.bindings', `${DO_BINDING} -> ${POLLER_CLASS} (combo A)`, DO_BLOCK)
+    add('durable_objects.bindings', `${DO_BINDING} -> ${POLLER_CLASS} (alarms scheduler)`, DO_BLOCK)
   }
 
   const migrations = tables(root, 'migrations')
@@ -110,7 +110,7 @@ export function planInit(existing: string | null, today: string): InitPlan {
     const tag = nextMigrationTag(migrations)
     add(
       'migrations',
-      `tag ${tag}: new_sqlite_classes ["${POLLER_CLASS}"] (combo A)`,
+      `tag ${tag}: new_sqlite_classes ["${POLLER_CLASS}"] (alarms scheduler)`,
       migrationsBlock(tag),
     )
   }
@@ -119,7 +119,7 @@ export function planInit(existing: string | null, today: string): InitPlan {
   if (isTable(triggers) && 'crons' in triggers) {
     actions.push({ kind: 'skip', subject: 'triggers.crons', detail: 'crons already declared' })
   } else if (triggers === undefined) {
-    add('triggers.crons', `["${CRON_SCHEDULE}"] (combo B)`, TRIGGERS_BLOCK)
+    add('triggers.crons', `["${CRON_SCHEDULE}"] (cron scheduler)`, TRIGGERS_BLOCK)
   } else {
     const header = /^[ \t]*\[triggers\][ \t]*(?:#.*)?$/m.exec(content)
     if (header) {
@@ -128,7 +128,7 @@ export function planInit(existing: string | null, today: string): InitPlan {
       actions.push({
         kind: 'add',
         subject: 'triggers.crons',
-        detail: `["${CRON_SCHEDULE}"] (combo B)`,
+        detail: `["${CRON_SCHEDULE}"] (cron scheduler)`,
         snippet: CRONS_LINE,
       })
     } else {
@@ -149,7 +149,7 @@ export function planInit(existing: string | null, today: string): InitPlan {
       detail: 'a D1 binding already exists; point datafridge at it',
     })
   } else {
-    add('d1_databases', `${D1_BINDING} -> ${D1_DATABASE_NAME} (both combos)`, D1_BLOCK)
+    add('d1_databases', `${D1_BINDING} -> ${D1_DATABASE_NAME} (both schedulers)`, D1_BLOCK)
   }
 
   if (appended.length > 0) {

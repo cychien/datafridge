@@ -88,50 +88,28 @@ const queries = defineQueries([
 
 Optional per query: `timeout`, `lease`, and `source`. Everything from here on is wiring that array to a scheduler and a store.
 
-## Quick start on Cloudflare
+## Wiring a scheduler and a store
 
-Three steps: declare the infrastructure, apply the schema, write the Worker.
+Who fetches on a timer, and where the data goes.
 
-**1. Scaffold the wrangler declarations.**
+**Who fetches**
 
-```sh
-pnpm exec datafridge init cloudflare
-# npm: npx --no-install datafridge init cloudflare
-```
+- `PollerDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
+- `cronPoller` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
 
-This writes the Durable Object binding, the SQLite class migration, a one-minute Cron Trigger, and a D1 binding into `wrangler.toml`. It is idempotent, never rewrites declarations you already have, and refuses to create a TOML file next to an existing `wrangler.json` or `wrangler.jsonc` (it prints the declarations for you to place by hand instead). Use `--config path/to/wrangler.toml` for a different file. It scaffolds both scheduling combinations; keep the one you use and delete the other.
+**Where the data goes**
 
-Combo A needs three of them, and they are short enough to write by hand. Delete the `[triggers]` block init wrote: it is combo B's, and the Worker below exports no `scheduled` handler for a cron tick to call.
+- `d1(env.DB)` - your D1.
 
-```toml
-[[durable_objects.bindings]]
-name = "POLLER"
-class_name = "Poller"
+Either side mixes freely with the other, and either can be your own implementation. A combination that cannot schedule safely is refused when you build the poller.
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Poller"]
+## A complete example
 
-[[d1_databases]]
-binding = "DB"
-database_name = "datafridge"
-database_id = "..."
-```
-
-`class_name` has to match the `PollerDO` subclass your Worker exports. The `database_id` is the one thing the CLI cannot fill in (it writes `TODO` there): run `pnpm exec wrangler d1 create datafridge`, or pick an existing database, and paste the ID it prints.
-
-**2. Apply the packaged D1 schema.**
-
-```sh
-pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
-  --file node_modules/@datafridge/cloudflare/migrations/0001_datafridge_init.sql
-```
-
-**3. Write the Worker.**
+`PollerDO` as the scheduler, `d1` as the store, and one route that reads:
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -151,15 +129,15 @@ export class Poller extends PollerDO<Env> {
     },
   ])
 
-  results(env: Env) {
-    return d1Results(env.DB)
+  store(env: Env) {
+    return d1(env.DB)
   }
 }
 
 export default {
   async fetch(_request: Request, env: Env) {
     await ensureStarted(env.POLLER)
-    const reader = createReader({ results: d1Results(env.DB) })
+    const reader = createReader({ store: d1(env.DB) })
     return Response.json(await reader.read('weekly-summary'))
   },
 }
@@ -171,6 +149,8 @@ The Durable Object is the scheduler: it wakes itself with alarms, runs each tick
 
 The very first read returns `null`, because nothing has been fetched yet. Every read after the first successful refresh returns data.
 
+The infrastructure this Worker needs - the `wrangler` declarations, the `datafridge init` scaffold, the packaged D1 schema, the Cron Trigger setup, and the operational checklist - is in [docs/cloudflare.md](./docs/cloudflare.md).
+
 [`examples/cloudflare-basic`](./examples/cloudflare-basic) is this setup as a runnable app, polling a deliberately slow fake API under `wrangler dev`.
 
 ## Reading a result
@@ -178,7 +158,7 @@ The very first read returns `null`, because nothing has been fetched yet. Every 
 A reader needs nothing but a result store. It has no fetchers and no schedule, so you can put one in a different Worker, a different service, or no TypeScript at all - envelopes are plain JSON rows.
 
 ```ts
-const result = await createReader({ results: d1Results(env.DB) }).read<Summary>('weekly-summary')
+const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
 ```
 
 ```ts
@@ -208,55 +188,6 @@ Nothing is thrown away. A failed refresh keeps the previous envelope, attaches `
 Three independent gates make this work: `nextRunAt` decides whether a query should run, the lease decides who is running it, and the version decides whose result counts. Slow fetches, crashed executors, and zombie writes each break through one gate and get caught by the next.
 
 Each tick returns a `RunReport` of `{ ran, skippedLeased, deferredBudget, failed }`. Override `onRunReport(report)` on your `PollerDO` subclass to log it - counts and allowlisted names only, since error messages come from your fetchers and may carry upstream detail.
-
-## Choosing a scheduler
-
-Cloudflare ships in two complete combinations. Both store envelopes in D1 and both honour the full contract.
-
-| | Combo A | Combo B |
-|---|---|---|
-| Scheduler | Durable Object alarms | Cron Triggers |
-| Schedule state | Durable Object SQLite | D1, with atomic compare-and-swap claims |
-| Result state | D1 | D1 |
-| Granularity | Exact alarm timestamp, 1-second floor | 1-minute floor |
-| Platform components | Durable Object + D1 | D1 only |
-| Pick it when | You want exact due times and dynamic backoff | You would rather not run a Durable Object |
-
-Combo A is the quick start above. Combo B is one export:
-
-```ts
-import { defineQueries } from '@datafridge/core'
-import { cronPoller, d1Store } from '@datafridge/cloudflare'
-
-interface Env {
-  DB: D1Database
-}
-
-const queries = defineQueries([
-  {
-    name: 'weekly-summary',
-    every: '10m',
-    source: 'analytics',
-    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
-  },
-])
-
-export default {
-  scheduled: cronPoller<Env>({
-    queries,
-    store: (env) => d1Store(env.DB),
-  }),
-}
-```
-
-```toml
-[triggers]
-crons = ["* * * * *"]
-```
-
-Scheduled invocations can overlap, so Combo B is not serialized and the schedule plane has to be atomic. `d1Store` claims with a version-checked `UPDATE`, which is why the pairing is safe and why `cronPoller` with `d1Results` alone throws at construction rather than quietly double-fetching.
-
-Reads are identical in both combinations: `createReader({ results: d1Results(env.DB) })`.
 
 ## Preset variants of one query
 
@@ -292,7 +223,7 @@ Tag queries with a `source` and cap how many of that group run per tick:
 export default {
   scheduled: cronPoller<Env>({
     queries,
-    store: (env) => d1Store(env.DB),
+    store: (env) => d1(env.DB),
     sources: { posthog: { maxPerTick: 2 } },
   }),
 }
@@ -324,7 +255,7 @@ They are the specification, not a summary of one. [docs/concepts.md](./docs/conc
 
 Not in 1.0 (the docs call the shipped scope Wave 1):
 
-- Node timer, Redis, SQLite, Postgres, KV, or Cache API adapters
+- Node timer, Redis, SQLite, or Postgres adapters
 - Unbounded, on-demand, or arbitrary custom-range variants outside the finite registry
 - Precise shared quota-window accounting
 - Metrics exporters and dashboards

@@ -2,11 +2,11 @@ import { DurableObject } from 'cloudflare:workers'
 import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
 import type {
   QueryDefinition,
-  ResultStore,
   RunReport,
+  SchedulePlane,
   ScheduleRow,
-  ScheduleStore,
   SourceBudget,
+  Store,
 } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
 
@@ -47,8 +47,8 @@ function toScheduleRow(record: ScheduleRecord): ScheduleRow {
 
 // The DO is a single-threaded actor and SqlStorage is synchronous, so every
 // method below is atomic without CAS gymnastics; claim is still implemented
-// with full version/lease semantics so core sees the exact Store contract.
-function sqliteScheduleStore(sql: SqlStorage): ScheduleStore {
+// with full version/lease semantics so core sees the exact contract.
+function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
   const readRecord = (name: string): ScheduleRecord | undefined =>
     sql.exec<ScheduleRecord>('SELECT * FROM datafridge_schedule WHERE name = ?', name).toArray()[0]
 
@@ -139,24 +139,24 @@ function registrySignature(queries: Queries): string {
  *
  *   export class Poller extends PollerDO<Env> {
  *     queries = defineQueries([...])
- *     results(env: Env) { return d1Results(env.DB) }
+ *     store(env: Env) { return d1(env.DB) }
  *   }
  */
 export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
   abstract queries: Queries | readonly QueryDefinition[]
-  abstract results(env: Env): ResultStore
+  abstract store(env: Env): Store
   sources?: Record<string, SourceBudget>
 
   protected onRunReport(_report: RunReport): void | Promise<void> {}
 
-  readonly #schedule: ScheduleStore
+  readonly #schedule: SchedulePlane
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     ctx.blockConcurrencyWhile(async () => {
       ctx.storage.sql.exec(BOOKKEEPING_SCHEMA)
     })
-    this.#schedule = sqliteScheduleStore(ctx.storage.sql)
+    this.#schedule = sqliteSchedulePlane(ctx.storage.sql)
   }
 
   /**
@@ -182,7 +182,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
       this.#writeMeta(REGISTRY_META_KEY, registrySignature(queries))
       const poller = createPoller({
         queries,
-        results: this.results(this.env),
+        store: this.store(this.env),
         driver: {
           serialized: true,
           defer: (promise) => this.ctx.waitUntil(promise),

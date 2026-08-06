@@ -9,7 +9,7 @@ datafridge 按 `source`（query 定義上的 `source` 欄位，預設 `'default'
 ```ts
 createPoller({
   driver: cronDriver(ctx),
-  store: d1Store(env.DB),
+  store: d1(env.DB),
   queries,
   sources: { posthog: { maxPerTick: 2 } },
 })
