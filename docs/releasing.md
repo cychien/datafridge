@@ -41,13 +41,14 @@ Never put credentials, private analytics, or private consumer wiring into tarbal
 
 ## Automation
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) has three least-privilege stages:
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) has two least-privilege jobs, each gated on its triggering event:
 
-1. A push to `main` selects Changesets mode.
-2. If changesets exist, the version job can create or update a version PR. That PR must be reviewed and merged normally.
-3. When versioned packages are on `main`, a captain manually dispatches the workflow. Only that event can enter the `npm` environment and run the publish job.
+1. `version` runs only on a push to `main`. If changesets are pending it creates or updates the version PR; that PR must be reviewed and merged normally. If none are pending it succeeds as a no-op. The job passes no publish script, so it cannot publish.
+2. `publish` runs only on a `workflow_dispatch` against `main`, which a captain triggers once the versioned packages are on `main`. Only that event can enter the `npm` environment.
 
-The publish job checks out `main`, installs with the lockfile, runs lint, typecheck, tests, and package verification, then calls Changesets publish. It uses a GitHub-hosted runner, Node 24 with npm 11.5.1 or newer, `id-token: write`, public `publishConfig`, and provenance. Actions are pinned by commit SHA. The action creates package tags and GitHub releases only after publication.
+The publish job checks out `main`, installs with the lockfile, refuses to continue while any changeset is still pending, runs lint, typecheck, tests, and package verification, then calls Changesets publish. It uses a GitHub-hosted runner, Node 24 with npm 11.5.1 or newer, `id-token: write`, public `publishConfig`, and provenance. Actions are pinned by commit SHA with the corresponding tag noted alongside. The action creates package tags and GitHub releases only after publication.
+
+`changesets/action` is pinned to `v1`, the line that supports the `@changesets/cli` v2 this repository installs. The `v2` action line requires `@changesets/cli` v3 and fails immediately against a v2 CLI, so the two must be upgraded together or not at all.
 
 Configure the GitHub `npm` environment with required reviewers. Configure npm trusted publishers for both scoped packages with:
 
