@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { createPoller, defineQueries, Queries } from '@datafridge/core'
+import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
 import type {
   QueryDefinition,
   ResultStore,
@@ -116,6 +116,14 @@ function sqliteScheduleStore(sql: SqlStorage): ScheduleStore {
   }
 }
 
+function validateSourceBudgets(sources: Record<string, SourceBudget> | undefined): void {
+  for (const [source, budget] of Object.entries(sources ?? {})) {
+    if (!Number.isInteger(budget.maxPerTick) || budget.maxPerTick < 1) {
+      throw new ConfigError(`source '${source}': maxPerTick must be a positive integer`)
+    }
+  }
+}
+
 function registrySignature(queries: Queries): string {
   return JSON.stringify(
     queries.all
@@ -196,6 +204,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
     const queries = this.queries
     const resolved = queries instanceof Queries ? queries : defineQueries(queries)
     assertTimeoutsFitInvocation(resolved, 'Durable Object alarm')
+    validateSourceBudgets(this.sources)
     return resolved
   }
 

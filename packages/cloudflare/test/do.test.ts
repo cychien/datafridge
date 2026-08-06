@@ -270,6 +270,54 @@ describe('PollerDO alarm loop', () => {
     )
   })
 
+  it('rejects an invalid source budget at ignition instead of failing silently each alarm', async () => {
+    const stub = pollerStub('invalid-source-budget')
+    await configure(stub, [counting('budgeted', '1m')])
+
+    for (const maxPerTick of [0, -1, 1.5]) {
+      const result = await runInDurableObject(stub, async (instance) => {
+        const poller = instance as TestPoller
+        poller.sources = { posthog: { maxPerTick } }
+        try {
+          await poller.ensureStarted()
+          return null
+        } catch (err) {
+          return { name: (err as Error).name, message: (err as Error).message }
+        }
+      })
+      expect(result).toEqual({
+        name: 'ConfigError',
+        message: "source 'posthog': maxPerTick must be a positive integer",
+      })
+    }
+
+    expect(await currentAlarm(stub)).toBeNull()
+    expect(await scheduleRows(stub)).toEqual([])
+  })
+
+  it('accepts a valid source budget and defers the over-budget query to the next tick', async () => {
+    const stub = pollerStub('valid-source-budget')
+    await configure(stub, [
+      { ...counting('first', '5m'), source: 'posthog' },
+      { ...counting('second', '5m'), source: 'posthog' },
+    ])
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestPoller).sources = { posthog: { maxPerTick: 1 } }
+    })
+
+    await stub.ensureStarted()
+    await settled(stub, ['first', 'second'])
+
+    expect(fetchCounts.get('first')).toBe(1)
+    expect(fetchCounts.get('second')).toBe(1)
+    const reports = await runInDurableObject(stub, async (instance) =>
+      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+    )
+    expect(reports[0]!.ran).toHaveLength(1)
+    expect(reports[0]!.deferredBudget).toHaveLength(1)
+    expect(reports.flatMap((report) => report.ran).sort()).toEqual(['first', 'second'])
+  })
+
   it('reconciles a changed registry: adds run, removed rows and envelopes vanish, every changes reschedule', async () => {
     const stub = pollerStub('reconcile')
     await configure(stub, [counting('keep', '5m'), counting('drop', '5m')])
