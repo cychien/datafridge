@@ -218,6 +218,8 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 
 D1 is single-region, so readers at remote PoPs can incur cross-region latency. Result-plane replicas are outside the shipped scope.
 
+One `PollerDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which a registry of a few dozen queries is nowhere near.
+
 ## Subpath imports
 
 ```ts

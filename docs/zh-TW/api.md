@@ -2,7 +2,7 @@
 
 [English](../api.md) | 繁體中文
 
-本文件描述已發布的 Wave 1 API 與已接受的 parameterized-query slice。權威保證以 [DESIGN.md section 2](../../DESIGN.md#2-語意契約) 為準。
+本文件描述已發布的 Wave 1 API 與已接受的 parameterized-query slice。權威保證以[六點語意契約](../../README.zh-TW.md#語意契約)為準。
 
 ## `@datafridge/core`
 

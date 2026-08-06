@@ -83,7 +83,7 @@ A non-serialized driver combined with a schedule store lacking `atomicClaim` is 
 
 ## Acceptance bar: the contract compatibility test suite
 
-`@datafridge/core` ships a Store contract compatibility test suite, first proven against the built-in `memoryStore` reference implementation. It encodes every semantic timeline from the design as a deterministic test (injected fake clock, zero sleeps): claim/lease behavior, expired-lease re-claim, zombie write rejection, concurrent `runDue` fetching each query exactly once, and so on.
+`@datafridge/core` ships a Store contract compatibility test suite, first proven against the built-in `memoryStore` reference implementation. It encodes every timeline in [Concepts](./concepts.md) as a deterministic test (injected fake clock, zero sleeps): claim/lease behavior, expired-lease re-claim, zombie write rejection, concurrent `runDue` fetching each query exactly once, and so on.
 
 An adapter is accepted when it passes this suite against its real backend - the Cloudflare `d1Store`, for example, runs the full suite against a real D1 binding, including the concurrent CAS claim cases. No adapter rewrites its own correctness tests; the suite is the spec for the adapter ecosystem.
 
