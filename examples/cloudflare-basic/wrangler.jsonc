@@ -1,0 +1,18 @@
+{
+  "name": "datafridge-example-cloudflare-basic",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "durable_objects": {
+    "bindings": [{ "name": "POLLER", "class_name": "Poller" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Poller"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "datafridge-example",
+      "database_id": "datafridge-example",
+      "migrations_dir": "node_modules/@datafridge/cloudflare/migrations",
+    },
+  ],
+  "services": [{ "binding": "API", "service": "datafridge-example-cloudflare-basic" }],
+}
