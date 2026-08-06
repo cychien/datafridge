@@ -50,6 +50,18 @@ Publish job 會 checkout `main`、pin npm、依 lockfile 安裝、在還有任�
 
 `changesets/action` pin 在 `v1`，也就是支援本 repository 所安裝的 `@changesets/cli` v2 的那條線。`v2` action 線要求 `@changesets/cli` v3，對著 v2 CLI 會立刻失敗，因此兩者必須一起升級，否則都不要動。
 
+### Version job 依賴一個 repository 設定
+
+建立 version PR 需要開啟 **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**（`can_approve_pull_request_reviews`）。目前是開啟的。關掉它只會讓最後一步失敗：job 仍然會建立 `changeset-release/main`、執行 `pnpm version-packages`、commit 並推出該 branch，然後才失敗於
+
+```
+GitHub Actions is not permitted to create or approve pull requests.
+```
+
+Job 層的 `pull-requests: write` permission 蓋不過這個 repository 設定。若真的發生，versioned branch 已經推上去了，可以在恢復設定的同時從 `changeset-release/main` 手動開 version PR。
+
+`default_workflow_permissions` 維持 `read`，這是正確的，也不該放寬：每個 job 各自宣告所需的 write scopes，因此預設 token 一開始不會擁有超過 read 的權限。
+
 ### 認證方式是 npm Trusted Publishing
 
 沒有 npm token，也沒有任何 Actions secret。Workflow 以 OIDC 認證：`id-token: write` 讓 npm 把 GitHub 發出的 id token 換成短期 publishing token。這帶來兩個影響 workflow 結構的後果：
@@ -126,7 +138,7 @@ pnpm publish --no-provenance --access public
 ## Release sequence
 
 1. Feature changes 與 changeset 通過 review 後 merge 到 `main`。
-2. 讓 workflow 建立 version PR。在 repository 設定 `can_approve_pull_request_reviews` 還是 `false` 的期間，`version` job 會推出 `changeset-release/main` 但在建立 PR 那步失敗，因此要從那個已推出的 branch 手動開 PR。
+2. 讓 workflow 建立 version PR。
 3. Review versions、changelogs、peer range 與 lockfile，再 merge。
 4. 取得 captain 對精確 package versions 與 npm public names 的批准。
 5. 僅 `1.0.0` 依照上面的本機首次發布 runbook 執行，然後設定 trusted publishers。

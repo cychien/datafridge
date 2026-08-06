@@ -50,6 +50,18 @@ The publish job checks out `main`, pins npm, installs with the lockfile, refuses
 
 `changesets/action` is pinned to `v1`, the line that supports the `@changesets/cli` v2 this repository installs. The `v2` action line requires `@changesets/cli` v3 and fails immediately against a v2 CLI, so the two must be upgraded together or not at all.
 
+### The version job depends on one repository setting
+
+Opening the version PR requires **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** to be enabled (`can_approve_pull_request_reviews`). It is enabled today. Turning it off breaks only the last step: the job still creates `changeset-release/main`, runs `pnpm version-packages`, commits, and pushes the branch, and then fails with
+
+```
+GitHub Actions is not permitted to create or approve pull requests.
+```
+
+A job-level `pull-requests: write` permission does not override the repository setting. If that ever happens, the versioned branch is already pushed, so the version PR can be opened by hand from `changeset-release/main` while the setting is restored.
+
+`default_workflow_permissions` stays `read`, which is correct and should not be widened: each job declares the write scopes it needs, so the default token starts with no more than read access.
+
 ### Authentication is npm Trusted Publishing
 
 There is no npm token, and no Actions secret of any kind. The workflow authenticates with OIDC: `id-token: write` lets npm exchange a GitHub-issued id token for a short-lived publishing token. Two consequences shape the workflow:
@@ -126,7 +138,7 @@ Tag and release `1.0.0` in git as well, since the local publish does not create 
 ## Release sequence
 
 1. Merge feature changes and their changeset to `main` after review.
-2. Let the workflow open the version PR. While the repository setting `can_approve_pull_request_reviews` is `false`, the `version` job pushes `changeset-release/main` but fails at PR creation, so open that PR by hand from the pushed branch.
+2. Let the workflow open the version PR.
 3. Review its versions, changelogs, peer range, and lockfile, then merge it.
 4. Obtain captain approval for the exact package versions and npm public names.
 5. For `1.0.0` only, follow the local first-publication runbook above and then configure trusted publishers.
