@@ -1,6 +1,6 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test'
-import { createReader } from '@datafridge/core'
-import type { QueryDef } from '@datafridge/core'
+import { createReader, defineParameterizedQuery, queryKey } from '@datafridge/core'
+import type { QueryDef, QueryDefinition } from '@datafridge/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { d1Results } from '../src/d1.js'
@@ -30,7 +30,7 @@ function reader() {
 
 type Stub = ReturnType<typeof pollerStub>
 
-async function configure(stub: Stub, defs: readonly QueryDef[]) {
+async function configure(stub: Stub, defs: readonly QueryDefinition[]) {
   await runInDurableObject(stub, async (instance) => {
     ;(instance as TestPoller).queries = defs
   })
@@ -86,6 +86,17 @@ describe('PollerDO alarm loop', () => {
 
     expect(fetchCounts.get('alpha')).toBe(1)
     expect(fetchCounts.get('beta')).toBe(1)
+    const reports = await runInDurableObject(stub, async (instance) =>
+      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+    )
+    expect(reports).toEqual([
+      {
+        ran: ['alpha', 'beta'],
+        skippedLeased: [],
+        deferredBudget: [],
+        failed: [],
+      },
+    ])
 
     const alpha = await reader().read<{ name: string; tick: number }>('alpha')
     expect(alpha).not.toBeNull()
@@ -97,6 +108,27 @@ describe('PollerDO alarm loop', () => {
     const alarm = await currentAlarm(stub)
     expect(alarm).toBe(Math.min(...rows.map((r) => r.next_run_at)))
     expect(alarm).toBeGreaterThan(Date.now())
+  })
+
+  it('keeps alarm-level error details out of logs while continuing the chain', async () => {
+    const stub = pollerStub('sanitized-alarm-error')
+    await configure(stub, [counting('safe', '1m')])
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestPoller).reportError = new Error('private payload must not leak')
+    })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      await stub.ensureStarted()
+      await settled(stub, ['safe'])
+      await vi.waitFor(() => expect(error).toHaveBeenCalled())
+
+      expect(error).toHaveBeenCalledWith('datafridge: alarm-level failure; alarm chain continues')
+      expect(JSON.stringify(error.mock.calls)).not.toContain('private payload')
+      expect(await currentAlarm(stub)).not.toBeNull()
+    } finally {
+      error.mockRestore()
+    }
   })
 
   it('keeps the chain alive when a fetcher throws: no alarm error, failCount recorded', async () => {
@@ -176,6 +208,33 @@ describe('PollerDO alarm loop', () => {
     expect(stale!.lastError).toMatchObject({ message: 'now failing', count: 1 })
   })
 
+  it('reconciles runtime parameter variants and stores each envelope independently', async () => {
+    const stub = pollerStub('parameterized')
+    const query = (courseIds: readonly string[]) =>
+      defineParameterizedQuery({
+        name: 'course-summary',
+        every: '5m',
+        variants: courseIds.map((courseId) => ({ courseId, window: '7d' })),
+        fetch: async ({ params }) => params.courseId,
+      })
+    const alpha = { courseId: 'alpha', window: '7d' }
+    const beta = { courseId: 'beta', window: '7d' }
+    const gamma = { courseId: 'gamma', window: '7d' }
+
+    await configure(stub, [query(['alpha', 'beta'])])
+    await stub.ensureStarted()
+    await settled(stub, [queryKey('course-summary', alpha), queryKey('course-summary', beta)])
+    await expect(reader().read('course-summary', alpha)).resolves.toMatchObject({ data: 'alpha' })
+    await expect(reader().read('course-summary', beta)).resolves.toMatchObject({ data: 'beta' })
+
+    await configure(stub, [query(['beta', 'gamma'])])
+    await stub.ensureStarted()
+    await settled(stub, [queryKey('course-summary', beta), queryKey('course-summary', gamma)])
+    await expect(reader().read('course-summary', alpha)).resolves.toBeNull()
+    await expect(reader().read('course-summary', beta)).resolves.toMatchObject({ data: 'beta' })
+    await expect(reader().read('course-summary', gamma)).resolves.toMatchObject({ data: 'gamma' })
+  })
+
   it('ensureStarted is idempotent: no double chain, no early re-alarm', async () => {
     const stub = pollerStub('idempotent')
     await configure(stub, [counting('solo', '1m')])
@@ -209,6 +268,54 @@ describe('PollerDO alarm loop', () => {
       "query 'slow': timeout (900000ms) must be shorter than the 900000ms wall-clock limit " +
         'of a Cloudflare Durable Object alarm invocation; lower the timeout',
     )
+  })
+
+  it('rejects an invalid source budget at ignition instead of failing silently each alarm', async () => {
+    const stub = pollerStub('invalid-source-budget')
+    await configure(stub, [counting('budgeted', '1m')])
+
+    for (const maxPerTick of [0, -1, 1.5]) {
+      const result = await runInDurableObject(stub, async (instance) => {
+        const poller = instance as TestPoller
+        poller.sources = { posthog: { maxPerTick } }
+        try {
+          await poller.ensureStarted()
+          return null
+        } catch (err) {
+          return { name: (err as Error).name, message: (err as Error).message }
+        }
+      })
+      expect(result).toEqual({
+        name: 'ConfigError',
+        message: "source 'posthog': maxPerTick must be a positive integer",
+      })
+    }
+
+    expect(await currentAlarm(stub)).toBeNull()
+    expect(await scheduleRows(stub)).toEqual([])
+  })
+
+  it('accepts a valid source budget and defers the over-budget query to the next tick', async () => {
+    const stub = pollerStub('valid-source-budget')
+    await configure(stub, [
+      { ...counting('first', '5m'), source: 'posthog' },
+      { ...counting('second', '5m'), source: 'posthog' },
+    ])
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestPoller).sources = { posthog: { maxPerTick: 1 } }
+    })
+
+    await stub.ensureStarted()
+    await settled(stub, ['first', 'second'])
+
+    expect(fetchCounts.get('first')).toBe(1)
+    expect(fetchCounts.get('second')).toBe(1)
+    const reports = await runInDurableObject(stub, async (instance) =>
+      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+    )
+    expect(reports[0]!.ran).toHaveLength(1)
+    expect(reports[0]!.deferredBudget).toHaveLength(1)
+    expect(reports.flatMap((report) => report.ran).sort()).toEqual(['first', 'second'])
   })
 
   it('reconciles a changed registry: adds run, removed rows and envelopes vanish, every changes reschedule', async () => {

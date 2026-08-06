@@ -1,5 +1,5 @@
 import { createReader } from '@datafridge/core'
-import type { QueryDef } from '@datafridge/core'
+import type { QueryDefinition, RunReport } from '@datafridge/core'
 import { d1Results } from '../src/d1.js'
 import { PollerDO } from '../src/do.js'
 
@@ -12,10 +12,17 @@ export interface TestEnv {
 // tests inject the registry straight onto the instance via runInDurableObject;
 // reassigning it simulates a redeploy with changed queries.
 export class TestPoller extends PollerDO<TestEnv> {
-  queries: readonly QueryDef[] = []
+  queries: readonly QueryDefinition[] = []
+  reports: RunReport[] = []
+  reportError: Error | undefined
 
   results(env: TestEnv) {
     return d1Results(env.DB)
+  }
+
+  protected override onRunReport(report: RunReport) {
+    this.reports.push(report)
+    if (this.reportError) throw this.reportError
   }
 }
 

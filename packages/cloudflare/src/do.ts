@@ -1,8 +1,9 @@
 import { DurableObject } from 'cloudflare:workers'
-import { createPoller, defineQueries, Queries } from '@datafridge/core'
+import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
 import type {
-  QueryDef,
+  QueryDefinition,
   ResultStore,
+  RunReport,
   ScheduleRow,
   ScheduleStore,
   SourceBudget,
@@ -115,6 +116,14 @@ function sqliteScheduleStore(sql: SqlStorage): ScheduleStore {
   }
 }
 
+function validateSourceBudgets(sources: Record<string, SourceBudget> | undefined): void {
+  for (const [source, budget] of Object.entries(sources ?? {})) {
+    if (!Number.isInteger(budget.maxPerTick) || budget.maxPerTick < 1) {
+      throw new ConfigError(`source '${source}': maxPerTick must be a positive integer`)
+    }
+  }
+}
+
 function registrySignature(queries: Queries): string {
   return JSON.stringify(
     queries.all
@@ -134,9 +143,11 @@ function registrySignature(queries: Queries): string {
  *   }
  */
 export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
-  abstract queries: Queries | readonly QueryDef[]
+  abstract queries: Queries | readonly QueryDefinition[]
   abstract results(env: Env): ResultStore
   sources?: Record<string, SourceBudget>
+
+  protected onRunReport(_report: RunReport): void | Promise<void> {}
 
   readonly #schedule: ScheduleStore
 
@@ -179,12 +190,11 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
         },
         ...(this.sources !== undefined ? { sources: this.sources } : {}),
       })
-      await poller.runDue()
-    } catch (err) {
-      // Per-query failures are already folded into failCount by the engine;
-      // anything reaching here is a store/reconcile failure. Swallow it so the
-      // finally below keeps the alarm chain alive, which is also the retry.
-      console.error('datafridge: runDue failed, alarm chain continues', err)
+      const report = await poller.runDue()
+      await this.onRunReport(report)
+    } catch {
+      // Error objects from application hooks or storage can contain secrets.
+      console.error('datafridge: alarm-level failure; alarm chain continues')
     } finally {
       await this.#scheduleNextAlarm(queries)
     }
@@ -194,6 +204,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
     const queries = this.queries
     const resolved = queries instanceof Queries ? queries : defineQueries(queries)
     assertTimeoutsFitInvocation(resolved, 'Durable Object alarm')
+    validateSourceBudgets(this.sources)
     return resolved
   }
 

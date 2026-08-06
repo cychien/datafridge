@@ -1,7 +1,7 @@
 import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
 import type {
   Driver,
-  QueryDef,
+  QueryDefinition,
   ResultStore,
   ScheduleStore,
   SourceBudget,
@@ -19,7 +19,7 @@ export function cronDriver(ctx: ExecutionContext): Driver {
 }
 
 export interface CronPollerConfig<Env> {
-  queries: Queries | readonly QueryDef[]
+  queries: Queries | readonly QueryDefinition[]
   store?: (env: Env) => Store
   results?: (env: Env) => ResultStore
   schedule?: (env: Env) => ScheduleStore

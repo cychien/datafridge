@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/concepts.md)
 
-datafridge turns slow or unreliable APIs into local reads that are always instant, always populated, and always labeled with their age. This page explains the data model and the semantics behind that promise.
+datafridge turns slow or unreliable APIs into local reads that are always instant and always labeled with their age. After the first successful refresh, stale-if-error keeps them populated. This page explains the data model and the semantics behind that promise.
 
 ## Architecture in one picture
 
@@ -63,6 +63,14 @@ The schedule plane has exactly two legitimate homes:
 2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence).
 
 The formal resolution rules are in [writing-adapters.md](./writing-adapters.md).
+
+## Parameter variants and identity
+
+A parameterized query expands a finite runtime list into ordinary scheduled identities. Every variant has its own `ScheduleRow`, lease, version, failure count, backoff, and `Envelope`. Registry reconcile therefore treats added and removed variants exactly like added and removed fixed queries.
+
+Variant params are canonical JSON. The storage key is `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`, so raw IDs and preset values do not appear in D1 keys or `RunReport`. SHA-256 provides a stable collision-resistant identity across object key ordering. Params are identifiers, not secret storage: credentials and private payloads must remain in bindings or fetcher closures.
+
+Only variants in the finite registry are scheduled and directly readable. Arbitrary on-demand variants are not created on read.
 
 ## Staleness semantics
 

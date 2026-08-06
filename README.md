@@ -2,84 +2,110 @@
 
 English | [繁體中文](./README.zh-TW.md)
 
-A fridge for your API data. datafridge restocks it on a schedule (proactive polling), so opening the door is always instant (`read()` never waits on upstream), every item carries a freshness label (`fetchedAt` / `freshUntil` / `isStale`), and when the supermarket burns down there is still food in the fridge (stale-if-error).
-
-> **Status: pre-release.** The API described here follows [DESIGN.md](./DESIGN.md) and may change before the first npm publish. Wave 1 targets Cloudflare only (Durable Object alarms + D1, or Cron Triggers + D1). Everything listed under [Roadmap](#roadmap-wave-2) does not exist yet. See [PLAN.md](./PLAN.md) for milestone status.
-
 ## The semantic contract
 
 These six guarantees are the product. Every implementation must uphold them:
 
-1. **Reads always return immediately.** `read()` only touches the result store. It never waits on upstream.
-2. **Reads always carry time.** Every result includes `fetchedAt`, so the caller always knows how old the data is.
-3. **Stale-if-error.** When upstream fails, the last-known-good result is kept and marked `isStale`. The application never notices.
-4. **At-least-once refresh.** If an executor dies mid-run, the work is picked up again after its lease expires. No cleanup process needed.
-5. **Write-back consistency.** Expired write-backs from concurrent or zombie executors are rejected. The store is always consistent.
-6. **Fail at config time.** Invalid configuration (timeout >= lease, no valid schedule plane, duplicate names) throws at construction, never at runtime.
+1. **Reads always return immediately.** `read()` only touches the result store and never waits on upstream.
+2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
+3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
+4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
+5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
+6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and an unresolved schedule plane throw during construction.
 
-## Why
+A fridge for your API data. datafridge refreshes named queries proactively, so request-time reads never wait on a slow or unreliable upstream. Every read is labeled with its age, and stale-if-error preserves the last good value.
 
-- **Request-triggered SWR libraries** (bentocache, cachified, stale-while-revalidate-cache) only refresh when someone reads. No traffic means no freshness, and a cold start swallows the slow query on the first request. datafridge refreshes proactively, so data is always warm.
-- **Heavy ETL platforms** (Airbyte, Fivetran) are connector businesses, not plug-and-play libraries you drop into a TypeScript project.
-- **Hand-rolled cron + Redis** gets rewritten in every project, and lease handling, backoff, and staleness semantics are never fully done.
+Wave 1 supports Cloudflare in two combinations: Durable Object alarms with D1 results, or Cron Triggers with a full D1 store. The accepted parameterized-query slice adds finite runtime variants for dimensions such as resource IDs and preset windows. Fetchers remain application code. datafridge is not an API connector, proxy, dashboard, or configuration DSL.
 
-datafridge is the combination of **proactive scheduled refresh**, **per-source rate limiting**, and **serve-stale-on-error**, as a TypeScript library with fully orthogonal, swappable modules: the store decides where state lives, the driver decides who ticks, and fetchers run wherever the poller runs.
+## Install
 
-Non-goals: no API connectors (fetchers are always your own closures), no dashboard, no config DSL (config is code), no transparent proxy (only pre-registered named queries).
+```sh
+pnpm add @datafridge/core @datafridge/cloudflare
+# or: npm install @datafridge/core @datafridge/cloudflare
+```
 
-## Quick start (Cloudflare)
+Both packages are ESM-only and require Node.js 20 or newer for development tooling. Worker code runs on Cloudflare's Workers runtime.
 
-Wave 1 ships two complete setups on Cloudflare. Both use your own D1 database as the result store.
+## Parameterized preset queries
 
-### Combo A (recommended): Durable Object alarms + D1 results
-
-A Durable Object acts purely as the scheduler: its alarm wakes itself, runs due queries single-threaded, and keeps schedule bookkeeping in its own SQLite (an internal driver detail). Results land in your D1, and readers query D1 directly without touching the DO.
+Use one parameterized definition when the same fetch applies to a finite set of runtime variants:
 
 ```ts
-// poller.ts
-import { defineQueries } from '@datafridge/core'
-import { PollerDO, d1Results } from '@datafridge/cloudflare'
+import { defineParameterizedQuery, defineQueries } from '@datafridge/core'
+
+const courseAnalytics = defineParameterizedQuery({
+  name: 'course-analytics',
+  every: '10m',
+  source: 'posthog',
+  variants: () => courseIds.flatMap((courseId) =>
+    ['7d', '30d', '90d'].map((window) => ({ courseId, window })),
+  ),
+  fetch: ({ params, signal }) => queryPostHogPreset(params, { signal }),
+})
+
+const queries = defineQueries([courseAnalytics])
+const result = await reader.read('course-analytics', { courseId: 'course-a', window: '30d' })
+```
+
+Each variant gets its own schedule, lease, backoff, and envelope. Added and removed variants reconcile like named queries. Storage and `RunReport` identities contain the public base name plus a canonical SHA-256 digest, never raw parameter values. Parameters must still contain only non-secret JSON dimensions. Credentials belong in bindings or fetcher closures.
+
+## Cloudflare quick start
+
+Apply the packaged D1 schema before deploying either combination:
+
+```sh
+pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
+  --file node_modules/@datafridge/cloudflare/migrations/0001_datafridge_init.sql
+```
+
+### Combo A: Durable Object alarms + D1 results
+
+The Durable Object owns serialized schedule bookkeeping in its SQLite storage. Results land in D1, and readers query D1 directly.
+
+```ts
+import { createReader, defineQueries } from '@datafridge/core'
+import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+
+interface Env {
+  DB: D1Database
+  POLLER: DurableObjectNamespace<Poller>
+}
 
 const queries = defineQueries([
   {
-    name: 'posthog-weekly',
+    name: 'weekly-summary',
     every: '10m',
-    source: 'posthog',
-    fetch: ({ signal }) => posthogQuery(weeklyReportSql, { signal }),
+    timeout: '30s',
+    source: 'analytics',
+    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
   },
 ])
 
-export class Poller extends PollerDO {
+export class Poller extends PollerDO<Env> {
   queries = queries
+
   results(env: Env) {
     return d1Results(env.DB)
   }
 }
-```
-
-```ts
-// worker.ts - the read side; same Worker or a completely different one
-import { createReader } from '@datafridge/core'
-import { d1Results, ensureStarted } from '@datafridge/cloudflare'
 
 export default {
-  async fetch(req, env) {
-    await ensureStarted(env.POLLER) // idempotent; ignites the alarm chain
-    const r = await createReader({ results: d1Results(env.DB) }).read('posthog-weekly')
-    return Response.json(r)
-    // r: { data, fetchedAt, isStale, age } | null (null = first fetch not done yet)
+  async fetch(_request: Request, env: Env) {
+    await ensureStarted(env.POLLER)
+    const reader = createReader({ results: d1Results(env.DB) })
+    return Response.json(await reader.read('weekly-summary'))
   },
 }
 ```
 
 ```toml
-# wrangler.toml
 [[durable_objects.bindings]]
 name = "POLLER"
 class_name = "Poller"
 
 [[d1_databases]]
 binding = "DB"
+database_name = "datafridge"
 database_id = "..."
 
 [[migrations]]
@@ -87,74 +113,95 @@ tag = "v1"
 new_sqlite_classes = ["Poller"]
 ```
 
+`ensureStarted()` is idempotent. It ignites the alarm chain on first use and reconciles changed query registries after deploys.
+
 ### Combo B: Cron Triggers + D1 full store
 
-No Durable Object at all. D1 carries both planes: results, and the schedule bookkeeping protected by a compare-and-swap claim (`UPDATE ... WHERE version = ?`), so concurrent cron invocations are safe. Scheduling granularity is capped at 1 minute.
+D1 stores both results and schedule rows. Atomic compare-and-swap claims make overlapping scheduled invocations safe.
 
 ```ts
-import { defineQueries, createPoller } from '@datafridge/core'
-import { d1Store } from '@datafridge/cloudflare'
+import { defineQueries } from '@datafridge/core'
+import { cronPoller, d1Store } from '@datafridge/cloudflare'
+
+interface Env {
+  DB: D1Database
+}
 
 const queries = defineQueries([
   {
-    name: 'posthog-weekly',
+    name: 'weekly-summary',
     every: '10m',
-    source: 'posthog',
-    fetch: ({ signal }) => posthogQuery(weeklyReportSql, { signal }),
+    source: 'analytics',
+    fetch: ({ signal }) => fetchWeeklySummary({ signal }),
   },
 ])
 
 export default {
-  scheduled: (event, env, ctx) =>
-    ctx.waitUntil(createPoller({ store: d1Store(env.DB), queries }).runDue()),
+  scheduled: cronPoller<Env>({
+    queries,
+    store: (env) => d1Store(env.DB),
+  }),
 }
 ```
 
 ```toml
-# wrangler.toml
 [triggers]
-crons = ["* * * * *"] # minimum granularity: 1 minute
+crons = ["* * * * *"]
 ```
 
-### Which one?
-
-| | Combo A (doAlarms) | Combo B (cron + D1 CAS) |
+| | Combo A | Combo B |
 |---|---|---|
-| Scheduling granularity | any timestamp | 1-minute floor |
-| Dynamic rescheduling | yes (backoff, runtime frequency changes) | tick is fixed; due checks stay dynamic |
-| Concurrency protection | driver is serialized, zero cost | D1 CAS claim |
-| Moving parts | DO + D1 | D1 only |
+| Scheduler | Durable Object alarms | Cron Triggers |
+| Schedule state | Durable Object SQLite | D1 with atomic claims |
+| Result state | D1 | D1 |
+| Granularity | Exact alarm timestamp | 1-minute floor |
+| Best fit | Dynamic backoff and minimal claim overhead | Fewer platform components |
 
-See [docs/cloudflare.md](./docs/cloudflare.md) for lifecycle details (alarm chain ignition, registry reconcile) and platform limits.
+## Init CLI
 
-## Reading from anywhere
+After installing `@datafridge/cloudflare`, scaffold both supported combinations into a TOML config:
 
-Results are plain JSON envelopes in the result store. Any process that can reach the store can read, with no poller present:
+```sh
+pnpm exec datafridge init cloudflare
+# npm: npx --no-install datafridge init cloudflare
+```
+
+Use `--config path/to/wrangler.toml` when needed. The command is idempotent, preserves existing declarations, refuses to conflict with `wrangler.json` or `wrangler.jsonc`, and prints any declaration it cannot safely add. Keep one combination and remove the unused declarations.
+
+## Read and failure behavior
 
 ```ts
-import { createReader } from '@datafridge/core'
-
-const reader = createReader({ results: d1Results(env.DB) })
-const r = await reader.read<WeeklyReport>('posthog-weekly')
+const result = await createReader({ results: d1Results(env.DB) }).read<Summary>(
+  'weekly-summary',
+)
+// { data, fetchedAt, isStale, age, lastError? } | null
 ```
 
-A full poller also exposes `poller.read()` directly, so the home that runs the poller does not need a separate reader. Consumers in other languages only need to read the underlying store; the envelope format is plain JSON.
+`null` means the first successful refresh has not completed. Upstream errors and timeouts preserve the previous envelope, increment failure state, and retry with jittered exponential backoff capped at the normal interval. `runDue()` returns `{ ran, skippedLeased, deferredBudget, failed }`. Combo A subclasses can override `onRunReport(report)` for sanitized operational logging.
+
+See [DESIGN.md section 2](./DESIGN.md#2-語意契約) for the authoritative contract and [docs/concepts.md](./docs/concepts.md) for the lease, version, backoff, and staleness model.
 
 ## Documentation
 
-- [docs/concepts.md](./docs/concepts.md) - the two planes, envelope and schedule row, staleness and failure semantics
-- [docs/cloudflare.md](./docs/cloudflare.md) - both combos in detail, lifecycle, platform limits
-- [docs/writing-adapters.md](./docs/writing-adapters.md) - ResultStore / ScheduleStore / Driver contracts and how adapters are accepted
-- [docs/rate-limiting.md](./docs/rate-limiting.md) - per-tick budgets, jitter, and when precise quota accounting is worth it
+- [API reference](./docs/api.md)
+- [Cloudflare setup and operations](./docs/cloudflare.md)
+- [Concepts and failure semantics](./docs/concepts.md)
+- [Rate limiting](./docs/rate-limiting.md)
+- [Writing adapters](./docs/writing-adapters.md)
+- [Release process and package names](./docs/releasing.md)
+- [Runnable Cloudflare example](./examples/cloudflare-basic)
 
-## Roadmap (wave 2+)
+## Wave 2 exclusions
 
-Planned, not available today:
+Not available in Wave 1:
 
-- `@datafridge/node` (setInterval driver), `@datafridge/sqlite`, `@datafridge/redis`
-- Result-plane read replicas (KV / Cache API; eventual consistency is acceptable on the result plane)
-- Precise per-source quota accounting (see [docs/rate-limiting.md](./docs/rate-limiting.md))
-- Parameterized queries (`variants: () => params[]`)
-- Metrics hook (the `RunReport` interface is already reserved for it)
-- QStash / Inngest provisioning drivers
-- `npx datafridge init cloudflare` scaffolding CLI (wave 1, milestone M3)
+- Node timer, Redis, SQLite, Postgres, KV, or Cache API adapters
+- Unbounded, on-demand, or arbitrary custom-range variants outside the finite registry
+- Precise shared quota-window accounting
+- Metrics exporters and dashboards
+- QStash or Inngest provisioning drivers
+- A documentation website
+
+## License
+
+[MIT](./LICENSE)

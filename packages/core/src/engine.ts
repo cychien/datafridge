@@ -4,12 +4,14 @@ import { defineQueries, Queries } from './define-queries.js'
 import { ConfigError, TimeoutError } from './errors.js'
 import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
+import { queryKey } from './query-key.js'
 import { shapeRead } from './reader.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
   Envelope,
-  QueryDef,
+  QueryDefinition,
+  QueryParams,
   ReadResult,
   ResultStore,
   RunReport,
@@ -19,7 +21,7 @@ import type {
 } from './types.js'
 
 export interface PollerConfig {
-  queries: Queries | readonly QueryDef[]
+  queries: Queries | readonly QueryDefinition[]
   driver: Driver
   clock?: Clock
   store?: Store
@@ -30,6 +32,7 @@ export interface PollerConfig {
 }
 
 export interface PollerReadOptions {
+  params?: QueryParams
   swrRefresh?: (refresh: Promise<void>) => void
 }
 
@@ -126,7 +129,7 @@ export function createPoller(config: PollerConfig): Poller {
     if (schedule.capabilities.listDue && schedule.listDue) {
       const all = await schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
       for (const row of all) {
-        if (queries.get(row.name)) continue
+        if (queries.getByKey(row.name)) continue
         await schedule.deleteSchedule(row.name)
         await results.deleteResult(row.name)
       }
@@ -146,11 +149,11 @@ export function createPoller(config: PollerConfig): Poller {
     }
   }
 
-  const refreshOne = async (name: string): Promise<void> => {
-    const query = queries.get(name)
+  const refreshOne = async (key: string): Promise<void> => {
+    const query = queries.getByKey(key)
     if (!query) return
     const now = clock.now()
-    const row = (await schedule.readSchedule(name)) ?? virtualRow(name, now)
+    const row = (await schedule.readSchedule(key)) ?? virtualRow(key, now)
     if (row.nextRunAt > now) return
     await executeOne({ query, row }, now, emptyReport())
   }
@@ -172,11 +175,12 @@ export function createPoller(config: PollerConfig): Poller {
     },
 
     async read<T>(name: string, options?: PollerReadOptions): Promise<ReadResult<T> | null> {
-      if (!queries.get(name)) throw new ConfigError(`unknown query '${name}'`)
-      const env = await results.readResult(name)
+      const key = queryKey(name, options?.params)
+      if (!queries.getByKey(key)) throw new ConfigError(`unknown query '${name}'`)
+      const env = await results.readResult(key)
       const shaped = shapeRead<T>(env, clock.now())
       if (options?.swrRefresh && (shaped === null || shaped.isStale)) {
-        options.swrRefresh(refreshOne(name))
+        options.swrRefresh(refreshOne(key))
       }
       return shaped
     },

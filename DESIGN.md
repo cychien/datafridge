@@ -95,11 +95,18 @@ Envelope 以純 JSON 序列化 - 任何語言的 consumer 只要能讀底層 res
 
 ```ts
 interface QueryDef<T = unknown> {
-  name: string                 // 唯一，是 store key 的一部分
+  name: string                 // 唯一，是 fixed query 的 store key
   every: Duration              // '5m' | '1h' | ms number
   timeout?: Duration           // 預設 30s；必須 < lease、< 平台上限
+  lease?: Duration             // 預設 timeout + 30s
   source?: string              // rate-limit 分組，預設 'default'
   fetch: (ctx: FetchCtx) => Promise<T>
+}
+
+interface ParameterizedQueryDef<P extends QueryParams, T = unknown>
+  extends Omit<QueryDef<T>, 'fetch'> {
+  variants: readonly P[] | (() => readonly P[])
+  fetch: (ctx: FetchCtx & { params: P }) => Promise<T>
 }
 
 interface FetchCtx {
@@ -108,8 +115,11 @@ interface FetchCtx {
   attempt: number              // 1-based，backoff 重試遞增
 }
 
-const queries = defineQueries([...])   // 建構時驗證，fail at config time
+const query = defineParameterizedQuery({...})
+const queries = defineQueries([query]) // 建構時展開 finite variants 並驗證
 ```
+
+已接受的 parameterized-query slice 把 finite runtime variants 展開成普通 registry entries。每個 variant 都有獨立 schedule row、lease、version、backoff 與 envelope。`queryKey(baseName, params)` 先 canonicalize JSON params，再以 SHA-256 建立 `@df/v1/...` identity；object key 順序不影響 identity，raw params 不進 store key 或 RunReport。Params 不得放 credential 或 private payload。新增與移除 variant 直接沿用 registry reconcile；read 以 base name + params 定位。Registry 外的 on-demand variant 不會在 read 時建立。
 
 ### Store contract：兩個獨立插槽
 
@@ -150,13 +160,13 @@ schedule plane 依序解析：
 三種典型寫法：
 
 ```ts
-createPoller({ store: d1Store(env.DB), driver: cronShell(), queries })            // full store 包辦
-createPoller({ results: d1Results(env.DB), driver: doAlarms(), queries })         // driver 自帶簿記
-createPoller({ results: redisResults(c), schedule: d1Schedule(env.DB),            // 全明確，極致混搭
-               driver: cronShell(), queries })
+createPoller({ store: d1Store(env.DB), driver: cronDriver(ctx), queries })
+createPoller({ results, driver: { serialized: true, defer, schedule }, queries }) // PollerDO 內部 shape
+createPoller({ results: customResults, schedule: customAtomicSchedule,
+               driver: cronDriver(ctx), queries })
 ```
 
-反例：`{ results: d1Results(...), driver: cronShell() }` - 只有 ResultStore 子集、cron 非 serialized、無明確 schedule → 規則 4，建構時報錯。
+反例：`{ results: d1Results(...), driver: cronDriver(ctx) }` - 只有 ResultStore 子集、cron 非 serialized、無明確 schedule，套用規則 4，建構時報錯。
 
 ### 後端能力矩陣
 
@@ -273,7 +283,8 @@ DO 在這裡的身分是 **scheduler**：alarm 自我喚醒、單線程執行 ru
 
 ```ts
 // poller.ts
-import { PollerDO, defineQueries, d1Results } from 'datafridge/cloudflare'
+import { createReader, defineQueries } from '@datafridge/core'
+import { d1Results, ensureStarted, PollerDO } from '@datafridge/cloudflare'
 
 const queries = defineQueries([
   { name: 'posthog-weekly', every: '10m', source: 'posthog',
@@ -332,9 +343,10 @@ per-query 錯誤全部收進 failCount，alarm handler 本身幾乎不 throw（t
 完全不用 DO 的接法 - schedule plane 走 resolution 規則第 3 條，落在 D1 自己身上（`UPDATE ... WHERE version = ?` 的 CAS）。cron 多實例併發由 claim 保護。
 
 ```ts
+import { cronPoller, d1Store } from '@datafridge/cloudflare'
+
 export default {
-  scheduled: (event, env, ctx) =>
-    ctx.waitUntil(createPoller({ store: d1Store(env.DB), queries }).runDue()),
+  scheduled: cronPoller({ queries, store: (env) => d1Store(env.DB) }),
 }
 ```
 
@@ -354,7 +366,7 @@ crons = ["* * * * *"]   # 粒度下限 1 分鐘
 | 併發保護 | driver 序列化，零成本 | D1 CAS claim |
 | 元件 | DO + D1 | 只有 D1 |
 
-提供 `npx datafridge init cloudflare` 自動寫入兩種組合的 wrangler 宣告。
+安裝 `@datafridge/cloudflare` 後，提供 `pnpm exec datafridge init cloudflare`（npm 專案用 `npx --no-install datafridge init cloudflare`）自動寫入兩種組合的 wrangler 宣告。
 
 ### 平台限制備忘
 
@@ -405,16 +417,20 @@ monorepo（pnpm workspaces）。未來每個依賴群聚一包：`@datafridge/re
 
 ## 11. Roadmap（wave 2+）
 
+M4 dogfood 已接受並提前交付一個 Wave 2 slice：finite parameterized queries。其 identity、獨立 state、reconcile 與 direct-read semantics 已納入 §5，不再是 roadmap 項目。
+
+其餘 roadmap：
+
 - `@datafridge/node`（setInterval driver，serialized、簿記可全放 results store 或記憶體）+ `@datafridge/sqlite` + `@datafridge/redis`
 - result-plane 讀取加速複本（KV / Cache API；最終一致在 result plane 可接受）
 - 精確配額記帳（§9 v2）
-- 參數化 queries（`variants: () => params[]`，展開成 name + paramsHash 的子項）
-- metrics hook（RunReport 已預留介面）
+- 無界或 read-time 建立的 on-demand/custom-range variants（finite parameterized registry 已作為 accepted Wave 2 slice 提前交付）
+- metrics exporter（RunReport 與 PollerDO operational hook 已提供）
 - QStash / Inngest provisioning driver
 
 ## 12. Open questions
 
-- ~~正式名稱與 npm scope~~：已定案 `datafridge`，scope `@datafridge/*`；發布時同時佔 `datafridge` 與 `data-fridge` 本名。
+- ~~正式名稱與 npm scope~~：installable packages 只使用 `@datafridge/*`。`datafridge` 與 `data-fridge` 僅保留品牌意圖，不屬 package graph；npm 沒有非 package 的 name reservation，因此不得為佔名發布 placeholder。未來只有在有真實 user-facing package semantics 且經獨立審核後才考慮 unscoped publication。
 - `read()` 對 null（首輪未完成）要不要提供 `waitForFirst()` 便利方法。
 - doAlarms 分片：單 coordinator DO 在幾百個 queries 之後是否需要按 source 分片（v1 明確不做，記錄觸發條件：單次 runDue 逼近 DO 執行時長限制時）。
 - envelope 是否提供壓縮選項。

@@ -2,7 +2,20 @@
   "name": "@datafridge/cloudflare",
   "version": "0.0.0",
   "description": "Cloudflare adapters for datafridge - Durable Object alarms driver, D1 store, cron shell",
+  "keywords": [
+    "cloudflare-workers",
+    "durable-objects",
+    "d1",
+    "scheduled"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cychien/datafridge.git",
+    "directory": "packages/cloudflare"
+  },
+  "homepage": "https://github.com/cychien/datafridge#readme",
+  "bugs": "https://github.com/cychien/datafridge/issues",
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -40,6 +53,10 @@
   },
   "peerDependencies": {
     "@datafridge/core": "workspace:^"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.2",
