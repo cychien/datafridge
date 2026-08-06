@@ -110,6 +110,41 @@ describe('PollerDO alarm loop', () => {
     expect(alarm).not.toBeNull()
   })
 
+  it(
+    'a resolution that hangs past its own backoff still clears the one-second floor',
+    { timeout: 20_000 },
+    async () => {
+      const stub = pollerStub('resolution-hang')
+      // The hang (3s) outlasts the first backoff (2s + jitter), so a tick that
+      // stamped the backoff from a `now` taken before resolution would write it
+      // into the past and drag the alarm back to MIN_ALARM_DELAY_MS.
+      await configure(stub, [
+        defineParameterizedQuery({
+          name: 'per-course',
+          every: '2s',
+          timeout: '3s',
+          variants: () => new Promise<never>(() => {}),
+          fetch: async () => ({ ok: true }),
+        }),
+      ])
+      await stub.ensureStarted()
+
+      await vi.waitFor(
+        async () => {
+          const rows = await scheduleRows(stub)
+          expect(rows.map((r) => r.name)).toEqual(['per-course'])
+          expect(await currentAlarm(stub)).not.toBeNull()
+        },
+        { timeout: 15_000 },
+      )
+
+      const row = (await scheduleRows(stub))[0]!
+      expect(row.fail_count).toBe(1)
+      expect(await currentAlarm(stub)).toBe(row.next_run_at)
+      expect(row.next_run_at).toBeGreaterThan(Date.now())
+    },
+  )
+
   it('a failed resolution backs the base off instead of pinning the alarm to its floor', async () => {
     const stub = pollerStub('resolution-backoff')
     let down = false

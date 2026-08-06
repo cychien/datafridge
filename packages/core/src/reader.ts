@@ -1,5 +1,5 @@
 import type { Clock } from './clock.js'
-import { defineQueries, Queries, resolveMemberWithin } from './define-queries.js'
+import { defineQueries, Queries, resolveMemberBy } from './define-queries.js'
 import { ConfigError } from './errors.js'
 import { queryKey } from './query-key.js'
 import { systemClock } from './system-clock.js'
@@ -111,15 +111,13 @@ export function createReader(config: ReaderConfig): Reader {
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
       // A hit never waits. A miss waits for whichever executor is fetching, for
       // as long as that query may take - but only a registry knows how long.
+      // That one budget also covers resolving a dynamic variant's membership.
       if (shaped !== null) return decodeRead(shaped, codec)
       if (!registry) return null
-      let timeoutMs: number
-      if (query) {
-        timeoutMs = query.timeoutMs
-      } else {
-        const found = await resolveMemberWithin(dynamic!, key, clock)
+      const deadline = clock.now() + (query?.timeoutMs ?? dynamic!.timeoutMs)
+      if (!query) {
+        const found = await resolveMemberBy(dynamic!, key, clock, deadline)
         if (!found) throw new ConfigError(`unknown query '${name}'`)
-        timeoutMs = found.timeoutMs
       }
       // Waiting is for a fetch that is happening or about to. A row scheduled
       // into the future with no live lease means the query is backing off after
@@ -130,7 +128,6 @@ export function createReader(config: ReaderConfig): Reader {
         const leaseHeld = row !== null && row.leaseUntil !== null && row.leaseUntil > now
         if (row !== null && !leaseHeld && row.nextRunAt > now) return null
       }
-      const deadline = clock.now() + timeoutMs
       const waited = await waitForEnvelope((k) => store.readResult(k), key, deadline, clock)
       return decodeRead(shapeRead<T>(waited, clock.now()), codec)
     },

@@ -11,8 +11,8 @@ import {
   queryKey,
   TimeoutError,
 } from '../src/index.js'
-import type { QueryParams, ResolveCtx } from '../src/index.js'
-import { makeHarness } from './helpers.js'
+import type { QueryParams, ResolveCtx, Store } from '../src/index.js'
+import { deferred, makeHarness } from './helpers.js'
 
 type VariantList = (ctx: ResolveCtx) => QueryParams[] | Promise<QueryParams[]>
 
@@ -39,6 +39,47 @@ function hangingQuery(name: string, onSignal: (signal: AbortSignal) => void) {
 }
 
 const key = (courseId: string) => queryKey('per-course', { courseId })
+
+/**
+ * A default-timeout static query sharing a registry with a dynamic base whose
+ * list resolves once and hangs for a full 2m timeout on every tick after that.
+ */
+function slowListHarness() {
+  const clock = new FakeClock(0)
+  const backing = memoryStore()
+  const claims: Array<{ name: string; leaseUntil: number }> = []
+  const store: Store = {
+    ...backing,
+    claim: (name, expectedVersion, leaseUntil, now) => {
+      claims.push({ name, leaseUntil })
+      return backing.claim(name, expectedVersion, leaseUntil, now)
+    },
+  }
+  let resolutions = 0
+  let fetches = 0
+  const queries = defineQueries([
+    {
+      name: 'static',
+      every: '5m',
+      fetch: async () => {
+        fetches += 1
+        return 'v'
+      },
+    },
+    defineParameterizedQuery({
+      name: 'per-course',
+      every: '15m',
+      timeout: '2m',
+      variants: () => {
+        resolutions += 1
+        return resolutions === 1 ? [{ courseId: 'alpha' }] : new Promise<QueryParams[]>(() => {})
+      },
+      fetch: async ({ params }) => params,
+    }),
+  ])
+  const { poller } = makeHarness(queries, { store, clock })
+  return { poller, clock, fetches: () => fetches, claims: () => claims }
+}
 
 describe('dynamic variants', () => {
   it('resolves the list at every tick: additions get rows, removals lose row and result', async () => {
@@ -221,6 +262,104 @@ describe('dynamic variants', () => {
 
     await expect(viaPoller).rejects.toThrow(TimeoutError)
     await expect(viaReader).rejects.toThrow(TimeoutError)
+  })
+
+  it('a hang longer than the first backoff still schedules ahead, not into the past', async () => {
+    // The one-second alarm floor coming back through a different door: a `now`
+    // captured before resolution would put a 60s backoff 60s behind a 120s hang.
+    let resolutions = 0
+    const queries = defineQueries([
+      defineParameterizedQuery({
+        name: 'per-course',
+        every: '15m',
+        timeout: '2m',
+        variants: () => {
+          resolutions += 1
+          return new Promise<QueryParams[]>(() => {})
+        },
+        fetch: async ({ params }) => params,
+      }),
+    ])
+    const { poller, store, clock } = makeHarness(queries)
+
+    const run = poller.runDue()
+    await flushMicrotasks()
+    await clock.advance(120_000)
+    await run
+
+    const row = (await store.readSchedule('per-course'))!
+    expect(row.nextRunAt).toBe(clock.now() + 60_000)
+    expect(resolutions).toBe(1)
+
+    // And the very next tick honours that backoff instead of hanging again.
+    await poller.runDue()
+    expect(resolutions).toBe(1)
+  })
+
+  it('an explicit runDue(now) is never refreshed, so a caller keeps control of time', async () => {
+    const { poller, clock, fetches } = slowListHarness()
+    await poller.runDue()
+    expect(fetches()).toBe(1)
+
+    await clock.advance(200_000)
+    const run = poller.runDue(clock.now())
+    await flushMicrotasks()
+    await clock.advance(120_000)
+    await run
+
+    // Pinned at 200_000, so 'static' is not due even though the wall clock
+    // passed its 300_000 boundary while the list hung.
+    expect(fetches()).toBe(1)
+  })
+
+  it('runDue() picks up the post-resolution time, and leases are still born live', async () => {
+    const { poller, clock, fetches, claims } = slowListHarness()
+    await poller.runDue()
+    expect(fetches()).toBe(1)
+
+    await clock.advance(200_000)
+    const run = poller.runDue()
+    await flushMicrotasks()
+    await clock.advance(120_000)
+    await run
+
+    expect(fetches()).toBe(2)
+    const staticClaims = claims().filter((c) => c.name === 'static')
+    expect(staticClaims[staticClaims.length - 1]!.leaseUntil).toBeGreaterThan(clock.now())
+  })
+
+  it('a cold read spends one timeout on membership and the wait together, not two', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const list = deferred<QueryParams[]>()
+    const queries = defineQueries([
+      defineParameterizedQuery({
+        name: 'per-course',
+        every: '5m',
+        timeout: '10s',
+        variants: () => list.promise,
+        fetch: () => new Promise<string>(() => {}),
+      }),
+    ])
+    const { poller } = makeHarness(queries, { store, clock })
+    const reader = createReader({ store, queries, clock })
+
+    const viaPoller = poller.read('per-course', { courseId: 'alpha' })
+    const viaReader = reader.read('per-course', { courseId: 'alpha' })
+    await flushMicrotasks()
+
+    // Six of the ten seconds go to the list; the wait inherits the remaining
+    // four rather than starting a fresh ten.
+    await clock.advance(6_000)
+    list.resolve([{ courseId: 'alpha' }])
+    await flushMicrotasks()
+    await clock.advance(4_000)
+
+    expect(clock.now()).toBe(10_000)
+    expect(await Promise.race([viaPoller, Promise.resolve('pending')])).not.toBe('pending')
+    expect(await Promise.race([viaReader, Promise.resolve('pending')])).not.toBe('pending')
+    await expect(viaPoller).resolves.toBeNull()
+    await expect(viaReader).resolves.toBeNull()
   })
 
   it('duplicate params in one resolution fail that base without touching its rows', async () => {

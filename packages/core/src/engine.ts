@@ -1,12 +1,7 @@
 import { backoffMs, firstRunJitterMs, MAX_JITTER_RATIO } from './backoff.js'
 import type { Clock } from './clock.js'
 import { withDeadline } from './deadline.js'
-import {
-  defineQueries,
-  Queries,
-  resolveMemberWithin,
-  resolveVariantsWithin,
-} from './define-queries.js'
+import { defineQueries, Queries, resolveMemberBy, resolveVariantsWithin } from './define-queries.js'
 import type { DynamicVariants } from './define-queries.js'
 import { ConfigError } from './errors.js'
 import type { Candidate } from './planner.js'
@@ -181,9 +176,12 @@ export function createPoller(config: PollerConfig): Poller {
       failures.push({ name: dynamic.baseName, message })
       unresolvedBases.add(dynamic.baseName)
       const failCount = (row?.failCount ?? 0) + 1
+      // Stamped when the row is written, not when the tick began: resolution
+      // may have spent the base's whole timeout getting here, and a backoff
+      // written into the past is no backoff at all.
       await schedule.writeSchedule({
         name: dynamic.baseName,
-        nextRunAt: now + backoffMs(failCount, dynamic.everyMs, random),
+        nextRunAt: clock.now() + backoffMs(failCount, dynamic.everyMs, random),
         failCount,
         leaseUntil: null,
         version: (row?.version ?? 0) + 1,
@@ -283,7 +281,9 @@ export function createPoller(config: PollerConfig): Poller {
       let query = queries.getByKey(key)
       if (!query) {
         const dynamic = dynamicOfKey(key)
-        query = dynamic ? await resolveMemberWithin(dynamic, key, clock) : undefined
+        query = dynamic
+          ? await resolveMemberBy(dynamic, key, clock, clock.now() + dynamic.timeoutMs)
+          : undefined
         if (!query) return
       }
       const now = clock.now()
@@ -298,16 +298,16 @@ export function createPoller(config: PollerConfig): Poller {
   /**
    * Nothing is stored yet and the caller is willing to wait. Fetch it here when
    * nobody else is on it, otherwise wait for whoever is - the lease keeps that
-   * to one upstream call however many readers arrive at once. The query's own
-   * timeout bounds the wait; a fetch that outlives it keeps going and lands for
-   * the next read.
+   * to one upstream call however many readers arrive at once. The deadline is
+   * the read's, already net of whatever membership resolution spent; a fetch
+   * that outlives it keeps going and lands for the next read.
    */
   const readThrough = async <T>(
     query: ResolvedQuery,
     key: string,
+    deadline: number,
   ): Promise<ReadResult<T> | null> => {
     const start = clock.now()
-    const deadline = start + query.timeoutMs
     const row = (await schedule.readSchedule(key)) ?? virtualRow(key, start)
     const leaseHeld = row.leaseUntil !== null && row.leaseUntil > start
 
@@ -357,8 +357,11 @@ export function createPoller(config: PollerConfig): Poller {
 
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
+      const effective = await resolveEffective(nowArg ?? clock.now())
+      // Resolution can legitimately spend a base's whole timeout, so dueness,
+      // reconciliation and leases work from a timestamp taken after it. A
+      // caller who supplied one owns the tick's clock and is never overridden.
       const now = nowArg ?? clock.now()
-      const effective = await resolveEffective(now)
       await reconcile(now, effective)
       const rowsByName = new Map(
         await Promise.all(
@@ -390,14 +393,16 @@ export function createPoller(config: PollerConfig): Poller {
         options.swrRefresh(refreshOne(key))
       }
       // A hit never waits; a miss fetches or waits for whoever is, bounded by
-      // this query's own timeout. A dynamic hit skips membership resolution -
-      // reconcile is the enforcer that removes departed variants.
+      // this query's own timeout - one budget, shared with resolving membership
+      // when the variant is dynamic. A dynamic hit skips that resolution
+      // entirely; reconcile is the enforcer that removes departed variants.
       if (shaped !== null) return decodeRead(shaped, codec)
+      const deadline = clock.now() + (query?.timeoutMs ?? dynamic!.timeoutMs)
       if (!query) {
-        query = await resolveMemberWithin(dynamic!, key, clock)
+        query = await resolveMemberBy(dynamic!, key, clock, deadline)
         if (!query) throw new ConfigError(`unknown query '${name}'`)
       }
-      return decodeRead(await readThrough<T>(query, key), codec)
+      return decodeRead(await readThrough<T>(query, key, deadline), codec)
     },
   }
 }

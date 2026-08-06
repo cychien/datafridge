@@ -70,7 +70,7 @@ const queries = defineQueries([analytics])
 
 **Arrays are static, functions are dynamic.** An array is expanded once at construction. A function - `variants` itself, or any single dimension - is resolved at every tick, may be async, and is where a list that lives in a database belongs. Reconciliation then creates rows for variants that appeared and deletes the row and result of variants that left. A resolution that throws removes nothing: the base keeps everything it already has, and the failure lands in that tick's `RunReport` under the base name.
 
-A resolver receives `{ signal }` exactly as `fetch` does - `courseId: ({ signal }) => listCourseIds(db, { signal })` - and is bound by the base's own `timeout`, so a list that hangs is aborted and treated as a resolution that failed. Bases resolve concurrently, so one hung list does not delay the others.
+A resolver receives `{ signal }` exactly as `fetch` does - `courseId: ({ signal }) => listCourseIds(db, { signal })` - and is bound by the base's own `timeout`, so a list that hangs is aborted and treated as a resolution that failed. Bases resolve concurrently, so one hung list does not delay the others. On a cold read that budget is shared with the wait: resolving membership and waiting for the first result cost one `timeout` between them, never two.
 
 Reading a dynamic variant is asymmetric on purpose: a stored result is served without consulting the list, and only a miss resolves it - to fetch a member, or to reject params that are not one.
 

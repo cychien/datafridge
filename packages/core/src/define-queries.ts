@@ -60,12 +60,19 @@ export function resolveVariantsWithin(
   )
 }
 
-export function resolveMemberWithin(
+/**
+ * Membership takes a deadline rather than a duration because a cold read
+ * spends one budget on resolving the list and then waiting for the result -
+ * one query, one answer to how long it may take.
+ */
+export function resolveMemberBy(
   dynamic: DynamicVariants,
   key: string,
   clock: Clock,
+  deadline: number,
 ): Promise<ResolvedQuery | undefined> {
-  return withDeadline(clock, dynamic.timeoutMs, resolutionLabel(dynamic), (signal) =>
+  const remaining = Math.max(0, deadline - clock.now())
+  return withDeadline(clock, remaining, resolutionLabel(dynamic), (signal) =>
     dynamic.member(key, signal),
   )
 }

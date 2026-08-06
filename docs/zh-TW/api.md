@@ -70,7 +70,7 @@ const queries = defineQueries([analytics])
 
 **陣列是靜態的，函式是動態的。** 陣列在建構時展開一次。函式 - 不論是 `variants` 本身，或任何一個 dimension - 在每個 tick 重新解析、可以是 async，清單活在資料庫裡時就用它。Reconcile 會替新出現的 variant 建 row，替離開的 variant 刪掉 row 與結果。解析拋錯時什麼都不會被刪：該 base 保留手上已有的一切，失敗記進那個 tick 的 `RunReport`，名字是 base name。
 
-解析函式和 `fetch` 一樣會拿到 `{ signal }` - `courseId: ({ signal }) => listCourseIds(db, { signal })` - 並受該 base 自己的 `timeout` 節制，所以卡住的清單會被 abort，並視為一次失敗的解析。各個 base 併發解析，一個卡住不會拖累其他。
+解析函式和 `fetch` 一樣會拿到 `{ signal }` - `courseId: ({ signal }) => listCourseIds(db, { signal })` - 並受該 base 自己的 `timeout` 節制，所以卡住的清單會被 abort，並視為一次失敗的解析。各個 base 併發解析，一個卡住不會拖累其他。冷讀取時這份額度和等待共用：解析成員身分與等第一筆結果加起來就是一個 `timeout`，不會變成兩個。
 
 讀取 dynamic variant 刻意不對稱：已存的結果直接回、不查清單；只有 miss 才解析 - 為了抓一個成員，或拒絕不是成員的 params。
 
