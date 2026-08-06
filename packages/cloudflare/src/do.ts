@@ -8,6 +8,7 @@ import {
 } from '@datafridge/core'
 import type {
   QueryDefinition,
+  QueryParams,
   RunReport,
   SchedulePlane,
   ScheduleRow,
@@ -25,7 +26,8 @@ const BOOKKEEPING_SCHEMA = `
     next_run_at INTEGER NOT NULL,
     fail_count INTEGER NOT NULL,
     lease_until INTEGER,
-    version INTEGER NOT NULL
+    version INTEGER NOT NULL,
+    params TEXT
   );
   CREATE TABLE IF NOT EXISTS datafridge_meta (
     key TEXT PRIMARY KEY,
@@ -44,6 +46,7 @@ type ScheduleRecord = {
   fail_count: number
   lease_until: number | null
   version: number
+  params: string | null
 }
 
 function toScheduleRow(record: ScheduleRecord): ScheduleRow {
@@ -53,6 +56,7 @@ function toScheduleRow(record: ScheduleRecord): ScheduleRow {
     failCount: record.fail_count,
     leaseUntil: record.lease_until,
     version: record.version,
+    ...(record.params !== null ? { params: JSON.parse(record.params) as QueryParams } : {}),
   }
 }
 
@@ -73,16 +77,18 @@ function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
 
     async writeSchedule(row) {
       sql.exec(
-        'INSERT INTO datafridge_schedule (name, next_run_at, fail_count, lease_until, version) ' +
-          'VALUES (?, ?, ?, ?, ?) ' +
+        'INSERT INTO datafridge_schedule ' +
+          '(name, next_run_at, fail_count, lease_until, version, params) ' +
+          'VALUES (?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT (name) DO UPDATE SET next_run_at = excluded.next_run_at, ' +
           'fail_count = excluded.fail_count, lease_until = excluded.lease_until, ' +
-          'version = excluded.version',
+          'version = excluded.version, params = excluded.params',
         row.name,
         row.nextRunAt,
         row.failCount,
         row.leaseUntil,
         row.version,
+        row.params === undefined ? null : JSON.stringify(row.params),
       )
     },
 

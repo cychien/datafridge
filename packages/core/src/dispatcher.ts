@@ -148,6 +148,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       failCount: 0,
       leaseUntil: null,
       version: token,
+      ...(query.params !== undefined ? { params: query.params } : {}),
     })
     return { status: 'ran' }
   }
@@ -177,6 +178,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
           failCount,
           leaseUntil: null,
           version: token,
+          ...(query.params !== undefined ? { params: query.params } : {}),
         })
       } else {
         message = `write discarded (lease reclaimed): ${message}`

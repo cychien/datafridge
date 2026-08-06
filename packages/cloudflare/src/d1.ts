@@ -1,4 +1,4 @@
-import type { Envelope, ScheduleRow, Store } from '@datafridge/core'
+import type { Envelope, QueryParams, ScheduleRow, Store } from '@datafridge/core'
 import { D1_SCHEMA } from './schema.js'
 
 // D1's documented maximum string/BLOB/row size (developers.cloudflare.com/d1/platform/limits).
@@ -14,6 +14,7 @@ type ScheduleRecord = {
   fail_count: number
   lease_until: number | null
   version: number
+  params: string | null
 }
 
 type QuotaRecord = {
@@ -39,6 +40,12 @@ function ensureSchema(db: D1Database): Promise<void> {
 
 function isMissingTable(err: unknown): boolean {
   return err instanceof Error && /no such table/i.test(err.message)
+}
+
+// A base name is user-supplied and reaches the key verbatim (percent-encoded),
+// so a '%' in it would otherwise widen the prefix match to other bases.
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`)
 }
 
 /**
@@ -67,6 +74,7 @@ function toScheduleRow(record: ScheduleRecord): ScheduleRow {
     failCount: record.fail_count,
     leaseUntil: record.lease_until,
     version: record.version,
+    ...(record.params !== null ? { params: JSON.parse(record.params) as QueryParams } : {}),
   }
 }
 
@@ -101,12 +109,14 @@ export function d1(db: D1Database): Store {
               `exceeding D1's ${D1_MAX_ROW_BYTES}-byte row limit; the previous envelope is kept`,
           )
         }
+        // A brand new entry counts as read when it lands, so a cold read that
+        // creates one cannot lose it to eviction before anyone touches it.
         await db
           .prepare(
-            'INSERT INTO datafridge_results (name, envelope) VALUES (?, ?) ' +
+            'INSERT INTO datafridge_results (name, envelope, last_read_at) VALUES (?, ?, ?) ' +
               'ON CONFLICT (name) DO UPDATE SET envelope = excluded.envelope',
           )
-          .bind(name, envelope)
+          .bind(name, envelope, env.fetchedAt)
           .run()
       })
     },
@@ -114,6 +124,38 @@ export function d1(db: D1Database): Store {
     async deleteResult(name) {
       return withSchema(db, async () => {
         await db.prepare('DELETE FROM datafridge_results WHERE name = ?').bind(name).run()
+      })
+    },
+
+    // Reached from the read path, so it applies no schema: nothing stored is
+    // nothing to record, exactly as the reads above treat a missing table.
+    async touchResult(name, at) {
+      try {
+        await db
+          .prepare('UPDATE datafridge_results SET last_read_at = ? WHERE name = ?')
+          .bind(at, name)
+          .run()
+      } catch (err) {
+        if (!isMissingTable(err)) throw err
+      }
+    },
+
+    async evictIdleResults(keyPrefix, idleBefore) {
+      return withSchema(db, async () => {
+        const { results } = await db
+          .prepare(
+            "SELECT name FROM datafridge_results WHERE name LIKE ? ESCAPE '\\' AND last_read_at < ?",
+          )
+          .bind(`${escapeLike(keyPrefix)}%`, idleBefore)
+          .run<{ name: string }>()
+        if (results.length === 0) return []
+        const names = results.map((record) => record.name)
+        await db.batch(
+          names.map((name) =>
+            db.prepare('DELETE FROM datafridge_results WHERE name = ?').bind(name),
+          ),
+        )
+        return names
       })
     },
 
@@ -134,13 +176,21 @@ export function d1(db: D1Database): Store {
       return withSchema(db, async () => {
         await db
           .prepare(
-            'INSERT INTO datafridge_schedule (name, next_run_at, fail_count, lease_until, version) ' +
-              'VALUES (?, ?, ?, ?, ?) ' +
+            'INSERT INTO datafridge_schedule ' +
+              '(name, next_run_at, fail_count, lease_until, version, params) ' +
+              'VALUES (?, ?, ?, ?, ?, ?) ' +
               'ON CONFLICT (name) DO UPDATE SET next_run_at = excluded.next_run_at, ' +
               'fail_count = excluded.fail_count, lease_until = excluded.lease_until, ' +
-              'version = excluded.version',
+              'version = excluded.version, params = excluded.params',
           )
-          .bind(row.name, row.nextRunAt, row.failCount, row.leaseUntil, row.version)
+          .bind(
+            row.name,
+            row.nextRunAt,
+            row.failCount,
+            row.leaseUntil,
+            row.version,
+            row.params === undefined ? null : JSON.stringify(row.params),
+          )
           .run()
       })
     },
@@ -156,7 +206,8 @@ export function d1(db: D1Database): Store {
         if (expectedVersion === 0) {
           const result = await db
             .prepare(
-              'INSERT INTO datafridge_schedule (name, next_run_at, fail_count, lease_until, version) ' +
+              'INSERT INTO datafridge_schedule ' +
+                '(name, next_run_at, fail_count, lease_until, version) ' +
                 'VALUES (?, ?, 0, ?, 1) ON CONFLICT (name) DO NOTHING',
             )
             .bind(name, now, leaseUntil)

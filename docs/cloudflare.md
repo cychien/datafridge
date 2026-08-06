@@ -192,11 +192,32 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 
 ## Construction-time validation
 
-- `defineQueries` validates names, durations, fetchers, duplicate variants, and `timeout < lease`.
+- `defineQueries` validates names, durations, fetchers, duplicate variants, `timeout < lease`, and `retain > every`.
 - `FridgeDO` validates its registry, source policies, and the Cloudflare wall-clock ceiling during ignition and before alarms.
 - `cronFridge` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
 - A source policy must declare a `limit`, a `maxConcurrent`, or both; `limit.requests`, `limit.per` and `maxConcurrent` must be positive, and `limit.reserve` must be smaller than `limit.requests`.
+
+## On-demand entries on Cloudflare
+
+A `retain` query needs two things here that a declared one does not.
+
+The read path is a reader, so the reader is what records reads - and an entry nothing records reading is an entry that gets evicted. Give it `d1(env.DB)` (which has `touchResult`) and hand it the invocation's `waitUntil`, or the Worker may be torn down before the stamp lands:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const reader = createReader({
+      store: d1(env.DB),
+      queries,
+      defer: (promise) => ctx.waitUntil(promise),
+    })
+    return Response.json(await reader.read('course-funnel', { courseId: 'course-a' }))
+  },
+}
+```
+
+And the schedule plane has to be able to list its rows, since an entry nothing declared can only be found by enumerating what is stored. Both shipped planes can - `FridgeDO`'s SQLite and `d1`'s schedule half - so this only bites a hand-written one.
 
 ## Failure and recovery
 

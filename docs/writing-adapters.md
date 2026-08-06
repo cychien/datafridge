@@ -14,6 +14,12 @@ interface Store {
   readResult(name: string): Promise<Envelope | null>
   writeResult(name: string, env: Envelope): Promise<void>
   deleteResult(name: string): Promise<void>        // used by registry reconcile
+  // `retain`: record that something was read, and drop what has gone cold
+  touchResult(name: string, at: number): Promise<void>
+  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
+  // `retain`: record that something was read, and drop what has gone cold
+  touchResult(name: string, at: number): Promise<void>
+  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 
   // schedule plane - coordination bookkeeping
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -32,6 +38,10 @@ interface Store {
 ```
 
 A store holds both halves. Applications only ever meet this one interface.
+
+`touchResult` is reached from the read path, so like the two reads it must never apply schema: with nothing stored there is nothing to record. `evictIdleResults` deletes results and names them, and deliberately does not touch schedule rows - the schedule half may live in a different object entirely, so removing those is the caller's job. A fresh `writeResult` counts as read at its `fetchedAt`, or an entry created by a cold read would be evictable before anybody could record reading it; a later `writeResult` leaves the stamp where the reader put it, because a refresh is not a read.
+
+`touchResult` is reached from the read path, so like the two reads it must never apply schema: with nothing stored there is nothing to record. `evictIdleResults` deletes results and names them, and deliberately does not touch schedule rows - the schedule half may live in a different object entirely, so removing those is the caller's job. A fresh `writeResult` counts as read at its `fetchedAt`, or an entry created by a cold read would be evictable before anybody could record reading it; a later `writeResult` leaves the stamp where the reader put it, because a refresh is not a read.
 
 **A store creates the storage it needs.** Before its first write it must apply its own tables, keys, or collections, so no adapter ever ships a migration the user has to remember. Applying an equivalent schema by hand must stay a no-op, a backend whose storage disappears under a warm process must be repaired and retried rather than failing until that process recycles, and both reads - `readResult` and `readSchedule` - must stay plain reads: storage that does not exist yet reads as `null`, exactly like an empty one, because a read-only consumer's read path reaches both and must never apply schema. `@datafridge/cloudflare`'s `test/schema.test.ts` is the reference test to copy - the contract suite cannot enforce this, because the suite's factory is what prepares the backend.
 

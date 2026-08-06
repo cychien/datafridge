@@ -75,9 +75,11 @@ export interface ReaderConfig {
    * readResult is the only method a read needs. A store that also offers
    * readSchedule - `d1()` does - lets a miss tell "nothing is coming yet" from
    * "a retry is already scheduled for later" and answer the second one at once
-   * instead of waiting it out.
+   * instead of waiting it out. `touchResult` matters when the registry has
+   * `retain` queries: on Cloudflare the read path is a reader, so a reader that
+   * cannot record a read is a reader whose on-demand entries all go cold.
    */
-  store: Pick<Store, 'readResult'> & Partial<Pick<Store, 'readSchedule'>>
+  store: Pick<Store, 'readResult'> & Partial<Pick<Store, 'readSchedule' | 'touchResult'>>
   /**
    * Rejects names outside it, and carries the timeout a miss waits for. Without
    * it a reader needs nothing but a store, and a miss answers null immediately
@@ -85,6 +87,12 @@ export interface ReaderConfig {
    */
   queries?: Queries | readonly QueryDefinition[]
   clock?: Clock
+  /**
+   * Where the keep-warm stamp goes to finish, e.g. `ctx.waitUntil`. Without it
+   * the stamp is still written, just with nobody holding the invocation open
+   * for it, so a Worker may be torn down before it lands.
+   */
+  defer?: (promise: Promise<unknown>) => void
 }
 
 export interface Reader {
@@ -101,22 +109,37 @@ export function createReader(config: ReaderConfig): Reader {
         ? config.queries
         : defineQueries(config.queries)
 
+  const keepWarm = (key: string): void => {
+    if (!store.touchResult) return
+    const stamped = store.touchResult(key, clock.now()).catch(() => {
+      // A missed keep-warm stamp is a slightly earlier eviction, not an error
+      // to raise on a read path that has already answered.
+    })
+    config.defer?.(stamped)
+  }
+
   return {
     async read<T>(name: string, params?: QueryParams): Promise<ReadResult<T> | null> {
       const key = queryKey(name, params)
       const query = registry?.getByKey(key)
       const dynamic = !query && registry ? registry.dynamicFor(name) : undefined
-      if (registry && !query && !dynamic) throw new ConfigError(`unknown query '${name}'`)
-      const codec = query?.codec ?? dynamic?.codec
+      const onDemand = !query && !dynamic && registry ? registry.onDemandFor(name) : undefined
+      if (registry && !query && !dynamic && !onDemand) {
+        throw new ConfigError(`unknown query '${name}'`)
+      }
+      const codec = query?.codec ?? dynamic?.codec ?? onDemand?.codec
+      // A reader is the read path on Cloudflare, so this is usually the only
+      // thing telling an on-demand entry that anyone still wants it.
+      if (onDemand) keepWarm(key)
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
       // A hit never waits. A miss waits for whichever executor is fetching, for
       // as long as that query may take - but only a registry knows how long.
       // That one budget also covers resolving a dynamic variant's membership.
       if (shaped !== null) return decodeRead(shaped, codec)
       if (!registry) return null
-      const deadline = clock.now() + (query?.timeoutMs ?? dynamic!.timeoutMs)
-      if (!query) {
-        const found = await resolveMemberBy(dynamic!, key, clock, deadline)
+      const deadline = clock.now() + (query?.timeoutMs ?? dynamic?.timeoutMs ?? onDemand!.timeoutMs)
+      if (!query && dynamic) {
+        const found = await resolveMemberBy(dynamic, key, clock, deadline)
         if (!found) throw new ConfigError(`unknown query '${name}'`)
       }
       // Waiting is for a fetch that is happening or about to. A row scheduled

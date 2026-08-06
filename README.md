@@ -198,7 +198,23 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 Every variant becomes an ordinary independent registry entry with its own schedule, lease, backoff, failure count, and stored result. Adding or removing a variant reconciles exactly like adding or removing a named query.
 
-Only variants in the finite registry are scheduled and readable. Arbitrary on-demand variants are not created at read time.
+## Sets too large to list
+
+When the set is open-ended - one entry per custom date range, a funnel per course - `retain` replaces the list entirely:
+
+```ts
+const funnel = defineParameterizedQuery({
+  name: 'course-funnel',
+  every: '15m',
+  retain: '2h',
+  source: 'posthog',
+  fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
+})
+```
+
+Any params become an entry the first time somebody reads them, and stay one - refreshed on `every`, metered by `source`, backed off on failure, exactly like a declared variant - until nothing has read them for `retain`. Then the entry goes, and with it the polling. What keeps an entry warm is a read, never a refresh, so nothing you have stopped looking at keeps costing you calls.
+
+That read has to be recorded, which on Cloudflare means the reader: give `createReader` a store with `touchResult` and hand it `ctx.waitUntil` as `defer`. See [on-demand entries](./docs/api.md#on-demand-entries).
 
 ## Rate limiting by source
 

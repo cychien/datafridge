@@ -78,7 +78,28 @@ Params 必須是由有限數字、字串、boolean、null、array 與 plain obje
 
 `queryKey(name, params?)` 是穩定的 storage identity function。Fixed name 保持不變。Variant identity 使用保留的 `@df/v1/` namespace、encoded public base name，以及 canonical params 的 SHA-256。Raw params 不會出現在 schedule rows、D1 keys 或 `RunReport`。不要把 credential、token 或 private payload 放入 params。Secret 應放在 binding 或 fetcher closure。
 
-不在有限 registry 內的任意 on-demand variants 仍不支援。
+### On-demand entries
+
+有些集合太大或太開放，列不出來。`retain` 完全不宣告清單：任何 params 在第一次被讀到時成為一個 entry，在沒有人讀它超過那麼久之後不再是。
+
+```ts
+const funnel = defineParameterizedQuery({
+  name: 'course-funnel',
+  every: '15m',
+  retain: '2h',
+  source: 'posthog',
+  fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
+})
+```
+
+`variants`、`dimensions`、`retain` 三者擇一。從建立到清除之間，on-demand entry 就是一個普通 entry：自己的 schedule row、lease、backoff 與結果，照 `every` 刷新，照 `source` 計額度 - 建立它的那次讀取走的是排程 tick 走的同一個 dispatcher。
+
+- **讓它活著的是讀取**，不是刷新。Polling 無法讓一個 entry 保持溫熱，只有真的有人要它才行。這個時間戳寫在關鍵路徑之外，讀取不會等它。
+- **清除就是停止刷新。** 閒置超過 `retain` 的 entry 會失去結果與 row，也就失去它在 tick 裡的位置。沒有第二個開關。
+- **`createReader` 必須有能力記錄讀取。** Cloudflare 上讀取路徑就是 reader，所以要給它一個有 `touchResult` 的 store（`d1(env.DB)` 有），以及一個 `defer`（`ctx.waitUntil`）把 invocation 撐到時間戳寫完。一個不能記錄讀取的 reader，它的 on-demand entry 會全部變冷。
+- `retain` 必須長於 `every`，而且 schedule plane 必須能列出自己的 row：沒有人宣告的 entry 只能靠列舉已存的東西找回來。兩者都在建構時檢查。
+
+第一次抓取就失敗的冷讀取會留下一筆 backoff row、沒有結果，所以猛打一個壞掉的 key 的讀者無法藉此猛打上游。那個 backoff 過期後 row 會被丟掉：一次讀取不構成持續有人要它的證據。
 
 ### Fridge
 

@@ -19,6 +19,9 @@ function tracing(inner: Store, log: string[]): Store {
     deleteSchedule: (name) => note('deleteSchedule', name, () => inner.deleteSchedule(name)),
     claim: (name, expectedVersion, leaseUntil, now) =>
       note('claim', name, () => inner.claim(name, expectedVersion, leaseUntil, now)),
+    touchResult: (name, at) => note('touchResult', name, () => inner.touchResult(name, at)),
+    evictIdleResults: (prefix, before) =>
+      note('evictIdleResults', prefix, () => inner.evictIdleResults(prefix, before)),
     takeQuota: (source, limit, windowMs, now) =>
       note('takeQuota', source, () => inner.takeQuota(source, limit, windowMs, now)),
     listDue: (now, limit) => note('listDue', '*', () => inner.listDue!(now, limit)),

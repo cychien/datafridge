@@ -6,8 +6,13 @@ function cloneEnvelope(env: Envelope): Envelope {
   return JSON.parse(JSON.stringify(env)) as Envelope
 }
 
+function cloneRow(row: ScheduleRow): ScheduleRow {
+  return JSON.parse(JSON.stringify(row)) as ScheduleRow
+}
+
 export function memoryStore(): Store {
   const results = new Map<string, Envelope>()
+  const lastReadAt = new Map<string, number>()
   const rows = new Map<string, ScheduleRow>()
   const quota = new Map<string, { windowStart: number; used: number }>()
 
@@ -21,19 +26,39 @@ export function memoryStore(): Store {
 
     async writeResult(name, env) {
       results.set(name, cloneEnvelope(env))
+      // A brand new entry counts as read when it lands, so a cold read that
+      // creates one cannot lose it to eviction before anyone touches it.
+      if (!lastReadAt.has(name)) lastReadAt.set(name, env.fetchedAt)
     },
 
     async deleteResult(name) {
       results.delete(name)
+      lastReadAt.delete(name)
+    },
+
+    async touchResult(name, at) {
+      if (results.has(name)) lastReadAt.set(name, at)
+    },
+
+    async evictIdleResults(keyPrefix, idleBefore) {
+      const evicted: string[] = []
+      for (const name of [...results.keys()]) {
+        if (!name.startsWith(keyPrefix)) continue
+        if ((lastReadAt.get(name) ?? 0) >= idleBefore) continue
+        results.delete(name)
+        lastReadAt.delete(name)
+        evicted.push(name)
+      }
+      return evicted.sort()
     },
 
     async readSchedule(name) {
       const row = rows.get(name)
-      return row ? { ...row } : null
+      return row ? cloneRow(row) : null
     },
 
     async writeSchedule(row) {
-      rows.set(row.name, { ...row })
+      rows.set(row.name, cloneRow(row))
     },
 
     async deleteSchedule(name) {
@@ -73,7 +98,7 @@ export function memoryStore(): Store {
         .filter((row) => row.nextRunAt <= now)
         .sort((a, b) => a.nextRunAt - b.nextRunAt)
         .slice(0, limit)
-        .map((row) => ({ ...row }))
+        .map(cloneRow)
     },
   }
 }

@@ -75,6 +75,63 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         first.fetchedAt = 0
         expect(await store.readResult('q')).toEqual(envelope({ data: { count: 1 } }))
       })
+
+      it('counts a new result as read when it lands, so retain does not start expired', async () => {
+        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 5_000 }))
+        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
+        expect(await store.readResult('@df/v1/q/aaa')).not.toBeNull()
+      })
+
+      it('touchResult moves the entry past an eviction it would otherwise fail', async () => {
+        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 1_000 }))
+        await store.touchResult('@df/v1/q/aaa', 9_000)
+        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
+        expect(await store.readResult('@df/v1/q/aaa')).not.toBeNull()
+      })
+
+      it('touchResult on a result that is not there is not an error', async () => {
+        await expect(store.touchResult('missing', 1_000)).resolves.not.toThrow()
+        expect(await store.readResult('missing')).toBeNull()
+      })
+
+      it('does not preserve last_read_at across a rewrite of the same entry', async () => {
+        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 1_000 }))
+        await store.touchResult('@df/v1/q/aaa', 9_000)
+        // A refresh is not a read: the stamp stays where the reader put it.
+        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 2_000 }))
+        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
+      })
+
+      it('evictIdleResults removes only idle entries under the prefix, and names them', async () => {
+        await store.writeResult('@df/v1/q/idle', envelope())
+        await store.touchResult('@df/v1/q/idle', 1_000)
+        await store.writeResult('@df/v1/q/warm', envelope())
+        await store.touchResult('@df/v1/q/warm', 9_000)
+        await store.writeResult('@df/v1/other/idle', envelope())
+        await store.touchResult('@df/v1/other/idle', 1_000)
+        await store.writeResult('plain', envelope())
+        await store.touchResult('plain', 1_000)
+
+        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual(['@df/v1/q/idle'])
+        expect(await store.readResult('@df/v1/q/idle')).toBeNull()
+        expect(await store.readResult('@df/v1/q/warm')).not.toBeNull()
+        expect(await store.readResult('@df/v1/other/idle')).not.toBeNull()
+        expect(await store.readResult('plain')).not.toBeNull()
+      })
+
+      it('evictIdleResults leaves the schedule row alone: the caller owns that half', async () => {
+        await store.writeResult('@df/v1/q/idle', envelope())
+        await store.touchResult('@df/v1/q/idle', 1_000)
+        await store.writeSchedule({
+          name: '@df/v1/q/idle',
+          nextRunAt: 1_000,
+          failCount: 0,
+          leaseUntil: null,
+          version: 1,
+        })
+        await store.evictIdleResults('@df/v1/q/', 5_000)
+        expect(await store.readSchedule('@df/v1/q/idle')).not.toBeNull()
+      })
     })
 
     describe('schedule plane', () => {
@@ -98,6 +155,14 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         expect(await store.readSchedule('q')).toEqual(
           row({ leaseUntil: 9_000, failCount: 2, version: 4 }),
         )
+      })
+
+      it('round-trips params, and omits them when absent', async () => {
+        const params = { courseId: 'c-1', nested: [1, 'two', null, { deep: true }] }
+        await store.writeSchedule(row({ params }))
+        expect(await store.readSchedule('q')).toEqual(row({ params }))
+        await store.writeSchedule(row())
+        expect(await store.readSchedule('q')).toEqual(row())
       })
 
       it('deleteSchedule removes the row and tolerates unknown names', async () => {

@@ -78,7 +78,28 @@ Params must be JSON values containing finite numbers, strings, booleans, nulls, 
 
 `queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from schedule rows, D1 keys, and `RunReport`. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
 
-Arbitrary on-demand variants outside the finite registry remain excluded.
+### On-demand entries
+
+Some sets are too large or too open-ended to enumerate. `retain` names no list at all: any params become an entry the first time somebody reads them, and stop being one once nothing has read them for that long.
+
+```ts
+const funnel = defineParameterizedQuery({
+  name: 'course-funnel',
+  every: '15m',
+  retain: '2h',
+  source: 'posthog',
+  fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
+})
+```
+
+Pass exactly one of `variants`, `dimensions`, or `retain`. Between creation and eviction an on-demand entry is an ordinary entry: its own schedule row, lease, backoff, and result, refreshed on `every` like anything else, and metered by its `source` like anything else - the read that creates it goes through the same dispatcher a tick does.
+
+- **What keeps it alive is a read**, not a refresh. Polling cannot keep an entry warm; only something asking for it can. The stamp is written off the critical path, so a read never waits for it.
+- **Eviction is what stops the refreshing.** An entry idle for longer than `retain` loses its result and its row, and with them its place in the tick. There is no second switch.
+- **`createReader` must be able to record reads.** On Cloudflare the read path is a reader, so pass it a store with `touchResult` - `d1(env.DB)` has it - and a `defer` (`ctx.waitUntil`) to hold the invocation open for the stamp. A reader that cannot record reads is a reader whose on-demand entries all go cold.
+- `retain` must be longer than `every`, and the schedule plane must be able to list its rows: an entry nothing declared can only be found by enumerating what is stored. Both are checked at construction.
+
+A cold read whose very first fetch fails leaves a backoff row and no result, so a reader hammering a broken key cannot hammer upstream with it. Once that backoff expires the row is dropped: one read is not evidence of ongoing demand.
 
 ### Fridge
 

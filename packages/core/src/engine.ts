@@ -6,7 +6,7 @@ import { createDispatcher } from './dispatcher.js'
 import type { DispatchOutcome } from './dispatcher.js'
 import { ConfigError } from './errors.js'
 import { planTick, virtualRow } from './planner.js'
-import { queryKey, variantBaseOf } from './query-key.js'
+import { queryKey, variantBaseOf, variantKeyPrefix } from './query-key.js'
 import { decodeRead, shapeRead, waitForEnvelope } from './reader.js'
 import { resolveSources } from './sources.js'
 import { systemClock, systemRandom } from './system-clock.js'
@@ -49,6 +49,7 @@ export function createFridge(config: FridgeConfig): Fridge {
   const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
   const dispatcher = createDispatcher({ store, schedule, clock, random, sources })
+  requireListDueForOnDemand(queries, schedule)
 
   interface EffectiveRegistry {
     list: readonly ResolvedQuery[]
@@ -75,11 +76,28 @@ export function createFridge(config: FridgeConfig): Fridge {
    * three, but they are expanded in registry order so which base is blamed for
    * a duplicate key does not depend on who answered first.
    */
-  const resolveEffective = async (now: number): Promise<EffectiveRegistry> => {
+  const resolveEffective = async (
+    now: number,
+    rows: readonly ScheduleRow[],
+  ): Promise<EffectiveRegistry> => {
     const list: ResolvedQuery[] = [...queries.all]
     const byKey = new Map(queries.all.map((query) => [query.name, query]))
     const failures: Array<{ name: string; message: string }> = []
     const unresolvedBases = new Set<string>()
+
+    // On-demand entries are declared by nothing, so the rows are the registry:
+    // each one carries the params its key only hashes.
+    for (const row of rows) {
+      const base = variantBaseOf(row.name)
+      if (base === undefined || row.params === undefined || byKey.has(row.name)) continue
+      const onDemand = queries.onDemandFor(base)
+      if (onDemand === undefined) continue
+      const query = onDemand.instantiate(row.params)
+      // Params that do not hash back to their own key are not this entry's.
+      if (query.name !== row.name) continue
+      byKey.set(query.name, query)
+      list.push(query)
+    }
 
     const failBase = async (attempt: Attempt, message: string): Promise<void> => {
       const { dynamic, row } = attempt
@@ -148,18 +166,77 @@ export function createFridge(config: FridgeConfig): Fridge {
     return { list, byKey, failures, unresolvedBases }
   }
 
-  const reconcile = async (now: number, effective: EffectiveRegistry): Promise<void> => {
-    if (schedule.capabilities.listDue && schedule.listDue) {
-      const all = await schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
-      for (const row of all) {
-        if (effective.byKey.has(row.name)) continue
-        // A dynamic base's own row is backoff bookkeeping, not a departed variant.
-        if (queries.dynamicFor(row.name)) continue
-        const base = variantBaseOf(row.name)
-        if (base !== undefined && effective.unresolvedBases.has(base)) continue
-        await schedule.deleteSchedule(row.name)
-        await store.deleteResult(row.name)
+  const listAllRows = async (): Promise<ScheduleRow[]> =>
+    schedule.capabilities.listDue && schedule.listDue
+      ? schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+      : []
+
+  /**
+   * On-demand entries live as long as something keeps reading them. Eviction is
+   * also what stops the refreshing: an entry nothing has read for `retain` loses
+   * its result and its row, and with them its place in the tick.
+   */
+  const evictIdle = async (now: number, removed: Set<string>): Promise<void> => {
+    for (const base of queries.onDemand) {
+      const evicted = await store.evictIdleResults(
+        variantKeyPrefix(base.baseName),
+        now - base.retainMs,
+      )
+      for (const name of evicted) {
+        await schedule.deleteSchedule(name)
+        removed.add(name)
       }
+    }
+  }
+
+  /**
+   * A cold read whose very first fetch failed leaves a row with no result. Its
+   * backoff is worth keeping - a reader hammering a broken key must not hammer
+   * upstream with it - but once that has expired, one read is not evidence of
+   * ongoing demand, and the row would otherwise retry forever unread. Only
+   * failing rows are checked, so a healthy registry pays nothing for this.
+   */
+  const dropFailedOnDemand = async (
+    now: number,
+    rows: readonly ScheduleRow[],
+    removed: Set<string>,
+  ): Promise<void> => {
+    for (const row of rows) {
+      const base = variantBaseOf(row.name)
+      if (base === undefined || queries.onDemandFor(base) === undefined) continue
+      if (row.failCount === 0 || row.nextRunAt > now || removed.has(row.name)) continue
+      if (row.leaseUntil !== null && row.leaseUntil > now) continue
+      if ((await store.readResult(row.name)) !== null) continue
+      await schedule.deleteSchedule(row.name)
+      removed.add(row.name)
+    }
+  }
+
+  /** Everything `retain` removed this tick, so the rest of it works from what is left. */
+  const sweepOnDemand = async (now: number, rows: readonly ScheduleRow[]): Promise<Set<string>> => {
+    const removed = new Set<string>()
+    if (queries.onDemand.length === 0) return removed
+    await evictIdle(now, removed)
+    await dropFailedOnDemand(now, rows, removed)
+    return removed
+  }
+
+  const reconcile = async (
+    now: number,
+    effective: EffectiveRegistry,
+    rows: readonly ScheduleRow[],
+  ): Promise<void> => {
+    for (const row of rows) {
+      if (effective.byKey.has(row.name)) continue
+      // A dynamic base's own row is backoff bookkeeping, not a departed variant.
+      if (queries.dynamicFor(row.name)) continue
+      const base = variantBaseOf(row.name)
+      if (base !== undefined && effective.unresolvedBases.has(base)) continue
+      // An on-demand row mid-claim has no params yet, so it is not in the
+      // registry above; it is not a departed variant either.
+      if (base !== undefined && queries.onDemandFor(base) !== undefined) continue
+      await schedule.deleteSchedule(row.name)
+      await store.deleteResult(row.name)
     }
     for (const query of effective.list) {
       const row = await schedule.readSchedule(query.name)
@@ -220,6 +297,15 @@ export function createFridge(config: FridgeConfig): Fridge {
     return shapeRead<T>(waited, clock.now())
   }
 
+  const touchQuietly = async (key: string): Promise<void> => {
+    try {
+      await store.touchResult(key, clock.now())
+    } catch {
+      // Callers hand this to ctx.waitUntil; a late keep-warm stamp must never
+      // surface as an invocation error, and the next read will stamp it again.
+    }
+  }
+
   const within = (promise: Promise<unknown>, deadline: number): Promise<boolean> =>
     new Promise((resolve) => {
       let done = false
@@ -243,12 +329,15 @@ export function createFridge(config: FridgeConfig): Fridge {
 
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
-      const effective = await resolveEffective(nowArg ?? clock.now())
+      const rows = await listAllRows()
+      const removed = await sweepOnDemand(nowArg ?? clock.now(), rows)
+      const live = removed.size === 0 ? rows : rows.filter((row) => !removed.has(row.name))
+      const effective = await resolveEffective(nowArg ?? clock.now(), live)
       // Resolution can legitimately spend a base's whole timeout, so dueness,
       // reconciliation and leases work from a timestamp taken after it. A
       // caller who supplied one owns the tick's clock and is never overridden.
       const now = nowArg ?? clock.now()
-      await reconcile(now, effective)
+      await reconcile(now, effective, live)
       const rowsByName = new Map(
         await Promise.all(
           effective.list.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
@@ -273,8 +362,15 @@ export function createFridge(config: FridgeConfig): Fridge {
       const key = queryKey(name, params)
       let query = queries.getByKey(key)
       const dynamic = query ? undefined : queries.dynamicFor(name)
-      if (!query && !dynamic) throw new ConfigError(`unknown query '${name}'`)
-      const codec = query?.codec ?? dynamic?.codec
+      const onDemand = query || dynamic ? undefined : queries.onDemandFor(name)
+      if (!query && !dynamic && !onDemand) throw new ConfigError(`unknown query '${name}'`)
+      if (onDemand && params === undefined) {
+        throw new ConfigError(`query '${name}': retain names no list, so a read must pass params`)
+      }
+      const codec = query?.codec ?? dynamic?.codec ?? onDemand?.codec
+      // The read is what keeps an on-demand entry alive, and it must not wait
+      // for the store to say so: `retain` is hours, this stamp is minutes-precise.
+      if (onDemand) driver.defer(touchQuietly(key))
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
       // A hit never waits and never touches upstream, however stale or expired
       // it is: refreshing that is the scheduler's job. A miss fetches, or waits
@@ -283,9 +379,13 @@ export function createFridge(config: FridgeConfig): Fridge {
       // dynamic hit skips that resolution entirely; reconcile is the enforcer
       // that removes departed variants.
       if (shaped !== null) return decodeRead(shaped, codec)
-      const deadline = clock.now() + (query?.timeoutMs ?? dynamic!.timeoutMs)
+      const deadline = clock.now() + (query?.timeoutMs ?? dynamic?.timeoutMs ?? onDemand!.timeoutMs)
       if (!query) {
-        query = await resolveMemberBy(dynamic!, key, clock, deadline)
+        // An on-demand base has no membership to check: these params are an
+        // entry because somebody asked for them.
+        query = onDemand
+          ? onDemand.instantiate(params!)
+          : await resolveMemberBy(dynamic!, key, clock, deadline)
         if (!query) throw new ConfigError(`unknown query '${name}'`)
       }
       const fetched = await readThrough<T>(query, key, deadline)
@@ -352,6 +452,20 @@ function resolveStores(
     driver.schedule ? "the driver's schedule bookkeeping" : 'the store',
   )
   return { store, schedule }
+}
+
+/**
+ * An on-demand entry exists only as a row: nothing declares it, so the only way
+ * to find it again - to refresh it, or to evict it once it goes cold - is to
+ * enumerate what is stored.
+ */
+function requireListDueForOnDemand(queries: Queries, schedule: SchedulePlane): void {
+  if (queries.onDemand.length === 0) return
+  if (schedule.capabilities.listDue && schedule.listDue) return
+  throw new ConfigError(
+    `query '${queries.onDemand[0]!.baseName}': retain needs a schedule plane that can list ` +
+      'rows, and this one declares listDue: false',
+  )
 }
 
 function requireClaimSafety(schedule: SchedulePlane, driver: Driver, which: string): void {

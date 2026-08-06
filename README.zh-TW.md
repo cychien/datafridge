@@ -198,7 +198,23 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 每個 variant 都會變成一筆普通、獨立的 registry entry，各自擁有 schedule、lease、backoff、失敗計數與自己存下來的結果。新增或移除 variant 的 reconcile 行為，與新增或移除 named query 完全一樣。
 
-只有 registry 內的有限 variant 會被排程與讀取。任意的 on-demand variant 不會在 read 時被建立。
+## 列不出來的集合
+
+集合開放到列不完時 - 每個自訂日期區間一筆、每門課一個 funnel - 用 `retain` 直接取代清單：
+
+```ts
+const funnel = defineParameterizedQuery({
+  name: 'course-funnel',
+  every: '15m',
+  retain: '2h',
+  source: 'posthog',
+  fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
+})
+```
+
+任何 params 在第一次被讀到時成為一個 entry，並且一直是 - 照 `every` 刷新、照 `source` 計額度、失敗時 backoff，和宣告過的 variant 完全一樣 - 直到沒有人讀它超過 `retain`。然後這個 entry 消失，polling 也跟著消失。讓 entry 保持溫熱的是讀取而非刷新，所以你已經不再看的東西不會繼續消耗呼叫額度。
+
+那次讀取必須被記錄下來，在 Cloudflare 上就是 reader 的責任：給 `createReader` 一個有 `touchResult` 的 store，並把 `ctx.waitUntil` 當作 `defer` 交給它。見 [on-demand entries](./docs/zh-TW/api.md#on-demand-entries)。
 
 ## 依 source 做 rate limiting
 

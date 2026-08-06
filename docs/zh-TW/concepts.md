@@ -84,7 +84,7 @@ Parameterized query 會把有限的 runtime list 展開成一般 scheduled ident
 
 Variant params 是 canonical JSON。Storage key 為 `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`，所以 raw ID 與 preset value 不會出現在 D1 key 或 `RunReport`。SHA-256 提供跨 object key ordering 的穩定 collision-resistant identity。Params 用來識別，不是 secret storage。Credential 與 private payload 必須留在 binding 或 fetcher closure。
 
-只有有限 registry 中的 variant 會被排程，也只有這些 variant 能直接讀取。Read 不會建立任意 on-demand variant。
+`retain` base 沒有清單：它的 entry 就是最近被讀過的那些。這種 entry 只以 schedule row 的形式存在，所以那一列會帶著它的 key 僅僅雜湊掉的 params - 這正是它能被一個沒有人宣告過它的 tick 執行的原因。結束它的是 eviction：超過 `retain` 沒有人讀，結果與 row 一起消失，刷新也一起消失。
 
 ## Staleness 語意
 

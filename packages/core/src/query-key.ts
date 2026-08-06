@@ -20,6 +20,11 @@ export function queryKey(name: string, params?: QueryParams): string {
   return `${VARIANT_KEY_PREFIX}${encodeURIComponent(name)}/${sha256(canonicalJson(params))}`
 }
 
+/** Every key minted from this base starts with this, and no other base's does. */
+export function variantKeyPrefix(name: string): string {
+  return `${VARIANT_KEY_PREFIX}${encodeURIComponent(name)}/`
+}
+
 /** The base name a variant storage key was minted from, or undefined for fixed names. */
 export function variantBaseOf(key: string): string | undefined {
   if (!key.startsWith(VARIANT_KEY_PREFIX)) return undefined

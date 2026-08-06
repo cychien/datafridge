@@ -84,7 +84,7 @@ A parameterized query expands a finite runtime list into ordinary scheduled iden
 
 Variant params are canonical JSON. The storage key is `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`, so raw IDs and preset values do not appear in D1 keys or `RunReport`. SHA-256 provides a stable collision-resistant identity across object key ordering. Params are identifiers, not secret storage: credentials and private payloads must remain in bindings or fetcher closures.
 
-Only variants in the finite registry are scheduled and directly readable. Arbitrary on-demand variants are not created on read.
+A `retain` base has no list: its entries are whatever has been read lately. Such an entry exists only as a schedule row, so the row carries the params its key merely hashes - that is what makes it runnable by a tick that nothing declared it to. Eviction is what ends it: nothing reading it for `retain` removes the result and the row together, and with them the refreshing.
 
 ## Staleness semantics
 

@@ -35,6 +35,21 @@ export interface DynamicVariants {
   readonly member: (key: string, signal?: AbortSignal) => Promise<ResolvedQuery | undefined>
 }
 
+/**
+ * A parameterized query with no list: its entries are whatever has been read
+ * lately. A read for params nobody declared creates one; `retainMs` of nothing
+ * reading it removes it again. Between those two moments it is an ordinary
+ * scheduled entry, refreshed on its own period like any other.
+ */
+export interface OnDemandBase {
+  readonly baseName: string
+  readonly everyMs: number
+  readonly timeoutMs: number
+  readonly retainMs: number
+  readonly codec?: QueryCodec
+  readonly instantiate: (params: QueryParams) => ResolvedQuery
+}
+
 // Construction stays free of time: the bound belongs to whoever owns a clock.
 const NEVER_ABORTED = new AbortController().signal
 
@@ -80,14 +95,26 @@ export function resolveMemberBy(
 export class Queries {
   readonly all: readonly ResolvedQuery[]
   readonly dynamic: readonly DynamicVariants[]
+  readonly onDemand: readonly OnDemandBase[]
   readonly #byName: Map<string, ResolvedQuery>
   readonly #dynamicByBase: Map<string, DynamicVariants>
+  readonly #onDemandByBase: Map<string, OnDemandBase>
 
-  constructor(all: readonly ResolvedQuery[], dynamic: readonly DynamicVariants[] = []) {
+  constructor(
+    all: readonly ResolvedQuery[],
+    dynamic: readonly DynamicVariants[] = [],
+    onDemand: readonly OnDemandBase[] = [],
+  ) {
     this.all = all
     this.dynamic = dynamic
+    this.onDemand = onDemand
     this.#byName = new Map(all.map((query) => [query.name, query]))
     this.#dynamicByBase = new Map(dynamic.map((entry) => [entry.baseName, entry]))
+    this.#onDemandByBase = new Map(onDemand.map((entry) => [entry.baseName, entry]))
+  }
+
+  onDemandFor(baseName: string): OnDemandBase | undefined {
+    return this.#onDemandByBase.get(baseName)
   }
 
   get(name: string, params?: QueryParams): ResolvedQuery | undefined {
@@ -120,6 +147,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
   const keys = new Set<string>()
   const resolved: ResolvedQuery[] = []
   const dynamic: DynamicVariants[] = []
+  const onDemand: OnDemandBase[] = []
 
   for (const definition of definitions) {
     validateQueryName(definition.name)
@@ -129,6 +157,16 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     baseNames.add(definition.name)
 
     if (isParameterized(definition)) {
+      if (definition.retain !== undefined) {
+        if (definition.variants !== undefined || definition.dimensions !== undefined) {
+          throw new ConfigError(
+            `query '${definition.name}': retain names no list, so it cannot be combined ` +
+              'with variants or dimensions',
+          )
+        }
+        onDemand.push(makeOnDemand(definition))
+        continue
+      }
       const source = variantSource(definition)
       if (source.kind === 'dynamic') {
         dynamic.push(makeDynamic(definition, source.resolve))
@@ -151,7 +189,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     resolved.push(query)
   }
 
-  return new Queries(Object.freeze(resolved), Object.freeze(dynamic))
+  return new Queries(Object.freeze(resolved), Object.freeze(dynamic), Object.freeze(onDemand))
 }
 
 type VariantSource =
@@ -231,6 +269,26 @@ function cartesian(
     combos = next
   }
   return combos
+}
+
+function makeOnDemand(definition: ParameterizedQueryDef): OnDemandBase {
+  const at = `query '${definition.name}'`
+  const settings = resolveSettings(definition)
+  const retainMs = parseDuration(definition.retain!, `${at}: retain`)
+  if (retainMs <= settings.everyMs) {
+    throw new ConfigError(
+      `${at}: retain (${retainMs}ms) must be longer than every (${settings.everyMs}ms), ` +
+        'otherwise an entry is evicted before it is ever refreshed',
+    )
+  }
+  return Object.freeze({
+    baseName: definition.name,
+    everyMs: settings.everyMs,
+    timeoutMs: settings.timeoutMs,
+    retainMs,
+    ...(settings.codec ? { codec: settings.codec } : {}),
+    instantiate: (params: QueryParams) => resolveParameterizedQuery(definition, params),
+  })
 }
 
 function makeDynamic(
@@ -327,5 +385,5 @@ function resolveSettings(definition: QueryDefinition) {
 }
 
 function isParameterized(definition: QueryDefinition): definition is ParameterizedQueryDef {
-  return 'variants' in definition || 'dimensions' in definition
+  return 'variants' in definition || 'dimensions' in definition || 'retain' in definition
 }

@@ -192,11 +192,32 @@ ctx.waitUntil(writeSanitizedOperations(report))
 
 ## 建構時驗證
 
-- `defineQueries` 驗證 names、durations、fetchers、duplicate variants 與 `timeout < lease`。
+- `defineQueries` 驗證 names、durations、fetchers、duplicate variants、`timeout < lease` 與 `retain > every`。
 - `FridgeDO` 在啟動與每次 alarm 前驗證 registry、source policies 與 Cloudflare wall-clock ceiling。
 - `cronFridge` 在建構時驗證 registry、store-factory shape、schedule-plane resolution 與 wall-clock ceiling。
 - Cloudflare query timeout 必須短於 15 分鐘。
 - Source policy 必須宣告 `limit`、`maxConcurrent` 或兩者；`limit.requests`、`limit.per` 與 `maxConcurrent` 必須為正，`limit.reserve` 必須小於 `limit.requests`。
+
+## Cloudflare 上的 on-demand entries
+
+`retain` query 在這裡比宣告過的 query 多需要兩件事。
+
+讀取路徑是 reader，所以記錄讀取的也是 reader - 而沒有人記錄讀取的 entry 就是會被清掉的 entry。給它 `d1(env.DB)`（它有 `touchResult`），並把該次 invocation 的 `waitUntil` 交給它，否則 Worker 可能在時間戳寫完前就被收掉：
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const reader = createReader({
+      store: d1(env.DB),
+      queries,
+      defer: (promise) => ctx.waitUntil(promise),
+    })
+    return Response.json(await reader.read('course-funnel', { courseId: 'course-a' }))
+  },
+}
+```
+
+另外，schedule plane 必須能列出自己的 row，因為沒有人宣告過的 entry 只能靠列舉已存的東西找回來。兩個已出貨的 plane 都可以 - `FridgeDO` 的 SQLite 與 `d1` 的排程那一半 - 所以這一條只會咬到自己手寫的實作。
 
 ## 失敗與復原
 

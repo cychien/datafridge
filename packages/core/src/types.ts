@@ -82,10 +82,22 @@ export type ParameterizedQueryDef<P extends QueryParams = QueryParams, T = unkno
   | (ParameterizedBase<P, T> & {
       variants: readonly P[] | ((ctx: ResolveCtx) => readonly P[] | Promise<readonly P[]>)
       dimensions?: never
+      retain?: never
     })
   | (ParameterizedBase<P, T> & {
       dimensions: Readonly<Record<string, DimensionValues>>
       variants?: never
+      retain?: never
+    })
+  | (ParameterizedBase<P, T> & {
+      /**
+       * No list at all: any params become an entry the first time somebody
+       * reads them, and stop being one once nothing has read them for this
+       * long. For sets too large or too open-ended to enumerate.
+       */
+      retain: Duration
+      variants?: never
+      dimensions?: never
     })
 
 export type QueryDefinition = QueryDef | ParameterizedQueryDef
@@ -123,6 +135,12 @@ export interface ScheduleRow {
   failCount: number
   leaseUntil: number | null
   version: number
+  /**
+   * The variant's params, for rows the registry does not name. A key is a hash,
+   * so an on-demand entry that nothing declared cannot be rebuilt from its name
+   * alone; carrying the params makes the row enough to run the work by itself.
+   */
+  params?: QueryParams
 }
 
 export interface StoreCapabilities {
@@ -157,6 +175,18 @@ export interface Store extends SchedulePlane {
   readResult(name: string): Promise<Envelope | null>
   writeResult(name: string, env: Envelope): Promise<void>
   deleteResult(name: string): Promise<void>
+  /**
+   * Records that something was read, for `retain`. Called off the read's
+   * critical path and never awaited by it, so precision does not matter; a
+   * result that is not there yet is not an error, it is nothing to record.
+   */
+  touchResult(name: string, at: number): Promise<void>
+  /**
+   * Deletes results under `keyPrefix` that nothing has read since `idleBefore`,
+   * and answers which. Schedule rows are not this plane's to delete: the caller
+   * removes them, because the schedule half may live somewhere else entirely.
+   */
+  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 }
 
 export interface Driver {
