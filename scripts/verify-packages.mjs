@@ -100,32 +100,45 @@ try {
     join(fixture, 'verify.mjs'),
     `import { createReader, defineQueries, memoryStore } from '@datafridge/core'
 import { cronDriver } from '@datafridge/cloudflare/cron'
-import { d1Results } from '@datafridge/cloudflare/d1'
+import { d1 } from '@datafridge/cloudflare/d1'
 
 const queries = defineQueries([{ name: 'fixture', every: '1m', fetch: async () => 1 }])
 if (queries.get('fixture')?.everyMs !== 60_000) throw new Error('core import failed')
 if (typeof createReader !== 'function' || typeof memoryStore !== 'function') throw new Error('core exports failed')
-if (typeof cronDriver !== 'function' || typeof d1Results !== 'function') throw new Error('Cloudflare subpath exports failed')
+if (typeof cronDriver !== 'function' || typeof d1 !== 'function') throw new Error('Cloudflare subpath exports failed')
+
+const store = memoryStore()
+await store.writeResult('fixture', { data: 7, fetchedAt: 0, freshUntil: 1 })
+const read = await createReader({ store }).read('fixture')
+if (read?.data !== 7 || read.status !== 'ok') throw new Error('read shape failed')
 `,
   )
   await writeFile(
     join(fixture, 'verify.ts'),
     `import { createReader, defineParameterizedQuery, defineQueries, memoryStore } from '@datafridge/core'
+import type { QueryCodec } from '@datafridge/core'
 import { cronPoller } from '@datafridge/cloudflare/cron'
-import { d1Store } from '@datafridge/cloudflare/d1'
+import { d1 } from '@datafridge/cloudflare/d1'
+
+const codec: QueryCodec<Map<string, number>> = {
+  encode: (value) => ({ rows: [...value] }),
+  decode: (raw) => new Map((raw as { rows: [string, number][] }).rows),
+}
 
 const parameterized = defineParameterizedQuery({
   name: 'fixture',
   every: '1m',
-  variants: [{ id: 'a' }],
-  fetch: async ({ params }) => params.id,
+  dimensions: { id: ['a'], window: async () => ['7d'] },
+  validUntil: ({ now }) => now + 60_000,
+  codec,
+  fetch: async () => new Map([['/a', 1]]),
 })
 const queries = defineQueries([parameterized])
-const reader = createReader({ results: memoryStore() })
-void reader.read<string>('fixture', { id: 'a' })
-void queries
+const reader = createReader({ store: memoryStore(), queries })
+void reader.read<Map<string, number>>('fixture', { id: 'a', window: '7d' })
+void queries.dynamic
 void cronPoller
-void d1Store
+void d1
 `,
   )
   await writeFile(
