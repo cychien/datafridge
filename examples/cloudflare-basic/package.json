@@ -1,0 +1,20 @@
+{
+  "name": "datafridge-example-cloudflare-basic",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "migrate": "wrangler d1 migrations apply DB --local",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@datafridge/cloudflare": "workspace:*",
+    "@datafridge/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.119.0"
+  }
+}

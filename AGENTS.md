@@ -7,6 +7,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - `packages/core` has zero runtime dependencies and never touches the wall clock: no `Date.now`, `Math.random`, or global timers (eslint enforces this). The single sanctioned exception is `src/system-clock.ts`, which provides the default `systemClock`/`systemRandom`; `clock` and `random` stay injectable and tests use `FakeClock` from core - no sleeps, no wall-clock dependence.
 - Every Store adapter must pass `storeContractSuite` from `@datafridge/core/contract-tests` (see `packages/core/test/contract.test.ts` for usage). The suite documents claim/version/lease semantics beyond the type signatures, including create-on-claim at expectedVersion 0.
 - Invalid configuration fails at construction (`defineQueries`, `createPoller` resolution rules), never at runtime.
+- `packages/cloudflare` typechecks and tests against core's source (tsconfig `paths` + vitest `resolve.alias`) because CI runs test before build; the tsup build uses `tsconfig.build.json` and resolves core from dist via pnpm's topological build order.
+- Cloudflare tests run on vitest 4 with the `cloudflareTest()` plugin from `@cloudflare/vitest-pool-workers` (no more `defineWorkersConfig`/`poolOptions`). Sharp edges: storage isolation is per test *file* (wipe D1 tables between tests), test files and the main worker do not share a module cache (inject test state into a DO via `runInDurableObject`), and due DO alarms auto-fire in workerd (await the ignition tick by polling, drive later ticks deterministically with `runDurableObjectAlarm`). `workerd` must stay in pnpm `onlyBuiltDependencies`.
 
 ## Maintaining this file
 

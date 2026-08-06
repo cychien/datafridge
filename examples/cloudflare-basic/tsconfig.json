@@ -4,9 +4,9 @@
     "lib": ["ES2023"],
     "types": ["@cloudflare/workers-types"],
     "paths": {
-      "@datafridge/core": ["../core/src/index.ts"],
-      "@datafridge/core/contract-tests": ["../core/src/contract-tests.ts"]
+      "@datafridge/core": ["../../packages/core/src/index.ts"],
+      "@datafridge/cloudflare": ["../../packages/cloudflare/src/index.ts"]
     }
   },
-  "include": ["src", "test"]
+  "include": ["src"]
 }

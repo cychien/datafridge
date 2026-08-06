@@ -9,26 +9,38 @@
     "node": ">=20"
   },
   "files": [
-    "dist"
+    "dist",
+    "migrations"
   ],
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./do": {
+      "types": "./dist/do.d.ts",
+      "import": "./dist/do.js"
+    },
+    "./d1": {
+      "types": "./dist/d1.d.ts",
+      "import": "./dist/d1.js"
     }
   },
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
   },
   "peerDependencies": {
     "@datafridge/core": "workspace:^"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "@types/node": "^24.0.0",
     "@datafridge/core": "workspace:*",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.10"
   }
 }
