@@ -7,7 +7,7 @@ datafridge 按 `source`（query 定義上的 `source` 欄位，預設 `'default'
 ## v1：per-tick budget + jitter
 
 ```ts
-createPoller({
+createFridge({
   driver: cronDriver(ctx),
   store: d1(env.DB),
   queries,

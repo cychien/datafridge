@@ -1,17 +1,17 @@
 import { createReader } from '@datafridge/core'
 import type { QueryDefinition, RunReport } from '@datafridge/core'
 import { d1 } from '../src/d1.js'
-import { PollerDO } from '../src/do.js'
+import { FridgeDO } from '../src/do.js'
 
 export interface TestEnv {
   DB: D1Database
-  POLLER: DurableObjectNamespace<TestPoller>
+  POLLER: DurableObjectNamespace<TestFridge>
 }
 
 // The test worker and the tests share an isolate but not a module cache, so
 // tests inject the registry straight onto the instance via runInDurableObject;
 // reassigning it simulates a redeploy with changed queries.
-export class TestPoller extends PollerDO<TestEnv> {
+export class TestFridge extends FridgeDO<TestEnv> {
   queries: readonly QueryDefinition[] = []
   reports: RunReport[] = []
   reportError: Error | undefined

@@ -81,8 +81,8 @@ const queries = defineQueries([
 
 **scheduler**
 
-- `PollerDO` - 用 Cloudflare Durable Object 當排程，到期時間精確。
-- `cronPoller` - 用 Cloudflare Cron Trigger 當排程，最細一分鐘。
+- `FridgeDO` - 用 Cloudflare Durable Object 當排程，到期時間精確。
+- `cronFridge` - 用 Cloudflare Cron Trigger 當排程，最細一分鐘。
 
 **store**
 
@@ -101,11 +101,11 @@ Scheduler：`durable-object`、`cron`。Store：`d1`。平台指南：[Cloudflar
 
 ## 完整範例
 
-`PollerDO` 當 scheduler、`d1` 當 store，加上一個負責讀取的 route：
+`FridgeDO` 當 scheduler、`d1` 當 store，加上一個負責讀取的 route：
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, FridgeDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -124,7 +124,7 @@ const queries = defineQueries([
   },
 ])
 
-export class Poller extends PollerDO<Env> {
+export class Poller extends FridgeDO<Env> {
   queries = queries
 
   store(env: Env) {
@@ -206,7 +206,7 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 ```ts
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
     sources: { posthog: { maxPerTick: 2 } },

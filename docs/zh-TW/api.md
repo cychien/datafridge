@@ -80,21 +80,21 @@ Params 必須是由有限數字、字串、boolean、null、array 與 plain obje
 
 不在有限 registry 內的任意 on-demand variants 仍不支援。
 
-### Poller
+### Fridge
 
 ```ts
-const poller = createPoller({
+const fridge = createFridge({
   queries,
   driver,
   store,
   sources: { analytics: { maxPerTick: 2 } },
 })
 
-const report = await poller.runDue()
-const value = await poller.read<Result>('analytics-7d')
+const report = await fridge.runDue()
+const value = await fridge.read<Result>('analytics-7d')
 ```
 
-`createPoller(config)` 必須提供：
+`createFridge(config)` 必須提供：
 
 - `queries`：`Queries` registry 或 raw query definitions
 - `driver`：`{ serialized, defer(promise), schedule? }`
@@ -117,19 +117,18 @@ interface RunReport {
 
 成功 refresh 會從完成時間排定下一次執行。失敗會保留舊 envelope，並以有 jitter 的 exponential backoff 重試，上限為 `every`。
 
-`poller.read(name, params?, options?)` 讀 result store。Registry 不存在該 name 或 parameter variant 時會拋錯。
+`fridge.read(name, params?)` 讀 result store。Registry 不存在該 name 或 parameter variant 時會拋錯。
 
 ```ts
-await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
-  swrRefresh: (refresh) => driver.defer(refresh),
-})
+await fridge.read('course-analytics', { courseId: 'course-a', window: '7d' })
 ```
 
-結果 stale 或時間窗已過時，`swrRefresh` 會收到一個刷新 promise，而 read 不會等它。Miss 不需要這種交接：讀取自己會去抓。那個 promise 受排程節制：query 沒到期時它什麼都不做，所以流量無法超越失敗上游的 backoff；lease 則讓併發刷新只產生一次上游呼叫。
+讀取只有兩種行為，沒有任何選項可以改變它們：
 
-完全沒有資料的讀取會等第一筆結果，最多等該 query 自己的 `timeout` 那麼久。沒有東西要設定：一個 query，一個「最多多久」的答案。已經有結果時（不論 stale）一律立刻回傳。
+- **有資料** - 立刻回傳，fresh、stale、`invalid` 一律如此，且完全不碰上游。刷新既有資料是 scheduler 的職責，所以讀一筆 stale 結果永遠不會替一個已經在掙扎的上游再加壓。
+- **沒資料** - 當下去抓，最多等該 query 自己的 `timeout` 那麼久。沒有東西要設定：一個 query，一個「最多多久」的答案。
 
-Poller 在沒有人持有 lease 時自己抓，有人持有就等那個人，所以同時來多少讀者都只有一次上游呼叫 - 和讓併發 tick 只跑一次的是同一個 lease。Query 正處於 backoff 之間時直接回 `null`，不為一個不會來的東西等待；到達 timeout 時，那次抓取會像在排程 tick 上一樣被 abort 並記為失敗，讀取則回 `null`。
+Fridge 在沒有人持有 lease 時自己抓，有人持有就等那個人，所以同時來多少讀者都只有一次上游呼叫 - 和讓併發 tick 只跑一次的是同一個 lease。Query 正處於 backoff 之間時直接回 `null`，不為一個不會來的東西等待；到達 timeout 時，那次抓取會像在排程 tick 上一樣被 abort 並記為失敗，讀取則回 `null`。
 
 ### Reader
 
@@ -178,17 +177,17 @@ Runtime exports 都可從 package root 使用，也提供獨立 subpaths：
 
 | Export | Subpath | 用途 |
 |---|---|---|
-| `PollerDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
+| `FridgeDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
 | `d1` | `@datafridge/cloudflare/d1` | D1 store：result envelopes 與 atomic schedule claims |
-| `cronDriver`, `cronPoller` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
+| `cronDriver`, `cronFridge` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
 | `INVOCATION_WALL_CLOCK_LIMIT_MS` | package root | Cloudflare timeout ceiling |
 
 ### Durable Object alarms
 
-Subclass `PollerDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提供 `sources`。Durable Object 把自己的排程簿記放在它的 SQLite storage，所以 store 只有 result 那一半會被用到。
+Subclass `FridgeDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提供 `sources`。Durable Object 把自己的排程簿記放在它的 SQLite storage，所以 store 只有 result 那一半會被用到。
 
 ```ts
-class Poller extends PollerDO<Env> {
+class Poller extends FridgeDO<Env> {
   queries = queries
   sources = { analytics: { maxPerTick: 2 } }
 
@@ -204,23 +203,23 @@ class Poller extends PollerDO<Env> {
 
 `onRunReport(report)` 是每次 alarm tick 後的選用 operational hook。不要記錄 query payload、credential 或 sensitive error details。Hook 失敗會被 alarm loop 吸收，下一個 alarm 仍會排定。
 
-`ensureStarted(namespace, instanceName?)` 會 idempotently 啟動一個具名 `PollerDO` instance。預設 instance name 是 `datafridge-poller`。
+`ensureStarted(namespace, instanceName?)` 會 idempotently 啟動一個具名 `FridgeDO` instance。預設 instance name 是 `datafridge`。
 
 Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及每次 alarm 前驗證。`timeout` 必須短於 15 分鐘，每個 `maxPerTick` 必須是正整數。
 
 ### D1 stores
 
-- `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。`PollerDO` 自帶 schedule plane，會直接把 D1 的那一半閒置。
+- `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。`FridgeDO` 自帶 schedule plane，會直接把 D1 的那一半閒置。
 
 它會在第一次寫入前自己建表，所以 `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` 是可選的；暖 isolate 底下表被刪掉時會重建並重試一次。讀取路徑從不建表 - 還不存在的 result table 讀起來就是 `null`。超過 D1 2,000,000-byte row limit 的寫入會被拒絕，舊資料保持不變。
 
 ### Cron Triggers
 
-`cronPoller(config)` 在每次 invocation 內完成 env-dependent store 建構，並回傳 scheduled handler：
+`cronFridge(config)` 在每次 invocation 內完成 env-dependent store 建構，並回傳 scheduled handler：
 
 ```ts
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
@@ -228,7 +227,7 @@ export default {
 }
 ```
 
-`onRunReport` 與 `PollerDO` 的 hook 同一份契約：寫 log 前先 sanitize，而拋錯的 hook 會被吸收，不會讓該次 tick 失敗。它會在 module 建構時驗證 query registry、timeout ceiling 與 store shape。需要直接呼叫 `createPoller` 並取得 `RunReport` 時，可使用 lower-level non-serialized `cronDriver(ctx)`。
+`onRunReport` 與 `FridgeDO` 的 hook 同一份契約：寫 log 前先 sanitize，而拋錯的 hook 會被吸收，不會讓該次 tick 失敗。它會在 module 建構時驗證 query registry、timeout ceiling 與 store shape。需要直接呼叫 `createFridge` 並取得 `RunReport` 時，可使用 lower-level non-serialized `cronDriver(ctx)`。
 
 ### Init CLI
 

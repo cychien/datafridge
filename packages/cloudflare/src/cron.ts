@@ -1,4 +1,4 @@
-import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
+import { ConfigError, createFridge, defineQueries, Queries } from '@datafridge/core'
 import type { Driver, QueryDefinition, RunReport, SourceBudget, Store } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
 
@@ -11,7 +11,7 @@ export function cronDriver(ctx: ExecutionContext): Driver {
   return { serialized: false, defer: (promise) => ctx.waitUntil(promise) }
 }
 
-export interface CronPollerConfig<Env> {
+export interface CronFridgeConfig<Env> {
   queries: Queries | readonly QueryDefinition[]
   store: (env: Env) => Store
   sources?: Record<string, SourceBudget>
@@ -33,20 +33,20 @@ export type CronScheduledHandler<Env> = (
  * One-line wiring for a cron trigger plus a CAS-protected store:
  *
  *   export default {
- *     scheduled: cronPoller<Env>({ queries, store: (env) => d1(env.DB) }),
+ *     scheduled: cronFridge<Env>({ queries, store: (env) => d1(env.DB) }),
  *   }
  *
  * Store factories take `env` because bindings only exist per invocation;
  * everything env-independent fails here, at config time.
  */
-export function cronPoller<Env>(config: CronPollerConfig<Env>): CronScheduledHandler<Env> {
+export function cronFridge<Env>(config: CronFridgeConfig<Env>): CronScheduledHandler<Env> {
   const queries = config.queries instanceof Queries ? config.queries : defineQueries(config.queries)
   assertTimeoutsFitInvocation(queries, 'cron trigger')
   if (typeof config.store !== 'function') {
-    throw new ConfigError('cronPoller requires a store: pass store: (env) => d1(env.DB)')
+    throw new ConfigError('cronFridge requires a store: pass store: (env) => d1(env.DB)')
   }
   return async (_controller, env, ctx) => {
-    const report = await createPoller({
+    const report = await createFridge({
       queries,
       driver: cronDriver(ctx),
       store: config.store(env),

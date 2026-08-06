@@ -1,6 +1,6 @@
 # cloudflare-basic
 
-Minimal setup: `PollerDO` (Durable Object alarms) polls a fake slow API
+Minimal setup: `FridgeDO` (Durable Object alarms) polls a fake slow API
 every 15s and writes results to D1; the read endpoint goes straight to D1
 through `createReader` and never waits on the upstream once anything is stored.
 

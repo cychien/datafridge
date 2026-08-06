@@ -33,7 +33,7 @@ They are the specification, not a summary of one. The rest of this page explains
 └──────────────────────────────────────────────┘
 ```
 
-Three orthogonal axes: the **store** decides where state lives, the **driver** decides who ticks, and **fetchers** run wherever the poller instance runs.
+Three orthogonal axes: the **store** decides where state lives, the **driver** decides who ticks, and **fetchers** run wherever the fridge instance runs.
 
 Core's single entry point is the idempotent `runDue(now)`. Core never owns an event loop, never schedules itself, and holds no memory state across calls - everything is read from the store, computed, and written back. That is why the same core runs in a long-lived Node process, a cold-starting Worker, or a multi-instance concurrent environment.
 

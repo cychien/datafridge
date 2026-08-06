@@ -80,21 +80,21 @@ Params must be JSON values containing finite numbers, strings, booleans, nulls, 
 
 Arbitrary on-demand variants outside the finite registry remain excluded.
 
-### Poller
+### Fridge
 
 ```ts
-const poller = createPoller({
+const fridge = createFridge({
   queries,
   driver,
   store,
   sources: { analytics: { maxPerTick: 2 } },
 })
 
-const report = await poller.runDue()
-const value = await poller.read<Result>('analytics-7d')
+const report = await fridge.runDue()
+const value = await fridge.read<Result>('analytics-7d')
 ```
 
-`createPoller(config)` requires:
+`createFridge(config)` requires:
 
 - `queries`: a `Queries` registry or raw query definitions
 - `driver`: `{ serialized, defer(promise), schedule? }`
@@ -117,19 +117,18 @@ interface RunReport {
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 
-`poller.read(name, params?, options?)` reads the result store. It throws for a name or parameter variant outside the registry.
+`fridge.read(name, params?)` reads the result store. It throws for a name or parameter variant outside the registry.
 
 ```ts
-await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
-  swrRefresh: (refresh) => driver.defer(refresh),
-})
+await fridge.read('course-analytics', { courseId: 'course-a', window: '7d' })
 ```
 
-`swrRefresh` receives a refresh promise when the result is stale or its window has expired, and the read returns without awaiting it. A miss needs no such hand-off: the read fetches it. That promise is gated by the schedule: it does nothing unless the query is due, so traffic cannot outpace a failing upstream's backoff, and the lease keeps concurrent refreshes to one upstream call.
+A read has exactly two behaviours, and no options that change them:
 
-A read with **nothing** stored waits for the first result, for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take. An existing result, stale or not, always returns immediately.
+- **Something stored** - it returns at once, fresh, stale or `invalid` alike, and touches nothing upstream. Refreshing what is already there belongs to the scheduler, so reading a stale result can never add load to an upstream that is already struggling.
+- **Nothing stored** - it fetches, waiting for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take.
 
-The poller fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
+The fridge fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
 
 ### Reader
 
@@ -178,17 +177,17 @@ All runtime exports are available from the package root. Independent subpaths ar
 
 | Export | Subpath | Purpose |
 |---|---|---|
-| `PollerDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
+| `FridgeDO`, `ensureStarted` | `@datafridge/cloudflare/do` | Durable Object alarm scheduler |
 | `d1` | `@datafridge/cloudflare/d1` | The D1 store: result envelopes and atomic schedule claims |
-| `cronDriver`, `cronPoller` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
+| `cronDriver`, `cronFridge` | `@datafridge/cloudflare/cron` | Cron Trigger integration |
 | `INVOCATION_WALL_CLOCK_LIMIT_MS` | package root | Cloudflare timeout ceiling |
 
 ### Durable Object alarms
 
-Subclass `PollerDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps its own schedule bookkeeping in its SQLite storage, so only the store's result half is used.
+Subclass `FridgeDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps its own schedule bookkeeping in its SQLite storage, so only the store's result half is used.
 
 ```ts
-class Poller extends PollerDO<Env> {
+class Poller extends FridgeDO<Env> {
   queries = queries
   sources = { analytics: { maxPerTick: 2 } }
 
@@ -204,23 +203,23 @@ class Poller extends PollerDO<Env> {
 
 `onRunReport(report)` is an optional operational hook after each alarm tick. Do not log query payloads, credentials, or sensitive error details. Hook failures are absorbed by the alarm loop, and the next alarm is still scheduled.
 
-`ensureStarted(namespace, instanceName?)` idempotently ignites one named `PollerDO` instance. The default instance name is `datafridge-poller`.
+`ensureStarted(namespace, instanceName?)` idempotently ignites one named `FridgeDO` instance. The default instance name is `datafridge`.
 
 The registry, source budgets, and Cloudflare timeout ceiling are validated when the object is ignited and before every alarm run. `timeout` must be shorter than 15 minutes, and every `maxPerTick` must be a positive integer.
 
 ### D1 stores
 
-- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `PollerDO` carries its own schedule plane and simply leaves D1's unused.
+- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `FridgeDO` carries its own schedule plane and simply leaves D1's unused.
 
 It applies its own tables before the first write, so the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` is optional; a dropped table under a warm isolate is repaired and retried once. The read path never applies schema - a result table that does not exist yet reads as `null`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
 
 ### Cron Triggers
 
-`cronPoller(config)` performs environment-dependent store construction inside each invocation and returns a scheduled handler:
+`cronFridge(config)` performs environment-dependent store construction inside each invocation and returns a scheduled handler:
 
 ```ts
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
@@ -229,7 +228,7 @@ export default {
 }
 ```
 
-`onRunReport` carries the same contract as the `PollerDO` hook: sanitize before logging, and a throwing hook is absorbed so it cannot fail the tick. It validates the query registry, timeout ceiling, and store shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createPoller` directly and consume its `RunReport`.
+`onRunReport` carries the same contract as the `FridgeDO` hook: sanitize before logging, and a throwing hook is absorbed so it cannot fail the tick. It validates the query registry, timeout ceiling, and store shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createFridge` directly and consume its `RunReport`.
 
 ### Init CLI
 

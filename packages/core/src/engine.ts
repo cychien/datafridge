@@ -1,17 +1,16 @@
-import { backoffMs, firstRunJitterMs, MAX_JITTER_RATIO } from './backoff.js'
+import { backoffMs, MAX_JITTER_RATIO } from './backoff.js'
 import type { Clock } from './clock.js'
-import { withDeadline } from './deadline.js'
 import { defineQueries, Queries, resolveMemberBy, resolveVariantsWithin } from './define-queries.js'
 import type { DynamicVariants } from './define-queries.js'
+import { createDispatcher } from './dispatcher.js'
+import type { DispatchOutcome } from './dispatcher.js'
 import { ConfigError } from './errors.js'
-import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
 import { queryKey, variantBaseOf } from './query-key.js'
 import { decodeRead, shapeRead, waitForEnvelope } from './reader.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
-  Envelope,
   QueryDefinition,
   QueryParams,
   ReadResult,
@@ -23,7 +22,7 @@ import type {
   Store,
 } from './types.js'
 
-export interface PollerConfig {
+export interface FridgeConfig {
   queries: Queries | readonly QueryDefinition[]
   driver: Driver
   store: Store
@@ -32,113 +31,19 @@ export interface PollerConfig {
   random?: () => number
 }
 
-export interface PollerReadOptions {
-  /** Hand the returned refresh somewhere that outlives the read, e.g. ctx.waitUntil. */
-  swrRefresh?: (refresh: Promise<void>) => void
-}
-
-export interface Poller {
+export interface Fridge {
   runDue(now?: number): Promise<RunReport>
-  read<T = unknown>(
-    name: string,
-    params?: QueryParams,
-    options?: PollerReadOptions,
-  ): Promise<ReadResult<T> | null>
+  read<T = unknown>(name: string, params?: QueryParams): Promise<ReadResult<T> | null>
 }
 
-export function createPoller(config: PollerConfig): Poller {
+export function createFridge(config: FridgeConfig): Fridge {
   const queries = config.queries instanceof Queries ? config.queries : defineQueries(config.queries)
   const driver = validateDriver(config.driver)
   const clock = validateClock(config.clock ?? systemClock)
   const sources = validateSources(config.sources)
   const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
-
-  const isOwner = async (name: string, token: number): Promise<boolean> => {
-    const current = await schedule.readSchedule(name)
-    return current !== null && current.version === token
-  }
-
-  const executeOne = async (
-    { query, row }: Candidate,
-    now: number,
-    report: RunReport,
-  ): Promise<void> => {
-    const { name } = query
-    const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
-    if (!claimed) {
-      report.skippedLeased.push(name)
-      return
-    }
-    const token = row.version + 1
-    try {
-      const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
-        query.fetch({ signal, now, attempt: row.failCount + 1 }),
-      )
-      const done = clock.now()
-      if (!(await isOwner(name, token))) {
-        report.failed.push({ name, message: 'write discarded (lease reclaimed)' })
-        return
-      }
-      const stored = query.codec ? query.codec.encode(data) : data
-      const validUntil = query.validUntil?.(done)
-      if (validUntil !== undefined && !Number.isFinite(validUntil)) {
-        throw new ConfigError(`query '${name}': validUntil must return a finite epoch-ms timestamp`)
-      }
-      const envelope: Envelope = {
-        data: stored,
-        fetchedAt: done,
-        freshUntil: done + query.everyMs,
-        ...(validUntil !== undefined ? { validUntil } : {}),
-      }
-      await store.writeResult(name, envelope)
-      const jitter = token === 1 ? firstRunJitterMs(query.everyMs, random) : 0
-      // everyMs is a positive duration, so periodic is always past `done`: no
-      // branch below can schedule a run that is due the moment it is written.
-      const periodic = done + query.everyMs + jitter
-      // Data with its own expiry re-fetches at the boundary, not a period
-      // later. A boundary already behind us describes a window that has closed
-      // - legitimate for a variant naming a past date - so it schedules
-      // nothing and the ordinary period governs.
-      const nextRunAt =
-        validUntil !== undefined && validUntil > done ? Math.min(periodic, validUntil) : periodic
-      await schedule.writeSchedule({
-        name,
-        nextRunAt,
-        failCount: 0,
-        leaseUntil: null,
-        version: token,
-      })
-      report.ran.push(name)
-    } catch (err) {
-      const done = clock.now()
-      let message = errorMessage(err)
-      try {
-        if (await isOwner(name, token)) {
-          const failCount = row.failCount + 1
-          const old = await store.readResult(name)
-          if (old) {
-            await store.writeResult(name, {
-              ...old,
-              lastError: { at: done, message, count: failCount },
-            })
-          }
-          await schedule.writeSchedule({
-            name,
-            nextRunAt: done + backoffMs(failCount, query.everyMs, random),
-            failCount,
-            leaseUntil: null,
-            version: token,
-          })
-        } else {
-          message = `write discarded (lease reclaimed): ${message}`
-        }
-      } catch {
-        // Store write failed mid-run; the lease expires and a later tick re-claims.
-      }
-      report.failed.push({ name, message })
-    }
-  }
+  const dispatcher = createDispatcher({ store, schedule, clock, random })
 
   interface EffectiveRegistry {
     list: readonly ResolvedQuery[]
@@ -266,35 +171,6 @@ export function createPoller(config: PollerConfig): Poller {
     }
   }
 
-  const dynamicOfKey = (key: string) => {
-    const base = variantBaseOf(key)
-    return base !== undefined ? queries.dynamicFor(base) : undefined
-  }
-
-  /**
-   * Fire-and-forget: callers hand this straight to ctx.waitUntil, so a variant
-   * list that is down, or a store that is, must not surface as an invocation
-   * error. The report it would produce is discarded too.
-   */
-  const refreshOne = async (key: string): Promise<void> => {
-    try {
-      let query = queries.getByKey(key)
-      if (!query) {
-        const dynamic = dynamicOfKey(key)
-        query = dynamic
-          ? await resolveMemberBy(dynamic, key, clock, clock.now() + dynamic.timeoutMs)
-          : undefined
-        if (!query) return
-      }
-      const now = clock.now()
-      const row = (await schedule.readSchedule(key)) ?? virtualRow(key, now)
-      if (row.nextRunAt > now) return
-      await executeOne({ query, row }, now, emptyReport())
-    } catch {
-      // Nothing to report to and nobody to raise it with.
-    }
-  }
-
   /**
    * Nothing is stored yet and the caller is willing to wait. Fetch it here when
    * nobody else is on it, otherwise wait for whoever is - the lease keeps that
@@ -316,15 +192,17 @@ export function createPoller(config: PollerConfig): Poller {
       // so waiting would only spend the budget.
       if (row.nextRunAt > start) return null
 
-      const report = emptyReport()
-      let threw = false
-      const refresh = executeOne({ query, row }, start, report).catch(() => {
-        threw = true
-      })
-      driver.defer(refresh)
-      const settled = await within(refresh, deadline)
-      if (!settled || threw || report.failed.length > 0) return null
-      if (report.ran.length > 0) {
+      let outcome: DispatchOutcome | undefined
+      const running = dispatcher
+        .run({ query, row, priority: 'demand' }, start)
+        .then((result) => {
+          outcome = result
+        })
+        .catch(() => {})
+      driver.defer(running)
+      const settled = await within(running, deadline)
+      if (!settled || outcome === undefined || outcome.status === 'failed') return null
+      if (outcome.status === 'ran') {
         return shapeRead<T>(await store.readResult(key), clock.now())
       }
       // Lost the claim to an executor that got there first: wait for it.
@@ -372,30 +250,28 @@ export function createPoller(config: PollerConfig): Poller {
       const report = emptyReport()
       report.failed.push(...effective.failures)
       report.deferredBudget.push(...deferredBudget)
-      await Promise.allSettled(toRun.map((candidate) => executeOne(candidate, now, report)))
+      await Promise.allSettled(
+        toRun.map(async (candidate) => {
+          const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
+          recordOutcome(report, candidate.query.name, outcome)
+        }),
+      )
       return report
     },
 
-    async read<T>(
-      name: string,
-      params?: QueryParams,
-      options?: PollerReadOptions,
-    ): Promise<ReadResult<T> | null> {
+    async read<T>(name: string, params?: QueryParams): Promise<ReadResult<T> | null> {
       const key = queryKey(name, params)
       let query = queries.getByKey(key)
       const dynamic = query ? undefined : queries.dynamicFor(name)
       if (!query && !dynamic) throw new ConfigError(`unknown query '${name}'`)
       const codec = query?.codec ?? dynamic?.codec
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
-      // Staleness and an expired window both refresh in the background; a miss
-      // is served by the read itself below.
-      if (options?.swrRefresh && shaped && (shaped.isStale || shaped.status === 'invalid')) {
-        options.swrRefresh(refreshOne(key))
-      }
-      // A hit never waits; a miss fetches or waits for whoever is, bounded by
-      // this query's own timeout - one budget, shared with resolving membership
-      // when the variant is dynamic. A dynamic hit skips that resolution
-      // entirely; reconcile is the enforcer that removes departed variants.
+      // A hit never waits and never touches upstream, however stale or expired
+      // it is: refreshing that is the scheduler's job. A miss fetches, or waits
+      // for whoever already is, bounded by this query's own timeout - one
+      // budget, shared with resolving membership when the variant is dynamic. A
+      // dynamic hit skips that resolution entirely; reconcile is the enforcer
+      // that removes departed variants.
       if (shaped !== null) return decodeRead(shaped, codec)
       const deadline = clock.now() + (query?.timeoutMs ?? dynamic!.timeoutMs)
       if (!query) {
@@ -405,6 +281,12 @@ export function createPoller(config: PollerConfig): Poller {
       return decodeRead(await readThrough<T>(query, key, deadline), codec)
     },
   }
+}
+
+function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome): void {
+  if (outcome.status === 'ran') report.ran.push(name)
+  else if (outcome.status === 'leased') report.skippedLeased.push(name)
+  else report.failed.push({ name, message: outcome.message })
 }
 
 function emptyReport(): RunReport {
@@ -417,7 +299,7 @@ function errorMessage(err: unknown): string {
 
 function validateDriver(driver: Driver): Driver {
   if (!driver || typeof driver !== 'object') {
-    throw new ConfigError('createPoller requires a driver')
+    throw new ConfigError('createFridge requires a driver')
   }
   if (typeof driver.serialized !== 'boolean') {
     throw new ConfigError('driver must declare serialized: boolean')
@@ -452,12 +334,12 @@ function validateSources(
 }
 
 function resolveStores(
-  config: PollerConfig,
+  config: FridgeConfig,
   driver: Driver,
 ): { store: Store; schedule: SchedulePlane } {
   const store = config.store
   if (!store || typeof store.readResult !== 'function' || typeof store.claim !== 'function') {
-    throw new ConfigError('createPoller requires a store that holds results and schedule rows')
+    throw new ConfigError('createFridge requires a store that holds results and schedule rows')
   }
   // A stateful serialized driver keeps its own bookkeeping (a Durable Object's
   // SQLite, for example); then the store's schedule half simply goes unused.

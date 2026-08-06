@@ -77,8 +77,8 @@ function slowListHarness() {
       fetch: async ({ params }) => params,
     }),
   ])
-  const { poller } = makeHarness(queries, { store, clock })
-  return { poller, clock, fetches: () => fetches, claims: () => claims }
+  const { fridge } = makeHarness(queries, { store, clock })
+  return { fridge, clock, fetches: () => fetches, claims: () => claims }
 }
 
 describe('dynamic variants', () => {
@@ -87,19 +87,19 @@ describe('dynamic variants', () => {
     const queries = defineQueries([
       courseQuery(async () => courses.map((courseId) => ({ courseId }))),
     ])
-    const { poller, store, clock } = makeHarness(queries)
+    const { fridge, store, clock } = makeHarness(queries)
 
-    await poller.runDue()
+    await fridge.runDue()
     expect(await store.readResult(key('alpha'))).not.toBeNull()
 
     courses = ['alpha', 'beta']
     await clock.advance(300_000)
-    await poller.runDue()
+    await fridge.runDue()
     expect(await store.readResult(key('beta'))).not.toBeNull()
 
     courses = ['beta']
     await clock.advance(300_000)
-    await poller.runDue()
+    await fridge.runDue()
     expect(await store.readResult(key('alpha'))).toBeNull()
     expect(await store.readSchedule(key('alpha'))).toBeNull()
     expect(await store.readResult(key('beta'))).not.toBeNull()
@@ -113,12 +113,12 @@ describe('dynamic variants', () => {
         return [{ courseId: 'alpha' }]
       }),
     ])
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
 
     down = true
     await clock.advance(300_000)
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.failed).toEqual([{ name: 'per-course', message: 'course db unreachable' }])
     // One bad resolution deleted nothing.
     expect(await store.readResult(key('alpha'))).not.toBeNull()
@@ -135,14 +135,14 @@ describe('dynamic variants', () => {
         return [{ courseId: 'alpha' }]
       }),
     ])
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
     const afterFirstTick = resolutions
 
     down = true
     await clock.advance(300_000)
     const firstFailAt = clock.now()
-    await poller.runDue()
+    await fridge.runDue()
     const first = (await store.readSchedule('per-course'))!
     expect(first.failCount).toBe(1)
     expect(first.nextRunAt).toBeGreaterThan(firstFailAt)
@@ -151,13 +151,13 @@ describe('dynamic variants', () => {
     // Ticks inside the backoff window do not call resolve() at all, so a down
     // dependency is not asked again once per alarm.
     await clock.advance(1_000)
-    const quiet = await poller.runDue()
+    const quiet = await fridge.runDue()
     expect(resolutions).toBe(afterFirstTick + 1)
     expect(quiet.failed).toEqual([])
 
     await clock.advance(first.nextRunAt - clock.now())
     const secondFailAt = clock.now()
-    await poller.runDue()
+    await fridge.runDue()
     const second = (await store.readSchedule('per-course'))!
     expect(second.failCount).toBe(2)
     expect(second.nextRunAt - secondFailAt).toBeGreaterThan(first.nextRunAt - firstFailAt)
@@ -175,13 +175,13 @@ describe('dynamic variants', () => {
         return [{ courseId: 'alpha' }]
       }),
     ])
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
     expect((await store.readSchedule('per-course'))!.failCount).toBe(1)
 
     down = false
     await clock.advance(60_000)
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.failed).toEqual([])
     expect(await store.readSchedule('per-course')).toBeNull()
     expect(await store.readResult(key('alpha'))).not.toBeNull()
@@ -203,13 +203,13 @@ describe('dynamic variants', () => {
         fetch: async ({ params }) => `data:${JSON.stringify(params)}`,
       }),
     ])
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
 
     hang = true
     await clock.advance(300_000)
     const startedAt = clock.now()
-    const run = poller.runDue()
+    const run = fridge.runDue()
     await flushMicrotasks()
     await clock.advance(10_000)
 
@@ -236,10 +236,10 @@ describe('dynamic variants', () => {
       hangingQuery('first', () => undefined),
       hangingQuery('second', () => undefined),
     ])
-    const { poller, clock } = makeHarness(queries)
+    const { fridge, clock } = makeHarness(queries)
 
     const startedAt = clock.now()
-    const run = poller.runDue()
+    const run = fridge.runDue()
     await flushMicrotasks()
     await clock.advance(10_000)
 
@@ -252,15 +252,15 @@ describe('dynamic variants', () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
     const queries = defineQueries([hangingQuery('per-course', () => undefined)])
-    const { poller } = makeHarness(queries, { store, clock })
+    const { fridge } = makeHarness(queries, { store, clock })
     const reader = createReader({ store, queries, clock })
 
-    const viaPoller = poller.read('per-course', { courseId: 'alpha' })
+    const viaFridge = fridge.read('per-course', { courseId: 'alpha' })
     const viaReader = reader.read('per-course', { courseId: 'alpha' })
     await flushMicrotasks()
     await clock.advance(10_000)
 
-    await expect(viaPoller).rejects.toThrow(TimeoutError)
+    await expect(viaFridge).rejects.toThrow(TimeoutError)
     await expect(viaReader).rejects.toThrow(TimeoutError)
   })
 
@@ -280,9 +280,9 @@ describe('dynamic variants', () => {
         fetch: async ({ params }) => params,
       }),
     ])
-    const { poller, store, clock } = makeHarness(queries)
+    const { fridge, store, clock } = makeHarness(queries)
 
-    const run = poller.runDue()
+    const run = fridge.runDue()
     await flushMicrotasks()
     await clock.advance(120_000)
     await run
@@ -292,17 +292,17 @@ describe('dynamic variants', () => {
     expect(resolutions).toBe(1)
 
     // And the very next tick honours that backoff instead of hanging again.
-    await poller.runDue()
+    await fridge.runDue()
     expect(resolutions).toBe(1)
   })
 
   it('an explicit runDue(now) is never refreshed, so a caller keeps control of time', async () => {
-    const { poller, clock, fetches } = slowListHarness()
-    await poller.runDue()
+    const { fridge, clock, fetches } = slowListHarness()
+    await fridge.runDue()
     expect(fetches()).toBe(1)
 
     await clock.advance(200_000)
-    const run = poller.runDue(clock.now())
+    const run = fridge.runDue(clock.now())
     await flushMicrotasks()
     await clock.advance(120_000)
     await run
@@ -313,12 +313,12 @@ describe('dynamic variants', () => {
   })
 
   it('runDue() picks up the post-resolution time, and leases are still born live', async () => {
-    const { poller, clock, fetches, claims } = slowListHarness()
-    await poller.runDue()
+    const { fridge, clock, fetches, claims } = slowListHarness()
+    await fridge.runDue()
     expect(fetches()).toBe(1)
 
     await clock.advance(200_000)
-    const run = poller.runDue()
+    const run = fridge.runDue()
     await flushMicrotasks()
     await clock.advance(120_000)
     await run
@@ -341,10 +341,10 @@ describe('dynamic variants', () => {
         fetch: () => new Promise<string>(() => {}),
       }),
     ])
-    const { poller } = makeHarness(queries, { store, clock })
+    const { fridge } = makeHarness(queries, { store, clock })
     const reader = createReader({ store, queries, clock })
 
-    const viaPoller = poller.read('per-course', { courseId: 'alpha' })
+    const viaFridge = fridge.read('per-course', { courseId: 'alpha' })
     const viaReader = reader.read('per-course', { courseId: 'alpha' })
     await flushMicrotasks()
 
@@ -356,9 +356,9 @@ describe('dynamic variants', () => {
     await clock.advance(4_000)
 
     expect(clock.now()).toBe(10_000)
-    expect(await Promise.race([viaPoller, Promise.resolve('pending')])).not.toBe('pending')
+    expect(await Promise.race([viaFridge, Promise.resolve('pending')])).not.toBe('pending')
     expect(await Promise.race([viaReader, Promise.resolve('pending')])).not.toBe('pending')
-    await expect(viaPoller).resolves.toBeNull()
+    await expect(viaFridge).resolves.toBeNull()
     await expect(viaReader).resolves.toBeNull()
   })
 
@@ -369,17 +369,17 @@ describe('dynamic variants', () => {
         dup ? [{ courseId: 'alpha' }, { courseId: 'alpha' }] : [{ courseId: 'alpha' }],
       ),
     ])
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
 
     dup = true
     await clock.advance(300_000)
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.failed[0]!.message).toMatch(/duplicate variant params/)
     expect(await store.readResult(key('alpha'))).not.toBeNull()
   })
 
-  it('the background refresh promise never rejects, however broken the variant list is', async () => {
+  it('a stale variant reads straight from the store, however broken the variant list is', async () => {
     let down = false
     const queries = defineQueries([
       courseQuery(async () => {
@@ -387,25 +387,13 @@ describe('dynamic variants', () => {
         return [{ courseId: 'alpha' }]
       }),
     ])
-    const { poller, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, clock } = makeHarness(queries)
+    await fridge.runDue()
 
     down = true
     await clock.advance(300_000)
-    const refreshes: Promise<void>[] = []
-    const read = await poller.read(
-      'per-course',
-      { courseId: 'alpha' },
-      {
-        swrRefresh: (refresh) => refreshes.push(refresh),
-      },
-    )
 
-    // Callers hand this straight to ctx.waitUntil, where a rejection would
-    // surface as an invocation error.
-    expect(read).toMatchObject({ isStale: true })
-    expect(refreshes).toHaveLength(1)
-    await expect(refreshes[0]).resolves.toBeUndefined()
+    expect(await fridge.read('per-course', { courseId: 'alpha' })).toMatchObject({ isStale: true })
   })
 
   it('a hit reads without resolving the list; only a miss pays for membership', async () => {
@@ -416,12 +404,12 @@ describe('dynamic variants', () => {
         return [{ courseId: 'alpha' }]
       }),
     ])
-    const { poller, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, clock } = makeHarness(queries)
+    await fridge.runDue()
     const afterTick = resolutions
 
     await clock.advance(1_000)
-    expect(await poller.read('per-course', { courseId: 'alpha' })).toMatchObject({
+    expect(await fridge.read('per-course', { courseId: 'alpha' })).toMatchObject({
       data: 'data:{"courseId":"alpha"}',
     })
     expect(resolutions).toBe(afterTick)
@@ -429,28 +417,28 @@ describe('dynamic variants', () => {
 
   it('a cold read of a current member fetches it; a non-member throws', async () => {
     const queries = defineQueries([courseQuery(() => [{ courseId: 'alpha' }])])
-    const { poller, clock } = makeHarness(queries)
+    const { fridge, clock } = makeHarness(queries)
 
-    const read = poller.read<string>('per-course', { courseId: 'alpha' })
+    const read = fridge.read<string>('per-course', { courseId: 'alpha' })
     await clock.advance(0)
     await expect(read).resolves.toMatchObject({ data: 'data:{"courseId":"alpha"}' })
 
-    await expect(poller.read('per-course', { courseId: 'ghost' })).rejects.toThrow(
+    await expect(fridge.read('per-course', { courseId: 'ghost' })).rejects.toThrow(
       "unknown query 'per-course'",
     )
-    await expect(poller.read('nowhere', { courseId: 'alpha' })).rejects.toThrow(ConfigError)
+    await expect(fridge.read('nowhere', { courseId: 'alpha' })).rejects.toThrow(ConfigError)
   })
 
   it('a reader waits for a dynamic member it cannot fetch, and rejects a non-member', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
     const queries = defineQueries([courseQuery(() => [{ courseId: 'alpha' }])])
-    const { poller } = makeHarness(queries, { store, clock })
+    const { fridge } = makeHarness(queries, { store, clock })
     const reader = createReader({ store, queries, clock })
 
     const waiting = reader.read<string>('per-course', { courseId: 'alpha' })
     await flushMicrotasks()
-    await poller.runDue()
+    await fridge.runDue()
     await clock.advance(50)
     await expect(waiting).resolves.toMatchObject({ data: 'data:{"courseId":"alpha"}' })
 
@@ -501,15 +489,15 @@ describe('dimensions', () => {
     expect(queries.all).toHaveLength(0)
     expect(queries.dynamic).toHaveLength(1)
 
-    const { poller, store, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge, store, clock } = makeHarness(queries)
+    await fridge.runDue()
     expect(
       await store.readResult(queryKey('analytics', { preset: '7d', courseId: 'alpha' })),
     ).not.toBeNull()
 
     courses = ['alpha', 'beta']
     await clock.advance(300_000)
-    await poller.runDue()
+    await fridge.runDue()
     expect(
       await store.readResult(queryKey('analytics', { preset: '30d', courseId: 'beta' })),
     ).not.toBeNull()
@@ -546,8 +534,8 @@ describe('dimensions', () => {
         fetch: async ({ params }) => params,
       }),
     ])
-    const { poller } = makeHarness(queries)
-    const report = await poller.runDue()
+    const { fridge } = makeHarness(queries)
+    const report = await fridge.runDue()
     expect(report.failed[0]!.message).toMatch(/dimension 'courseId' must resolve to an array/)
   })
 })

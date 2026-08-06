@@ -34,7 +34,7 @@ interface Store {
 
 這條義務就是 `datafridge init <平台>` 在每個平台上都一樣小的原因。
 
-兩個半邊的一致性需求仍然不同，而且已出貨的程式碼裡就有一個例子證明這點：有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半。`PollerDO` 正是如此 - 它的簿記放在 Durable Object 自己的 SQLite，envelope 則寫進你交給它的 store。`SchedulePlane` 屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
+兩個半邊的一致性需求仍然不同，而且已出貨的程式碼裡就有一個例子證明這點：有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半。`FridgeDO` 正是如此 - 它的簿記放在 Durable Object 自己的 SQLite，envelope 則寫進你交給它的 store。`SchedulePlane` 屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
 
 ## 能力矩陣
 
@@ -52,7 +52,7 @@ interface Store {
 ## 排程那一半從哪來（建構時就決定）
 
 ```
-createPoller({ store, driver, queries })
+createFridge({ store, driver, queries })
 
 1. driver 自帶簿記        -> 用 driver 的
    （有狀態的 serialized driver，例如 DO alarms；store 的排程那一半就閒置）
@@ -65,17 +65,17 @@ serialized 的。否則建構直接拋錯，絕不默默降級。
 兩種典型寫法：
 
 ```ts
-createPoller({ store: d1(env.DB), driver: cronDriver(ctx), queries })
-createPoller({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
+createFridge({ store: d1(env.DB), driver: cronDriver(ctx), queries })
+createFridge({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
 ```
 
-`PollerDO` 會在內部用自己的 SQLite `SchedulePlane` 建構第二種 shape。反例：一個回報 `atomicClaim: false` 的 store 搭配 `cronDriver(ctx)` 會拋錯，因為重疊的 cron invocation 會導致重複 fetch。
+`FridgeDO` 會在內部用自己的 SQLite `SchedulePlane` 建構第二種 shape。反例：一個回報 `atomicClaim: false` 的 store 搭配 `cronDriver(ctx)` 會拋錯，因為重疊的 cron invocation 會導致重複 fetch。
 
 ## Driver contract
 
 Driver 是 integration shell，它的義務：
 
-1. 在自己的節奏下呼叫 `poller.runDue(now?)`。
+1. 在自己的節奏下呼叫 `fridge.runDue(now?)`。
 2. 提供 `defer(promise)` - Workers 版接到 `ctx.waitUntil`；常駐 process 版是 no-op。
 3. 宣告 `serialized: boolean` - 保證 `runDue` 永遠不會併發執行（單線程的 DO 或單一 node process 成立；Cron Triggers 不成立）。
 4. 可選：自帶 `schedule: SchedulePlane`（有狀態 driver 的內部簿記，如 DO alarms）。
@@ -94,6 +94,6 @@ Package 是配銷單位，不是組合單位 - 組合自由由 core interface �
 
 1. **按共享 runtime 依賴群聚。** Cloudflare 的三個部件（doAlarms、d1、cron shell）共享同一組依賴與發版節奏，所以同包。Redis、SQLite 各自依賴不同 client，各自成包。
 2. **包內每個部件是獨立 subpath export**（`@datafridge/cloudflare/do`、`/d1`、`/cron`）- 想用哪個拿哪個。
-3. **任何包不得依賴兄弟包；所有部件只認 core 的 interface。** `PollerDO` 接受任何 `Store`，所以跨包混搭（DO scheduler + Redis store）就是裝兩個包，永遠合法。
+3. **任何包不得依賴兄弟包；所有部件只認 core 的 interface。** `FridgeDO` 接受任何 `Store`，所以跨包混搭（DO scheduler + Redis store）就是裝兩個包，永遠合法。
 4. 純 JS、零平台依賴的部件住 core，不進平台包。
 5. Driver 天生平台味（Cloudflare 的 scheduled handler、node 的 timer、K8s 的 HTTP endpoint 形狀各不同），按平台組織是貼合現實。

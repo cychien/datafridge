@@ -117,7 +117,7 @@ if (read?.data !== 7 || read.status !== 'ok') throw new Error('read shape failed
     join(fixture, 'verify.ts'),
     `import { createReader, defineParameterizedQuery, defineQueries, memoryStore } from '@datafridge/core'
 import type { QueryCodec } from '@datafridge/core'
-import { cronPoller } from '@datafridge/cloudflare/cron'
+import { cronFridge } from '@datafridge/cloudflare/cron'
 import { d1 } from '@datafridge/cloudflare/d1'
 
 const codec: QueryCodec<Map<string, number>> = {
@@ -137,7 +137,7 @@ const queries = defineQueries([parameterized])
 const reader = createReader({ store: memoryStore(), queries })
 void reader.read<Map<string, number>>('fixture', { id: 'a', window: '7d' })
 void queries.dynamic
-void cronPoller
+void cronFridge
 void d1
 `,
   )

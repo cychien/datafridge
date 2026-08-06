@@ -81,8 +81,8 @@ const queries = defineQueries([
 
 **scheduler**
 
-- `PollerDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
-- `cronPoller` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
+- `FridgeDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
+- `cronFridge` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
 
 **store**
 
@@ -101,11 +101,11 @@ Schedulers: `durable-object`, `cron`. Stores: `d1`. Platform guides: [Cloudflare
 
 ## A complete example
 
-`PollerDO` as the scheduler, `d1` as the store, and one route that reads:
+`FridgeDO` as the scheduler, `d1` as the store, and one route that reads:
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, FridgeDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -124,7 +124,7 @@ const queries = defineQueries([
   },
 ])
 
-export class Poller extends PollerDO<Env> {
+export class Poller extends FridgeDO<Env> {
   queries = queries
 
   store(env: Env) {
@@ -206,7 +206,7 @@ Tag queries with a `source` and cap how many of that group run per tick:
 
 ```ts
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
     sources: { posthog: { maxPerTick: 2 } },

@@ -7,7 +7,7 @@ datafridge groups queries by `source` (the `source` field on a query definition,
 ## v1: per-tick budget + jitter
 
 ```ts
-createPoller({
+createFridge({
   driver: cronDriver(ctx),
   store: d1(env.DB),
   queries,

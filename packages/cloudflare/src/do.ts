@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { ConfigError, createPoller, defineQueries, Queries, variantBaseOf } from '@datafridge/core'
+import { ConfigError, createFridge, defineQueries, Queries, variantBaseOf } from '@datafridge/core'
 import type {
   QueryDefinition,
   RunReport,
@@ -138,12 +138,12 @@ function registrySignature(queries: Queries): string {
  * core engine serialized, and keeps schedule bookkeeping in its own SQLite.
  * Subclasses declare the registry and where envelopes live:
  *
- *   export class Poller extends PollerDO<Env> {
+ *   export class Poller extends FridgeDO<Env> {
  *     queries = defineQueries([...])
  *     store(env: Env) { return d1(env.DB) }
  *   }
  */
-export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
+export abstract class FridgeDO<Env = unknown> extends DurableObject<Env> {
   abstract queries: Queries | readonly QueryDefinition[]
   abstract store(env: Env): Store
   sources?: Record<string, SourceBudget>
@@ -185,7 +185,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
     const queries = this.#resolveQueries()
     try {
       this.#writeMeta(REGISTRY_META_KEY, registrySignature(queries))
-      const poller = createPoller({
+      const fridge = createFridge({
         queries,
         store: this.store(this.env),
         driver: {
@@ -195,7 +195,7 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
         },
         ...(this.sources !== undefined ? { sources: this.sources } : {}),
       })
-      const report = await poller.runDue()
+      const report = await fridge.runDue()
       await this.onRunReport(report)
     } catch {
       // Error objects from application hooks or storage can contain secrets.
@@ -284,19 +284,19 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
   }
 }
 
-interface PollerNamespace {
+interface FridgeNamespace {
   idFromName(name: string): DurableObjectId
   get(id: DurableObjectId): { ensureStarted(): Promise<void> }
 }
 
 /**
- * Ignites (or re-ignites after a redeploy) the alarm chain of a PollerDO.
+ * Ignites (or re-ignites after a redeploy) the alarm chain of a FridgeDO.
  * Idempotent and cheap once running; hang it on the read path or a post-deploy
  * hook.
  */
 export async function ensureStarted(
-  namespace: PollerNamespace,
-  instanceName = 'datafridge-poller',
+  namespace: FridgeNamespace,
+  instanceName = 'datafridge',
 ): Promise<void> {
   await namespace.get(namespace.idFromName(instanceName)).ensureStarted()
 }

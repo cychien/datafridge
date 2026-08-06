@@ -8,7 +8,7 @@ describe('runDue', () => {
   it('cold start: no records means everything is due, first run schedules with jitter', async () => {
     let aCalls = 0
     let bCalls = 0
-    const { clock, store, poller } = makeHarness(
+    const { clock, store, fridge } = makeHarness(
       [
         { name: 'a', every: '5m', fetch: async () => `a${++aCalls}` },
         { name: 'b', every: '10m', fetch: async () => `b${++bCalls}` },
@@ -16,7 +16,7 @@ describe('runDue', () => {
       { random: () => 0.5 },
     )
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
 
     expect(report.ran).toEqual(['a', 'b'])
     expect([aCalls, bCalls]).toEqual([1, 1])
@@ -31,7 +31,7 @@ describe('runDue', () => {
 
   it('budget squeeze: the deferred query is picked up on the next tick', async () => {
     const calls = { p1: 0, p2: 0, p3: 0 }
-    const { clock, poller } = makeHarness(
+    const { clock, fridge } = makeHarness(
       (['p1', 'p2', 'p3'] as const).map((name) => ({
         name,
         every: '5m' as const,
@@ -41,20 +41,20 @@ describe('runDue', () => {
       { sources: { posthog: { maxPerTick: 2 } } },
     )
 
-    const first = await poller.runDue()
+    const first = await fridge.runDue()
     expect(first.ran).toEqual(['p1', 'p2'])
     expect(first.deferredBudget).toEqual(['p3'])
     expect(calls).toEqual({ p1: 1, p2: 1, p3: 0 })
 
     await clock.advance(60_000)
-    const second = await poller.runDue()
+    const second = await fridge.runDue()
     expect(second.ran).toEqual(['p3'])
     expect(second.deferredBudget).toEqual([])
     expect(calls).toEqual({ p1: 1, p2: 1, p3: 1 })
   })
 
   it('orders by overdue ratio: a 5m query late by 4m beats a 60m query late by 5m', async () => {
-    const { store, poller } = makeHarness(
+    const { store, fridge } = makeHarness(
       [
         { name: 'hourly', every: '60m', source: 's', fetch: async () => 'h' },
         { name: 'fast', every: '5m', source: 's', fetch: async () => 'f' },
@@ -76,18 +76,18 @@ describe('runDue', () => {
       version: 1,
     })
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.ran).toEqual(['fast'])
     expect(report.deferredBudget).toEqual(['hourly'])
   })
 
   it('fixed-delay: a slow query reschedules from completion time, never piling up', async () => {
     const slow = deferred<string>()
-    const { clock, store, poller } = makeHarness([
+    const { clock, store, fridge } = makeHarness([
       { name: 'q', every: '5m', timeout: '3m', fetch: () => slow.promise },
     ])
 
-    const pending = poller.runDue()
+    const pending = fridge.runDue()
     await flushMicrotasks()
     await clock.advance(120_000)
     slow.resolve('v1')
@@ -108,7 +108,7 @@ describe('runDue', () => {
 
   it('stale-if-error: a failed refresh keeps the old envelope and read() reports stale', async () => {
     let fail = false
-    const { clock, store, poller } = makeHarness([
+    const { clock, store, fridge } = makeHarness([
       {
         name: 'q',
         every: '5m',
@@ -119,10 +119,10 @@ describe('runDue', () => {
       },
     ])
 
-    await poller.runDue()
+    await fridge.runDue()
     fail = true
     await clock.advance(300_000)
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
 
     expect(report.failed).toEqual([{ name: 'q', message: 'boom' }])
     expect(await store.readResult('q')).toEqual({
@@ -133,7 +133,7 @@ describe('runDue', () => {
     })
     expect(await store.readSchedule('q')).toMatchObject({ failCount: 1, leaseUntil: null })
 
-    const result = await poller.read<string>('q')
+    const result = await fridge.read<string>('q')
     expect(result).toEqual({
       data: 'v1',
       fetchedAt: 0,
@@ -147,7 +147,7 @@ describe('runDue', () => {
   it('backoff curve: 1m, 2m, 4m doubling, capped at every, reset on success', async () => {
     let fail = true
     const attempts: number[] = []
-    const { clock, store, poller } = makeHarness([
+    const { clock, store, fridge } = makeHarness([
       {
         name: 'q',
         every: '1h',
@@ -161,7 +161,7 @@ describe('runDue', () => {
 
     const backoffs: number[] = []
     for (let i = 0; i < 7; i++) {
-      await poller.runDue()
+      await fridge.runDue()
       const row = (await store.readSchedule('q'))!
       backoffs.push(row.nextRunAt - clock.now())
       await clock.advance(row.nextRunAt - clock.now())
@@ -170,7 +170,7 @@ describe('runDue', () => {
     expect(attempts).toEqual([1, 2, 3, 4, 5, 6, 7])
 
     fail = false
-    await poller.runDue()
+    await fridge.runDue()
     const row = (await store.readSchedule('q'))!
     expect(row.failCount).toBe(0)
     expect(row.nextRunAt).toBe(clock.now() + 3_600_000)
@@ -179,7 +179,7 @@ describe('runDue', () => {
 
   it('timeout: the AbortSignal fires and the run is recorded as failed', async () => {
     let signal: AbortSignal | undefined
-    const { clock, store, poller } = makeHarness([
+    const { clock, store, fridge } = makeHarness([
       {
         name: 'q',
         every: '5m',
@@ -190,7 +190,7 @@ describe('runDue', () => {
       },
     ])
 
-    const pending = poller.runDue()
+    const pending = fridge.runDue()
     await flushMicrotasks()
     expect(signal!.aborted).toBe(false)
     await clock.advance(30_000)
@@ -210,7 +210,7 @@ describe('runDue', () => {
   it('lease skip: a second runDue while the lease is live silently skips', async () => {
     let calls = 0
     const slow = deferred<string>()
-    const { poller } = makeHarness([
+    const { fridge } = makeHarness([
       {
         name: 'q',
         every: '5m',
@@ -221,9 +221,9 @@ describe('runDue', () => {
       },
     ])
 
-    const first = poller.runDue()
+    const first = fridge.runDue()
     await flushMicrotasks()
-    const second = await poller.runDue()
+    const second = await fridge.runDue()
     expect(second.skippedLeased).toEqual(['q'])
     expect(second.ran).toEqual([])
 
@@ -247,23 +247,23 @@ describe('runDue', () => {
         return inner.writeSchedule(row)
       },
     }
-    const { clock, poller } = makeHarness(
+    const { clock, fridge } = makeHarness(
       [{ name: 'q', every: '5m', fetch: async () => `v${++calls}` }],
       { store },
     )
 
-    const first = await poller.runDue()
+    const first = await fridge.runDue()
     expect(first.failed).toEqual([{ name: 'q', message: 'process died' }])
     expect(await inner.readResult('q')).toBeNull()
     expect(await inner.readSchedule('q')).toMatchObject({ version: 1, leaseUntil: 60_000 })
 
     crashWrites = false
     await clock.advance(59_999)
-    const tooEarly = await poller.runDue()
+    const tooEarly = await fridge.runDue()
     expect(tooEarly.skippedLeased).toEqual(['q'])
 
     await clock.advance(1)
-    const second = await poller.runDue()
+    const second = await fridge.runDue()
     expect(second.ran).toEqual(['q'])
     expect(calls).toBe(2)
     expect(await inner.readResult('q')).toMatchObject({ data: 'v2' })
@@ -292,7 +292,7 @@ describe('runDue', () => {
         return inner.readSchedule(name)
       },
     }
-    const { clock, poller } = makeHarness(
+    const { clock, fridge } = makeHarness(
       [
         {
           name: 'q',
@@ -304,14 +304,14 @@ describe('runDue', () => {
       { store },
     )
 
-    const zombieRun = poller.runDue()
+    const zombieRun = fridge.runDue()
     await flushMicrotasks()
     gateArmed = true
     first.resolve('zombie-data')
     await flushMicrotasks()
 
     await clock.advance(630_001)
-    const rerun = poller.runDue()
+    const rerun = fridge.runDue()
     await flushMicrotasks()
     second.resolve('fresh-data')
     const rerunReport = await rerun
@@ -331,9 +331,9 @@ describe('runDue', () => {
 
   it('concurrent runDue: each query is fetched exactly once', async () => {
     let calls = 0
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => ++calls }])
+    const { fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => ++calls }])
 
-    const [r1, r2] = await Promise.all([poller.runDue(), poller.runDue()])
+    const [r1, r2] = await Promise.all([fridge.runDue(), fridge.runDue()])
 
     expect(calls).toBe(1)
     expect([...r1.ran, ...r2.ran]).toEqual(['q'])
@@ -344,7 +344,7 @@ describe('runDue', () => {
   it('RunReport: ran, skippedLeased, deferredBudget and failed are classified correctly', async () => {
     const t0 = 1_000_000
     const clock = new FakeClock(t0)
-    const { store, poller } = makeHarness(
+    const { store, fridge } = makeHarness(
       [
         { name: 'ok', every: '5m', fetch: async () => 'fine' },
         {
@@ -376,7 +376,7 @@ describe('runDue', () => {
       version: 1,
     })
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
 
     expect(report.ran.toSorted()).toEqual(['ok', 'old'])
     expect(report.skippedLeased).toEqual(['leased'])

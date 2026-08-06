@@ -34,7 +34,7 @@ A store holds both halves. Applications only ever meet this one interface.
 
 This is what keeps `datafridge init <target>` the same size on every platform.
 
-The two halves still have different consistency needs, and one shipped case proves it: a stateful serialized driver can keep the schedule bookkeeping itself, and then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone. `PollerDO` is exactly that - its bookkeeping lives in the Durable Object's own SQLite while envelopes go to the store you hand it. `SchedulePlane` is adapter-level: implement it only if you are writing that kind of driver.
+The two halves still have different consistency needs, and one shipped case proves it: a stateful serialized driver can keep the schedule bookkeeping itself, and then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone. `FridgeDO` is exactly that - its bookkeeping lives in the Durable Object's own SQLite while envelopes go to the store you hand it. `SchedulePlane` is adapter-level: implement it only if you are writing that kind of driver.
 
 ## Capability matrix
 
@@ -52,7 +52,7 @@ A backend with no conditional-write primitive cannot host the schedule half at a
 ## Where the schedule half comes from (decided at config time)
 
 ```
-createPoller({ store, driver, queries })
+createFridge({ store, driver, queries })
 
 1. The driver carries its own bookkeeping   -> use the driver's
    (stateful serialized drivers, e.g. DO alarms; the store's schedule half goes unused)
@@ -65,17 +65,17 @@ driver must be serialized. Otherwise construction throws, never degrades silentl
 Two typical configurations:
 
 ```ts
-createPoller({ store: d1(env.DB), driver: cronDriver(ctx), queries })
-createPoller({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
+createFridge({ store: d1(env.DB), driver: cronDriver(ctx), queries })
+createFridge({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
 ```
 
-`PollerDO` constructs the second shape internally with its SQLite `SchedulePlane`. Counter-example: a store that reports `atomicClaim: false` under `cronDriver(ctx)` throws, because overlapping cron invocations could then double-fetch.
+`FridgeDO` constructs the second shape internally with its SQLite `SchedulePlane`. Counter-example: a store that reports `atomicClaim: false` under `cronDriver(ctx)` throws, because overlapping cron invocations could then double-fetch.
 
 ## Driver contract
 
 A driver is the integration shell. Its obligations:
 
-1. Call `poller.runDue(now?)` on its own cadence.
+1. Call `fridge.runDue(now?)` on its own cadence.
 2. Provide `defer(promise)` - the Workers version wires it to `ctx.waitUntil`; long-lived processes make it a no-op.
 3. Declare `serialized: boolean` - a guarantee that `runDue` never executes concurrently (true for a single-threaded DO or a single node process; false for Cron Triggers).
 4. Optionally carry its own `schedule: SchedulePlane` (internal bookkeeping of a stateful driver, like DO alarms).
@@ -94,6 +94,6 @@ Packages are distribution units, not composition units - composition freedom is 
 
 1. **Cluster by shared runtime dependency.** The three Cloudflare parts (doAlarms, d1, cron shell) share one dependency set and release cadence, so they share one package. Redis and SQLite depend on different clients, so they each get their own.
 2. **Each part is an independent subpath export** (`@datafridge/cloudflare/do`, `/d1`, `/cron`) - import only what you use.
-3. **No package may depend on a sibling package; every part talks only to core's interfaces.** `PollerDO` accepts any `Store`, so cross-package mixing (DO scheduler + a Redis store) is just installing two packages, and always legal.
+3. **No package may depend on a sibling package; every part talks only to core's interfaces.** `FridgeDO` accepts any `Store`, so cross-package mixing (DO scheduler + a Redis store) is just installing two packages, and always legal.
 4. Pure-JS, platform-free parts live in core, not in platform packages.
 5. Drivers are inherently platform-shaped (Cloudflare's scheduled handler, node's timer, a K8s HTTP endpoint all look different), so organizing them by platform reflects reality.

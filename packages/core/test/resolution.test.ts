@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { ConfigError, createPoller, defineQueries, FakeClock, memoryStore } from '../src/index.js'
+import { ConfigError, createFridge, defineQueries, FakeClock, memoryStore } from '../src/index.js'
 import type { Store } from '../src/index.js'
 import { makeDriver, scheduleOnly } from './helpers.js'
 
@@ -14,13 +14,13 @@ function withoutAtomicClaim(store: Store): Store {
 describe('where schedule bookkeeping lives', () => {
   it('the store holds both halves, even under a non-serialized driver', async () => {
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       store,
       driver: makeDriver({ serialized: false }),
       queries,
       clock: clock(),
     })
-    const report = await poller.runDue(0)
+    const report = await fridge.runDue(0)
     expect(report.ran).toEqual(['q'])
     expect(await store.readSchedule('q')).not.toBeNull()
     expect(await store.readResult('q')).toMatchObject({ data: 'v1' })
@@ -29,13 +29,13 @@ describe('where schedule bookkeeping lives', () => {
   it("a stateful driver's own bookkeeping wins, leaving the store's schedule half unused", async () => {
     const store = memoryStore()
     const driverPlane = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       store,
       driver: makeDriver({ serialized: true, schedule: scheduleOnly(driverPlane) }),
       queries,
       clock: clock(),
     })
-    const report = await poller.runDue(0)
+    const report = await fridge.runDue(0)
     expect(report.ran).toEqual(['q'])
     expect(await driverPlane.readSchedule('q')).toMatchObject({ version: 1 })
     expect(await store.readSchedule('q')).toBeNull()
@@ -43,16 +43,16 @@ describe('where schedule bookkeeping lives', () => {
   })
 
   it('a store without atomicClaim is allowed only under a serialized driver', async () => {
-    const okPoller = createPoller({
+    const okFridge = createFridge({
       store: withoutAtomicClaim(memoryStore()),
       driver: makeDriver({ serialized: true }),
       queries,
       clock: clock(),
     })
-    expect((await okPoller.runDue(0)).ran).toEqual(['q'])
+    expect((await okFridge.runDue(0)).ran).toEqual(['q'])
 
     expect(() =>
-      createPoller({
+      createFridge({
         store: withoutAtomicClaim(memoryStore()),
         driver: makeDriver({ serialized: false }),
         queries,
@@ -76,7 +76,7 @@ describe('unsafe claiming fails at config time with an exact, actionable message
   it('the store cannot claim safely under a non-serialized driver', () => {
     expect(
       configErrorMessage(() =>
-        createPoller({
+        createFridge({
           store: withoutAtomicClaim(memoryStore()),
           driver: makeDriver({ serialized: false }),
           queries,
@@ -92,7 +92,7 @@ describe('unsafe claiming fails at config time with an exact, actionable message
   it("the driver's own bookkeeping cannot claim safely under a non-serialized driver", () => {
     expect(
       configErrorMessage(() =>
-        createPoller({
+        createFridge({
           store: memoryStore(),
           driver: makeDriver({
             serialized: false,
@@ -110,9 +110,9 @@ describe('unsafe claiming fails at config time with an exact, actionable message
   })
 })
 
-describe('createPoller config validation', () => {
+describe('createFridge config validation', () => {
   it('rejects a missing store', () => {
-    expect(() => createPoller({ driver: makeDriver(), queries, clock: clock() } as never)).toThrow(
+    expect(() => createFridge({ driver: makeDriver(), queries, clock: clock() } as never)).toThrow(
       /requires a store/,
     )
   })
@@ -120,7 +120,7 @@ describe('createPoller config validation', () => {
   it('rejects a store that is missing either half', () => {
     const { readResult, writeResult, deleteResult } = memoryStore()
     expect(() =>
-      createPoller({
+      createFridge({
         store: { readResult, writeResult, deleteResult } as never,
         driver: makeDriver(),
         queries,
@@ -130,11 +130,11 @@ describe('createPoller config validation', () => {
   })
 
   it('rejects a missing or malformed driver', () => {
-    expect(() => createPoller({ store: memoryStore(), queries, clock: clock() } as never)).toThrow(
+    expect(() => createFridge({ store: memoryStore(), queries, clock: clock() } as never)).toThrow(
       /driver/,
     )
     expect(() =>
-      createPoller({
+      createFridge({
         store: memoryStore(),
         driver: { serialized: true } as never,
         queries,
@@ -145,16 +145,16 @@ describe('createPoller config validation', () => {
 
   it('defaults to systemClock when no clock is passed', async () => {
     const store = memoryStore()
-    const poller = createPoller({ store, driver: makeDriver(), queries, random: () => 0 })
+    const fridge = createFridge({ store, driver: makeDriver(), queries, random: () => 0 })
     const before = Date.now()
-    expect((await poller.runDue()).ran).toEqual(['q'])
+    expect((await fridge.runDue()).ran).toEqual(['q'])
     expect(await store.readResult('q')).toMatchObject({ data: 'v1' })
     expect((await store.readSchedule('q'))!.nextRunAt).toBeGreaterThanOrEqual(before + 300_000)
   })
 
   it('rejects a malformed clock', () => {
     expect(() =>
-      createPoller({
+      createFridge({
         store: memoryStore(),
         driver: makeDriver(),
         queries,
@@ -166,7 +166,7 @@ describe('createPoller config validation', () => {
   it('rejects invalid source budgets', () => {
     for (const maxPerTick of [0, -1, 1.5, NaN]) {
       expect(() =>
-        createPoller({
+        createFridge({
           store: memoryStore(),
           driver: makeDriver(),
           queries,
@@ -179,7 +179,7 @@ describe('createPoller config validation', () => {
 
   it('validates raw query defs passed without defineQueries', () => {
     expect(() =>
-      createPoller({
+      createFridge({
         store: memoryStore(),
         driver: makeDriver(),
         clock: clock(),

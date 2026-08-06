@@ -1,5 +1,5 @@
-export { cronDriver, cronPoller } from './cron.js'
-export type { CronPollerConfig, CronScheduledHandler } from './cron.js'
+export { cronDriver, cronFridge } from './cron.js'
+export type { CronFridgeConfig, CronScheduledHandler } from './cron.js'
 export { d1 } from './d1.js'
-export { ensureStarted, PollerDO } from './do.js'
+export { ensureStarted, FridgeDO } from './do.js'
 export { INVOCATION_WALL_CLOCK_LIMIT_MS } from './limits.js'

@@ -33,7 +33,7 @@ datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的�
 └──────────────────────────────────────────────┘
 ```
 
-三軸正交：**store** 決定狀態放哪、**driver** 決定誰來踢、**fetcher** 跟著 poller 實例跑在哪都行。
+三軸正交：**store** 決定狀態放哪、**driver** 決定誰來踢、**fetcher** 跟著 fridge 實例跑在哪都行。
 
 Core 的唯一入口是冪等的 `runDue(now)`。Core 永遠不擁有 event loop、不自己排程、不持有跨呼叫的記憶體狀態 - 一切都從 store 讀出、計算、寫回。這就是同一份 core 能同時活在常駐的 Node process、冷啟的 Worker、多實例併發環境的原因。
 

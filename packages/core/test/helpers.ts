@@ -1,5 +1,5 @@
-import { createPoller, FakeClock, memoryStore } from '../src/index.js'
-import type { Driver, PollerConfig, SchedulePlane, Store } from '../src/index.js'
+import { createFridge, FakeClock, memoryStore } from '../src/index.js'
+import type { Driver, FridgeConfig, SchedulePlane, Store } from '../src/index.js'
 
 export function makeDriver(overrides: Partial<Driver> = {}): Driver {
   return { serialized: false, defer: () => undefined, ...overrides }
@@ -35,16 +35,16 @@ export function scheduleOnly(store: Store): SchedulePlane {
 export interface Harness {
   clock: FakeClock
   store: Store
-  poller: ReturnType<typeof createPoller>
+  fridge: ReturnType<typeof createFridge>
 }
 
 export function makeHarness(
-  queries: PollerConfig['queries'],
-  overrides: Partial<PollerConfig> = {},
+  queries: FridgeConfig['queries'],
+  overrides: Partial<FridgeConfig> = {},
 ): Harness {
   const clock = (overrides.clock as FakeClock | undefined) ?? new FakeClock(0)
   const store = (overrides.store as Store | undefined) ?? memoryStore()
-  const poller = createPoller({
+  const fridge = createFridge({
     driver: makeDriver(),
     random: () => 0,
     ...overrides,
@@ -52,5 +52,5 @@ export function makeHarness(
     clock,
     store,
   })
-  return { clock, store, poller }
+  return { clock, store, fridge }
 }

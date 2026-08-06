@@ -10,4 +10,4 @@ The read path stays a single `SELECT` and never applies schema. A result table t
 
 The packaged migration is still there for teams that would rather declare the schema in their own pipeline; applying it makes the automatic step a no-op, and a test keeps the two from drifting.
 
-`cronPoller` also accepts `onRunReport` now, under the same contract as the `PollerDO` hook: sanitize before logging, and a throwing hook cannot fail the tick. Getting at the report no longer means dropping down to `cronDriver` plus `createPoller`.
+`cronFridge` also accepts `onRunReport` now, under the same contract as the `FridgeDO` hook: sanitize before logging, and a throwing hook cannot fail the tick. Getting at the report no longer means dropping down to `cronDriver` plus `createFridge`.

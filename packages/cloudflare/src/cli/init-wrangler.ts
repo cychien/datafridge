@@ -43,7 +43,7 @@ export class InitError extends Error {
 type TomlTable = Record<string, unknown>
 
 const DO_BLOCK = `# datafridge: Durable Object alarms scheduler.
-# class_name must match your PollerDO subclass exported by the Worker.
+# class_name must match your FridgeDO subclass exported by the Worker.
 [[durable_objects.bindings]]
 name = "${DO_BINDING}"
 class_name = "${POLLER_CLASS}"`
@@ -123,14 +123,14 @@ export function planInit(
   }
 
   const migrations = tables(root, 'migrations')
-  const pollerMigrated = migrations.some((m) =>
+  const classMigrated = migrations.some((m) =>
     [m.new_sqlite_classes, m.new_classes].some(
       (classes) => Array.isArray(classes) && classes.includes(POLLER_CLASS),
     ),
   )
   if (!wantsDurableObject) {
     // nothing to migrate for this scheduler
-  } else if (pollerMigrated) {
+  } else if (classMigrated) {
     actions.push({
       kind: 'skip',
       subject: 'migrations',

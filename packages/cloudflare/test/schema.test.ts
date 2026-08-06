@@ -2,7 +2,7 @@ import { createScheduledController, createExecutionContext, env } from 'cloudfla
 import { createReader, defineQueries } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { cronPoller } from '../src/cron.js'
+import { cronFridge } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
 
 interface SchemaEnv {
@@ -19,7 +19,7 @@ beforeEach(async () => {
   ])
 })
 
-async function invoke(handler: ReturnType<typeof cronPoller<SchemaEnv>>): Promise<void> {
+async function invoke(handler: ReturnType<typeof cronFridge<SchemaEnv>>): Promise<void> {
   const ctx = createExecutionContext()
   await handler(
     createScheduledController({ scheduledTime: new Date(), cron: '* * * * *' }),
@@ -30,7 +30,7 @@ async function invoke(handler: ReturnType<typeof cronPoller<SchemaEnv>>): Promis
 
 describe('d1 applies its own schema', () => {
   it('a tick works against a database with no datafridge tables', async () => {
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ ok: true }) }],
       store: (e) => d1(e.DB),
     })
@@ -49,7 +49,7 @@ describe('d1 applies its own schema', () => {
 
   it('is idempotent: a second tick against the existing schema still refreshes', async () => {
     let ticks = 0
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '1ms', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
     })
@@ -64,7 +64,7 @@ describe('d1 applies its own schema', () => {
 
   it('recovers when the tables disappear under a warm isolate', async () => {
     let ticks = 0
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '1ms', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
     })
@@ -134,7 +134,7 @@ describe('a cold read over a real D1', () => {
     const reader = createReader({ store: d1(env.DB), queries })
     const waiting = reader.read<{ ok: boolean }>('metrics')
 
-    const handler = cronPoller<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
+    const handler = cronFridge<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
     await invoke(handler)
 
     const result = await waiting
@@ -167,7 +167,7 @@ describe('a cold read over a real D1', () => {
         fetch: async () => ({ ok: true }),
       },
     ])
-    expect(() => cronPoller<SchemaEnv>({ queries: tooSlow, store: (e) => d1(e.DB) })).toThrow(
+    expect(() => cronFridge<SchemaEnv>({ queries: tooSlow, store: (e) => d1(e.DB) })).toThrow(
       /query 'per-course': timeout \(1200000ms\) must be shorter than the 900000ms/,
     )
   })

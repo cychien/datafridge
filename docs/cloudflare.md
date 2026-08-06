@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/cloudflare.md)
 
-This page is the setup and operations home for the Cloudflare modules: `PollerDO` and `ensureStarted` for alarm-driven scheduling, `cronDriver` and `cronPoller` for Cron Triggers, and `d1` for storage. Which position each module fills is in the [README's module list](../README.md#wiring-a-scheduler-and-a-store). Every arrangement below stores result envelopes in D1 and preserves the [six-point semantic contract](./concepts.md#the-semantic-contract).
+This page is the setup and operations home for the Cloudflare modules: `FridgeDO` and `ensureStarted` for alarm-driven scheduling, `cronDriver` and `cronFridge` for Cron Triggers, and `d1` for storage. Which position each module fills is in the [README's module list](../README.md#wiring-a-scheduler-and-a-store). Every arrangement below stores result envelopes in D1 and preserves the [six-point semantic contract](./concepts.md#the-semantic-contract).
 
 ## Install and initialize
 
@@ -14,7 +14,7 @@ pnpm exec datafridge init --scheduler durable-object --store d1
 
 You name the scheduler and the store, and the CLI idempotently adds only what that combination needs: the Durable Object binding and its SQLite class migration, or the `[triggers]` cron, plus the D1 binding. Nothing is written for you to delete afterwards. Pass `--config <path>` for another TOML file. It preserves existing declarations, reports declarations that need manual placement, and refuses to create TOML beside an existing `wrangler.json` or `wrangler.jsonc` (it prints the declarations for you to place by hand instead).
 
-With the Durable Object scheduler, `class_name` has to match the `PollerDO` subclass your Worker exports.
+With the Durable Object scheduler, `class_name` has to match the `FridgeDO` subclass your Worker exports.
 
 The `database_id` is the one thing the CLI cannot fill in, so it writes `TODO` there. Run `pnpm exec wrangler d1 create datafridge`, or pick an existing database, and paste the ID it prints.
 
@@ -31,14 +31,14 @@ Use Worker secrets for upstream credentials. Never put a credential in a query n
 pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 ```
 
-## Durable Object alarms: `PollerDO`
+## Durable Object alarms: `FridgeDO`
 
-The scheduler here is the class you export: `wrangler` instantiates it by `class_name` and its alarm loop drives every tick. `PollerDO` is a serialized driver that carries its own schedule bookkeeping, so it only needs somewhere to put envelopes. Use it when you want alarms scheduled at exact due timestamps, dynamic backoff without fixed cron wakeups, or serialized schedule coordination.
+The scheduler here is the class you export: `wrangler` instantiates it by `class_name` and its alarm loop drives every tick. `FridgeDO` is a serialized driver that carries its own schedule bookkeeping, so it only needs somewhere to put envelopes. Use it when you want alarms scheduled at exact due timestamps, dynamic backoff without fixed cron wakeups, or serialized schedule coordination.
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
 import type { RunReport } from '@datafridge/core'
-import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, FridgeDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -46,7 +46,7 @@ interface Env {
   UPSTREAM_API_TOKEN: string
 }
 
-export class Poller extends PollerDO<Env> {
+export class Poller extends FridgeDO<Env> {
   queries = defineQueries([
     {
       name: 'weekly-summary',
@@ -106,7 +106,7 @@ The Durable Object stores only schedule rows in its own SQLite. Fetchers execute
 
 ### Alarm lifecycle
 
-`ensureStarted(namespace, instanceName?)` wakes the object and schedules an immediate alarm unless the current registry already has one. The default instance name is `datafridge-poller`. Calling it on every read is safe and also re-ignites the chain after a deployment. To keep the request path clear of it, hand it to the handler's `ExecutionContext` with `ctx.waitUntil(ensureStarted(env.POLLER))` instead of awaiting it, or call it from a post-deploy hook.
+`ensureStarted(namespace, instanceName?)` wakes the object and schedules an immediate alarm unless the current registry already has one. The default instance name is `datafridge`. Calling it on every read is safe and also re-ignites the chain after a deployment. To keep the request path clear of it, hand it to the handler's `ExecutionContext` with `ctx.waitUntil(ensureStarted(env.POLLER))` instead of awaiting it, or call it from a post-deploy hook.
 
 Every alarm:
 
@@ -120,13 +120,13 @@ For a variant list that changes at runtime, declare it as a function - it is res
 
 `onRunReport` is for operational evidence, not payload logging. Prefer category counts or allowlisted identities. Error messages originate in application fetchers and may be sensitive, so sanitize them before logging.
 
-## Cron Triggers: `cronPoller`
+## Cron Triggers: `cronFridge`
 
 The scheduler here is the handler you export: Cloudflare's cron trigger calls `scheduled`, so nothing has to ignite itself and there is no `ensureStarted`. `cronDriver` is not serialized, so it needs atomic claims - which `d1` provides. Use this pairing when a one-minute scheduler floor is acceptable and you prefer D1 as the only stateful platform component.
 
 ```ts
 import { defineQueries } from '@datafridge/core'
-import { cronPoller, d1 } from '@datafridge/cloudflare'
+import { cronFridge, d1 } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -143,7 +143,7 @@ const queries = defineQueries([
 ])
 
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
@@ -161,23 +161,23 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-Cron invocations can overlap, so `cronPoller` uses a non-serialized driver and requires an atomic schedule store. `d1` claims with a version-checked D1 update. Invalid `results`-only configurations fail when `cronPoller` is constructed.
+Cron invocations can overlap, so `cronFridge` uses a non-serialized driver and requires an atomic schedule store. `d1` claims with a version-checked D1 update. Invalid `results`-only configurations fail when `cronFridge` is constructed.
 
-Pass `onRunReport` to observe each tick under the same sanitize-before-logging contract as the `PollerDO` hook. Use `cronDriver(ctx)` with `createPoller` directly when the handler needs to do more with the `RunReport` than observe it:
+Pass `onRunReport` to observe each tick under the same sanitize-before-logging contract as the `FridgeDO` hook. Use `cronDriver(ctx)` with `createFridge` directly when the handler needs to do more with the `RunReport` than observe it:
 
 ```ts
-const poller = createPoller({
+const fridge = createFridge({
   queries,
   driver: cronDriver(ctx),
   store: d1(env.DB),
 })
-const report = await poller.runDue()
+const report = await fridge.runDue()
 ctx.waitUntil(writeSanitizedOperations(report))
 ```
 
 ## Choosing a scheduler
 
-| | `PollerDO` | `cronPoller` |
+| | `FridgeDO` | `cronFridge` |
 |---|---|---|
 | Driver | Durable Object alarms | Cron Triggers |
 | Schedule plane | Durable Object SQLite | D1 |
@@ -193,8 +193,8 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 ## Construction-time validation
 
 - `defineQueries` validates names, durations, fetchers, duplicate variants, and `timeout < lease`.
-- `PollerDO` validates its registry, source budgets, and the Cloudflare wall-clock ceiling during ignition and before alarms.
-- `cronPoller` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
+- `FridgeDO` validates its registry, source budgets, and the Cloudflare wall-clock ceiling during ignition and before alarms.
+- `cronFridge` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
 - Source budgets must be positive integers.
 
@@ -217,7 +217,7 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 1. Optionally apply the packaged D1 migration; otherwise the first write creates the tables.
 2. Put upstream credentials in Worker secrets.
 3. Keep query params non-secret and finite.
-4. Deploy the Worker and, when `PollerDO` is the scheduler, call a route that invokes `ensureStarted` once.
+4. Deploy the Worker and, when `FridgeDO` is the scheduler, call a route that invokes `ensureStarted` once.
 5. Confirm result rows appear and reads return `{ data, fetchedAt, isStale, age }`.
 6. Record sanitized `RunReport` categories, alarm continuity, and an observation start and end condition.
 7. Test failure handling with an authorized, controlled upstream condition. Verify the old envelope remains and subsequent reports show failure and recovery without logging payloads.
@@ -225,14 +225,14 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 
 D1 is single-region, so readers at remote PoPs can incur cross-region latency. Result-plane replicas are outside the shipped scope.
 
-One `PollerDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which a registry of a few dozen queries is nowhere near.
+One `FridgeDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which a registry of a few dozen queries is nowhere near.
 
 ## Subpath imports
 
 ```ts
-import { PollerDO, ensureStarted } from '@datafridge/cloudflare/do'
+import { FridgeDO, ensureStarted } from '@datafridge/cloudflare/do'
 import { d1 } from '@datafridge/cloudflare/d1'
-import { cronDriver, cronPoller } from '@datafridge/cloudflare/cron'
+import { cronDriver, cronFridge } from '@datafridge/cloudflare/cron'
 ```
 
 The package root re-exports all of these APIs.
