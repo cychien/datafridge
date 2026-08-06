@@ -94,6 +94,21 @@ const queries = defineQueries([
 
 兩邊可自由搭配，也都可以換成你自己的實作。
 
+## 初始化
+
+`datafridge init` 會把你選的那些零件需要的宣告寫好，並把它替你填不了的部分印出來。你指定 scheduler 和 store，它只寫那個組合。
+
+```sh
+npx --no-install datafridge init --scheduler durable-object --store d1
+# 或：--scheduler cron --store d1
+```
+
+它是 idempotent 的，不會改寫你已有的設定。
+
+沒有 migration 要先跑：store 會在第一次寫入前自己把需要的儲存空間建好。剩下那些跟你的平台有關的事 - 要建哪個 database、binding 叫什麼名字 - 在該平台自己的文件裡。
+
+Scheduler：`durable-object`、`cron`。Store：`d1`。平台指南：[Cloudflare](./docs/zh-TW/cloudflare.md)。
+
 ## 完整範例
 
 `PollerDO` 當 scheduler、`d1` 當 store，加上一個負責讀取的 route：
@@ -134,19 +149,15 @@ export default {
 }
 ```
 
-Durable Object 在這裡的身分是 scheduler：用 alarm 喚醒自己、執行每個 tick 到期的 query 且兩個 tick 永不重疊、把 schedule 簿記放在自己的 SQLite。Envelope 寫進你的 D1。讀取本身直接查 D1，完全不經過 Durable Object - 你的 handler 與那一列資料之間，沒有 scheduler、沒有鎖、也沒有 coordinator。
+Durable Object 就是這裡的 scheduler，`ensureStarted()` 點燃它 - 沒有這行不會有任何 tick。讀取則直接查 D1，完全不經過 Durable Object。
 
-`ensureStarted()` 是便宜且 idempotent 的 RPC，也是上面範例中唯一一次 Durable Object 呼叫。它第一次會點燃 alarm chain，部署後會重新點燃，所以在讀取路由上 await 它完全沒問題。若想讓 request path 完全不碰它，就別 await，改交給 handler 的 `ExecutionContext`：`ctx.waitUntil(ensureStarted(env.POLLER))`，或改在部署後的 hook 呼叫。它也會察覺 registry 的變動：下一個 tick 會替新增的 query 建立 row，並把刪掉的 query 連 row 與 envelope 一起移除。
+第一次讀取會回 `null`，因為還沒 fetch 過任何東西。
 
-第一次讀取會回 `null`，因為還沒 fetch 過任何東西。第一次成功刷新之後，每次讀取都會有資料。
-
-這個 Worker 需要的 infra - `wrangler` 宣告、`datafridge init` scaffold、package 內附的 D1 schema、Cron Trigger 設定，以及營運 checklist - 都在 [docs/zh-TW/cloudflare.md](./docs/zh-TW/cloudflare.md)。
-
-[`examples/cloudflare-basic`](./examples/cloudflare-basic) 就是這套設定的可執行版本，在 `wrangler dev` 下輪詢一個故意做慢的假 API。
+[`examples/cloudflare-basic`](./examples/cloudflare-basic) 是可以跑的版本，在 `wrangler dev` 下輪詢一個故意做慢的假 API。
 
 ## 讀取結果
 
-Reader 只需要一個 result store，沒有 fetcher、也沒有 schedule，所以你可以把它放在另一個 Worker、另一個服務，甚至完全不用 TypeScript：envelope 就是純 JSON row。
+Reader 只需要一個 result store，沒有 fetcher、也沒有 schedule，所以你可以把它放在另一個 Worker、另一個服務，甚至完全不用 TypeScript：存進去的就是普通的 JSON row。
 
 ```ts
 const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
@@ -159,26 +170,22 @@ const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-s
 - `fetchedAt` 是資料實際被抓下來的時間，epoch 毫秒。
 - `age` 是它此刻多舊，讓你套用自己的門檻（「超過兩小時就顯示警告」）。
 - `age` 超過該 query 的 `every` 之後，`isStale` 為 `true`。它只是標籤、從不阻擋：stale 資料一樣立即回傳，跟 fresh 資料完全一樣。
-- `null` 代表那個 key 底下沒有 envelope。通常是第一次成功刷新還沒落地，但名稱拼錯、或傳入一組沒有註冊過的 params，同樣會讀到 `null`，因為 reader 身上沒有 registry 可以拿來核對名稱。
+- `null` 代表那個 key 底下什麼都沒有。通常是第一次成功刷新還沒落地，但名稱拼錯、或傳入一組沒有註冊過的 params，同樣會讀到 `null`，因為 reader 身上沒有 registry 可以拿來核對名稱。
 
 如果同一個 process 裡已經有 poller，就用 `poller.read(name, options)`：它讀同一個 store，並且會額外拒絕 registry 之外的名稱。
 
 ## 上游失敗時
 
-什麼都不會被丟掉。刷新失敗會保留先前的 envelope、把 `lastError` 附在上面，並以帶 jitter 的 exponential backoff 重排：`min(every, 1m * 2^(failCount - 1))`。上限收在 `every`，因為重試得比正常間隔還慢對誰都沒好處。一次成功就把計數歸零。
+什麼都不會被丟掉。刷新失敗會保留先前的 cache、把 `lastError` 附在上面，並以帶 jitter 的 exponential backoff 重排：`min(every, 1m * 2^(failCount - 1))`。上限收在 `every`，因為重試得比正常間隔還慢對誰都沒好處。一次成功就把計數歸零。
 
 | 發生了什麼 | Scheduler 怎麼做 | `read()` 回什麼 |
 |---|---|---|
-| 上游錯誤或 timeout | 記錄失敗、backoff、保留舊 envelope | 舊資料、`isStale`、`lastError` |
+| 上游錯誤或 timeout | 記錄失敗、backoff、保留舊結果 | 舊資料、`isStale`、`lastError` |
 | Executor 執行到一半暴斃 | 租約過期後由另一個 tick 重新 claim | 舊資料、`isStale` |
 | Zombie 遲到寫回 | Version 不符，寫入被拒 | 不受影響 |
 | 被 source budget 擠掉 | 保持到期，下個 tick 優先度提高 | 舊資料，稍微舊一點 |
 | 連續失敗數小時 | Backoff 收斂在 `every`，永久保留 last-known-good | 舊資料、`lastError` |
 | 從未成功 fetch 過 | 依排程持續嘗試 | `null` |
-
-支撐這一切的是三道各自獨立的關卡：`nextRunAt` 決定「該不該跑」、lease 決定「誰在跑」、version 決定「誰的結果算數」。慢速 fetch、暴斃的 executor、zombie 寫回各自打穿一關，下一關接住。
-
-每個 tick 回傳一份 `RunReport`：`{ ran, skippedLeased, deferredBudget, failed }`。在 `PollerDO` subclass 上 override `onRunReport(report)` 就能記錄它 - 只記數量與允許清單內的名稱，因為錯誤訊息來自你的 fetcher，可能帶有上游細節。
 
 ## 同一個 query 的 preset variants
 
@@ -200,9 +207,7 @@ const queries = defineQueries([courseAnalytics])
 const result = await reader.read('course-analytics', { courseId: 'course-a', window: '30d' })
 ```
 
-每個 variant 都會變成一筆普通、獨立的 registry entry，各自擁有 schedule、lease、backoff、失敗計數與 envelope。新增或移除 variant 的 reconcile 行為，與新增或移除 named query 完全一樣。
-
-Params 是身分，不是儲存空間。它們在建構時被快照，必須是有限的 JSON（object key 順序不影響結果），並被雜湊成 `@df/v1/<base-name>/<sha256>` 的 storage key - 所以原始參數值不會出現在 D1 key 或 `RunReport` 裡。永遠不要把 credential 放進去；secret 的家是 binding 與 fetcher closure。
+每個 variant 都會變成一筆普通、獨立的 registry entry，各自擁有 schedule、lease、backoff、失敗計數與自己存下來的結果。新增或移除 variant 的 reconcile 行為，與新增或移除 named query 完全一樣。
 
 只有 registry 內的有限 variant 會被排程與讀取。任意的 on-demand variant 不會在 read 時被建立。
 
@@ -220,7 +225,7 @@ export default {
 }
 ```
 
-同樣的 `sources` 欄位也能當作 `PollerDO` subclass 的 property。它是無狀態的，所以在併發 executor 之間依然正確，而且給你一個硬上限：不論你註冊多少 query，上游呼叫都不會超過 `maxPerTick × tick 頻率`。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
+不論你註冊多少 query，上游呼叫都不會超過 `maxPerTick × tick 頻率`。被預算擠掉的 query 會保持到期，而且每等一個 tick 優先度就上升，因為優先度看的是過期*比例* `(now - nextRunAt) / every` 而非絕對遲到時間。沒有人會餓死。
 
 Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` 加上隨機偏移，所以 `5m`、`10m`、`1h` 的 query 不會永遠對齊在同一個 tick、一次擠爆同一個 source。預算是保險絲，jitter 讓保險絲平常不用燒。
 
@@ -231,7 +236,6 @@ Jitter 是另外一半：第一次註冊時會替每個 query 的 `nextRunAt` �
 - [Cloudflare 設定與營運](./docs/zh-TW/cloudflare.md)
 - [Rate limiting](./docs/zh-TW/rate-limiting.md)
 - [撰寫 adapters](./docs/zh-TW/writing-adapters.md)
-- [Release 流程與 package 名稱](./docs/zh-TW/releasing.md)
 - [可執行的 Cloudflare 範例](./examples/cloudflare-basic)
 
 ## License

@@ -30,6 +30,10 @@ interface Store {
 
 A store holds both halves. Applications only ever meet this one interface.
 
+**A store creates the storage it needs.** Before its first write it must apply its own tables, keys, or collections, so no adapter ever ships a migration the user has to remember. Applying an equivalent schema by hand must stay a no-op, a backend whose storage disappears under a warm process must be repaired and retried rather than failing until that process recycles, and `readResult` must stay a plain read: storage that does not exist yet reads as `null`, exactly like an empty one. `@datafridge/cloudflare`'s `test/schema.test.ts` is the reference test to copy - the contract suite cannot enforce this, because the suite's factory is what prepares the backend.
+
+This is what keeps `datafridge init <target>` the same size on every platform.
+
 The two halves still have different consistency needs, and one shipped case proves it: a stateful serialized driver can keep the schedule bookkeeping itself, and then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone. `PollerDO` is exactly that - its bookkeeping lives in the Durable Object's own SQLite while envelopes go to the store you hand it. `SchedulePlane` is adapter-level: implement it only if you are writing that kind of driver.
 
 ## Capability matrix

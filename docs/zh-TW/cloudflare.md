@@ -2,20 +2,23 @@
 
 [English](../cloudflare.md) | 繁體中文
 
-這份文件是 Cloudflare 各 module 的設定與營運指南：`PollerDO` 與 `ensureStarted` 負責 alarm 排程、`cronDriver` 與 `cronPoller` 負責 Cron Triggers、`d1` 負責儲存。每個 module 各自填哪個位置，見 [README 的 module 清單](../../README.zh-TW.md#接上-scheduler-與-store)。以下每一種組法都把 result envelope 存在 D1，並遵守[六點語意契約](../../README.zh-TW.md#語意契約)。
+這份文件是 Cloudflare 各 module 的設定與營運指南：`PollerDO` 與 `ensureStarted` 負責 alarm 排程、`cronDriver` 與 `cronPoller` 負責 Cron Triggers、`d1` 負責儲存。每個 module 各自填哪個位置，見 [README 的 module 清單](../../README.zh-TW.md#接上-scheduler-與-store)。以下每一種組法都把 result envelope 存在 D1，並遵守[六點語意契約](./concepts.md#語意契約)。
 
 ## 安裝與初始化
 
 ```sh
 pnpm add @datafridge/core @datafridge/cloudflare
-pnpm exec datafridge init cloudflare
+pnpm exec datafridge init --scheduler durable-object --store d1
+# 或：--scheduler cron --store d1
 ```
 
-Init CLI 會 idempotently 把兩種 scheduler 的 declarations 加到 `wrangler.toml`。其他 TOML file 可使用 `--config <path>`。它會保留既有 declarations、列出需要手動放置的設定，並拒絕在既有 `wrangler.json` 或 `wrangler.jsonc` 旁建立 TOML（這時它會把 declarations 印出來讓你自己放）。
+你指定 scheduler 和 store，CLI 只會 idempotently 加入那個組合需要的東西：Durable Object binding 加它的 SQLite class migration，或是 `[triggers]` 的 cron，再加上 D1 binding。不會寫出任何需要你事後刪掉的東西。其他 TOML file 可使用 `--config <path>`。它會保留既有 declarations、列出需要手動放置的設定，並拒絕在既有 `wrangler.json` 或 `wrangler.jsonc` 旁建立 TOML（這時它會把 declarations 印出來讓你自己放）。
 
-檢查輸出後，保留你實際使用的那個 scheduler 的 declarations。如果不使用 Cron Triggers，就刪掉 `[triggers]` 區塊：沒有匯出 `scheduled` handler 的 Worker，沒有東西可以讓 cron tick 呼叫。`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。
+使用 Durable Object scheduler 時，`class_name` 必須與你的 Worker 匯出的 `PollerDO` subclass 名稱一致。
 
-`database_id` 是 CLI 唯一填不了的欄位，它會寫成 `TODO`。執行 `pnpm exec wrangler d1 create datafridge`，或選一個既有的 database，把它印出來的 ID 貼進去。接著套用 package 內附的 schema：
+`database_id` 是 CLI 唯一填不了的欄位，它會寫成 `TODO`。執行 `pnpm exec wrangler d1 create datafridge`，或選一個既有的 database，把它印出來的 ID 貼進去。
+
+設定到這裡就結束了。`d1()` 會在第一次寫入前自己建表，所以空的 database 直接就能用。如果你希望 schema 由自己的 pipeline 宣告，package 內附的 migration 是一模一樣的語句（有測試盯著兩邊不漂移），先套用它就會讓自動建表變成 no-op：
 
 ```sh
 pnpm exec wrangler d1 execute YOUR_DATABASE --remote \
@@ -30,7 +33,7 @@ pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 
 ## Durable Object alarms：`PollerDO`
 
-`PollerDO` 是 serialized driver，而且自帶 schedule plane，所以它只需要一個 result store。需要精確 due timestamp 的 alarm、可動態調整的 backoff，或 serialized schedule coordination 時，用它。
+這條路的 scheduler 就是你匯出的那個 class：`wrangler` 依 `class_name` 實例化它，它的 alarm 迴圈推動每一個 tick。`PollerDO` 是 serialized driver，而且自帶排程簿記，所以它只需要一個地方放 envelope。需要精確 due timestamp 的 alarm、可動態調整的 backoff，或 serialized schedule coordination 時，用它。
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
@@ -103,7 +106,7 @@ Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 
 
 ### Alarm lifecycle
 
-`ensureStarted(namespace, instanceName?)` 會喚醒 object；目前 registry 還沒有 alarm 時，排定 immediate alarm。預設 instance name 是 `datafridge-poller`。每次 read 都呼叫是安全的，部署後也能重新啟動 alarm chain。
+`ensureStarted(namespace, instanceName?)` 會喚醒 object；目前 registry 還沒有 alarm 時，排定 immediate alarm。預設 instance name 是 `datafridge-poller`。每次 read 都呼叫是安全的，部署後也能重新啟動 alarm chain。若想讓 request path 完全不碰它，就別 await，改交給 handler 的 `ExecutionContext`：`ctx.waitUntil(ensureStarted(env.POLLER))`，或改在部署後的 hook 呼叫。
 
 每次 alarm 會：
 
@@ -119,7 +122,7 @@ Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 
 
 ## Cron Triggers：`cronPoller`
 
-`cronDriver` 不是 serialized 的，所以它需要具備 atomic claim 的 schedule plane，而 `d1` 正好提供。可接受 scheduler 最低 1 分鐘，而且希望 D1 是唯一 stateful platform component 時，用這個配對。
+這條路的 scheduler 就是你匯出的那個 handler：Cloudflare 的 cron trigger 會呼叫 `scheduled`，所以沒有東西需要自己點火，也沒有 `ensureStarted`。`cronDriver` 不是 serialized 的，所以它需要 atomic claim，而 `d1` 正好提供。可接受 scheduler 最低 1 分鐘，而且希望 D1 是唯一 stateful platform component 時，用這個配對。
 
 ```ts
 import { defineQueries } from '@datafridge/core'
@@ -160,7 +163,7 @@ database_id = "..."
 
 Cron invocation 可能重疊，因此 `cronPoller` 使用 non-serialized driver，並要求 atomic schedule store。`d1` 以 version-checked D1 update claim。只有 `results` 的非法設定會在 `cronPoller` 建構時失敗。
 
-Scheduled handler 需要取得 `RunReport` 時，可直接搭配 `createPoller` 使用 `cronDriver(ctx)`：
+想觀察每個 tick 就傳 `onRunReport`，它與 `PollerDO` 的 hook 同一份「寫 log 前先 sanitize」契約。若 handler 需要對 `RunReport` 做的事超過觀察，可直接搭配 `createPoller` 使用 `cronDriver(ctx)`：
 
 ```ts
 const poller = createPoller({
@@ -211,7 +214,7 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 
 ## 營運 checklist
 
-1. 第一次 invocation 前套用 D1 schema。
+1. 可選：套用內附的 D1 migration；不套的話第一次寫入就會建表。
 2. 把上游 credential 放入 Worker secrets。
 3. Query params 保持非機密且數量有限。
 4. 部署 Worker。以 `PollerDO` 當 scheduler 時，需呼叫一次會執行 `ensureStarted` 的 route。

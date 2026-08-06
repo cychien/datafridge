@@ -6,4 +6,4 @@ The zero-runtime-dependency engine for [datafridge](https://github.com/cychien/d
 pnpm add @datafridge/core
 ```
 
-See the [API reference](https://github.com/cychien/datafridge/blob/main/docs/api.md) and [semantic contract](https://github.com/cychien/datafridge#the-semantic-contract).
+See the [API reference](https://github.com/cychien/datafridge/blob/main/docs/api.md) and [semantic contract](https://github.com/cychien/datafridge/blob/main/docs/concepts.md#the-semantic-contract).

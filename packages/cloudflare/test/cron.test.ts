@@ -5,7 +5,7 @@ import {
   waitOnExecutionContext,
 } from 'cloudflare:test'
 import { ConfigError, createReader } from '@datafridge/core'
-import type { QueryDef, Store } from '@datafridge/core'
+import type { QueryDef, RunReport, Store } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { cronPoller } from '../src/cron.js'
@@ -88,6 +88,41 @@ describe('cronPoller config-time validation', () => {
 })
 
 describe('cron shell e2e (scheduled handler + d1)', () => {
+  it('hands each tick its RunReport through onRunReport', async () => {
+    const reports: RunReport[] = []
+    const handler = cronPoller<CronEnv>({
+      queries: [{ name: 'metrics', every: '5m', fetch: async () => 1 }],
+      store: (e) => d1(e.DB),
+      onRunReport: (report) => {
+        reports.push(report)
+      },
+    })
+
+    await invoke(handler)
+    expect(reports).toHaveLength(1)
+    expect(reports[0]!.ran).toEqual(['metrics'])
+
+    // Nothing is due on the next tick, and the hook still sees the empty report.
+    await invoke(handler)
+    expect(reports).toHaveLength(2)
+    expect(reports[1]!.ran).toEqual([])
+  })
+
+  it('absorbs a throwing onRunReport: the tick itself still counts', async () => {
+    let ticks = 0
+    const handler = cronPoller<CronEnv>({
+      queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ tick: ++ticks }) }],
+      store: (e) => d1(e.DB),
+      onRunReport: () => {
+        throw new Error('logging backend down')
+      },
+    })
+
+    await expect(invoke(handler)).resolves.toBeUndefined()
+    expect(ticks).toBe(1)
+    expect(await createReader({ store: d1(env.DB) }).read('metrics')).not.toBeNull()
+  })
+
   it('a scheduled invocation fetches due queries into D1 and reschedules them', async () => {
     let ticks = 0
     const handler = cronPoller<CronEnv>({

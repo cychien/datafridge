@@ -4,6 +4,19 @@
 
 datafridge 把慢或不穩定的 API 變成永遠即回、永遠標著年齡的本地讀取。第一次成功 refresh 後，stale-if-error 會讓它持續有資料。本頁說明支撐這個承諾的資料模型與語意。
 
+## 語意契約
+
+這六項保證就是產品本身。所有實作都必須遵守：
+
+1. **讀取永遠立即回傳。** `read()` 只存取 result store，絕不等待上游。
+2. **讀取永遠附帶時間。** 每筆結果都有 `fetchedAt`，caller 永遠知道資料年齡。
+3. **Stale-if-error。** 上游失敗時保留 last-known-good 結果並標示為 stale，不會用錯誤取代它。
+4. **At-least-once refresh。** Executor 在執行中死亡時，lease 過期後會由另一個 executor 接手。
+5. **寫回一致性。** Version 檢查會拒絕 concurrent 或 zombie executor 的遲到寫回。
+6. **Fail at config time。** 非法 duration、重複名稱、不安全的 lease、不受平台支援的 timeout，以及無法安全 claim 的 store，都會在建構時拋錯。
+
+它們就是規格本身，而不是某份規格的摘要。本頁其餘部分說明實現它們的 lease、version、backoff 與 staleness model；每個 store adapter 都必須通過 `@datafridge/core/contract-tests` 的契約相容性套件，才算正確。
+
 ## 一張圖的架構
 
 ```

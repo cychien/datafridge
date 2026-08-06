@@ -4,6 +4,19 @@ English | [繁體中文](./zh-TW/concepts.md)
 
 datafridge turns slow or unreliable APIs into local reads that are always instant and always labeled with their age. After the first successful refresh, stale-if-error keeps them populated. This page explains the data model and the semantics behind that promise.
 
+## The semantic contract
+
+These six guarantees are the product. Every implementation must uphold them:
+
+1. **Reads always return immediately.** `read()` only touches the result store and never waits on upstream.
+2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
+3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
+4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
+5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
+6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and a store that cannot claim safely throw during construction.
+
+They are the specification, not a summary of one. The rest of this page explains the lease, version, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
+
 ## Architecture in one picture
 
 ```

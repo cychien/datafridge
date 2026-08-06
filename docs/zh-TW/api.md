@@ -2,7 +2,7 @@
 
 [English](../api.md) | 繁體中文
 
-本文件描述已發布的 Wave 1 API 與已接受的 parameterized-query slice。權威保證以[六點語意契約](../../README.zh-TW.md#語意契約)為準。
+本文件描述已發布的 Wave 1 API 與已接受的 parameterized-query slice。權威保證以[六點語意契約](./concepts.md#語意契約)為準。
 
 ## `@datafridge/core`
 
@@ -176,7 +176,7 @@ Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及
 
 - `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。`PollerDO` 自帶 schedule plane，會直接把 D1 的那一半閒置。
 
-兩者都需要 `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`。超過 D1 2,000,000-byte row limit 的寫入會被拒絕，舊 envelope 保持不變。
+它會在第一次寫入前自己建表，所以 `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` 是可選的；暖 isolate 底下表被刪掉時會重建並重試一次。讀取路徑從不建表 - 還不存在的 result table 讀起來就是 `null`。超過 D1 2,000,000-byte row limit 的寫入會被拒絕，舊資料保持不變。
 
 ### Cron Triggers
 
@@ -192,16 +192,16 @@ export default {
 }
 ```
 
-它會在 module 建構時驗證 query registry、timeout ceiling 與 schedule-plane shape。需要直接呼叫 `createPoller` 並取得 `RunReport` 時，可使用 lower-level non-serialized `cronDriver(ctx)`。
+`onRunReport` 與 `PollerDO` 的 hook 同一份契約：寫 log 前先 sanitize，而拋錯的 hook 會被吸收，不會讓該次 tick 失敗。它會在 module 建構時驗證 query registry、timeout ceiling 與 store shape。需要直接呼叫 `createPoller` 並取得 `RunReport` 時，可使用 lower-level non-serialized `cronDriver(ctx)`。
 
 ### Init CLI
 
 Package 會安裝 `datafridge` binary：
 
 ```sh
-pnpm exec datafridge init cloudflare [--config wrangler.toml]
+pnpm exec datafridge init --scheduler <durable-object|cron> --store <d1> [--config wrangler.toml]
 ```
 
-它會加入 Durable Object binding 與 migration、每分鐘 Cron Trigger，以及 D1 binding。既有 declarations 會保留。CLI 只編輯 TOML，若旁邊有 `wrangler.json` 或 `wrangler.jsonc`，則拒絕建立衝突的 TOML file。
+兩個 flag 都是必填：沒有預設配對，而且只會寫出所選組合需要的 declarations - `durable-object` 寫 Durable Object binding 與它的 SQLite class migration，`cron` 寫每分鐘的 `[triggers]`，兩者都加上 D1 binding。既有 declarations 會保留。CLI 只編輯 TOML，若旁邊有 `wrangler.json` 或 `wrangler.jsonc`，則拒絕建立衝突的 TOML file。
 
 完整部署流程見 [Cloudflare 設定與營運](./cloudflare.md)。

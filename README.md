@@ -18,23 +18,15 @@
   /></a>
 </p>
 
-<h3 align="center">Data always on hand. Never at the vendor's mercy.</h3>
+<h3 align="center">Data always on hand, reliable even when the source is not</h3>
 
 <p align="center"><strong>English</strong> · <a href="./README.zh-TW.md">繁體中文</a></p>
 
-When your system depends on third-party data, the third party's bad day looks like your bad day. Their API is what wobbles, and your product is what gets called unreliable.
+When our system depends on third-party data, an unstable source easily makes our own system look unreliable.
 
-That instability has a few shapes: slow responses, data that is sometimes simply not there, and rate limits you hit as soon as traffic grows or calls get frequent. Leave them unhandled and what the user sees is numbers that fail to load - and you are the one they complain to.
+That instability comes as slow responses, data that is sometimes simply not there, rate limits you hit as soon as usage grows or calls get frequent. Once users run into that and our system has not handled it, we are the ones they complain to.
 
 datafridge handles it for you. You register a query once and configure a scheduler, a result store, and metadata such as the refresh interval and rate limits. From then on the scheduler writes the latest third-party data into your own database in the background.
-
-Your request handler does one local read, which costs the same whether the upstream is fast, slow, throttled, or gone. Cache libraries like `bentocache` or `cachified` are request-triggered. Their stale-while-revalidate modes do spare the reader while an entry is still warm, but a refresh only ever happens because somebody asked: an entry nobody reads goes cold, and a cold or fully expired one makes that caller wait. datafridge refreshes on a schedule, so no reader is ever the one warming it up.
-
-- **Reads do not wait on upstream.** `read()` touches your result store and nothing else. There is no cold-start request that pays the latency for everyone else.
-- **Every read is dated.** `fetchedAt`, `age`, and `isStale` come back with the data, so you decide what "too old" means instead of guessing.
-- **The vendor's outage is not your outage.** A failed refresh keeps the last good value and records the error next to it. The page keeps rendering.
-- **The rate limit is a config field.** Group queries by `source`, cap how many run per tick, and that ceiling holds no matter how many queries you register.
-- **Bad config throws at construction, not at 3 a.m.** A timeout longer than its lease, a duplicate name, a scheduler with nowhere safe to keep its bookkeeping: all of it fails when you build the poller.
 
 ```
    scheduler tick (Durable Object alarm, or cron)
@@ -46,27 +38,27 @@ Your request handler does one local read, which costs the same whether the upstr
           │ { data, fetchedAt }        on failure: keep the last good value,
           ▼                            record the error, retry with backoff
    ┌─────────────────────────────────────────────┐
-   │ your store (D1)                             │
+   │ your store                                  │
    └──────┬──────────────────────────────────────┘
           │ read() - one local query, never waits on upstream
           ▼
    { data, fetchedAt, isStale, age }
 ```
 
-`@datafridge/core` is the engine: pure logic, an injected clock, and zero runtime dependencies. `@datafridge/cloudflare` is the adapter package that runs it on Durable Object alarms, Cron Triggers, and D1. Fetchers are always your code - datafridge never talks to a vendor on your behalf.
+`@datafridge/core` is the engine: pure logic, zero runtime dependencies. `@datafridge/cloudflare` is the adapter package that lets it use Cloudflare infrastructure such as Durable Object alarms, Cron Triggers, or D1.
 
 ## Install
 
 ```sh
-pnpm add @datafridge/core @datafridge/cloudflare
-# or: npm install @datafridge/core @datafridge/cloudflare
+npm install @datafridge/core @datafridge/cloudflare
+# or: pnpm add @datafridge/core @datafridge/cloudflare
 ```
 
-Both packages are ESM-only and need Node.js 20 or newer for tooling. Worker code runs on Cloudflare's Workers runtime.
+Both packages are ESM-only and need Node.js 20 or newer for tooling.
 
-## Configuration is one array
+## Defining queries
 
-A query is a name, an interval, and a function that fetches. That is the entire configuration surface:
+Define what you want polled:
 
 ```ts
 import { defineQueries } from '@datafridge/core'
@@ -74,6 +66,9 @@ import { defineQueries } from '@datafridge/core'
 const queries = defineQueries([
   {
     name: 'weekly-summary',
+    timeout: '30s',            // optional, defaults to 30s; aborts the fetch when it runs out
+    lease: '1m',               // optional, defaults to timeout + 30s
+    source: 'default',         // optional, defaults to 'default'; the rate-limit group
     every: '10m',
     fetch: async ({ signal }) => {
       const response = await fetch('https://api.example.com/weekly-summary', { signal })
@@ -83,10 +78,6 @@ const queries = defineQueries([
   },
 ])
 ```
-
-`every` accepts `'30s'`, `'10m'`, `'1h'`, `'1d'`, or a millisecond number. `signal` aborts at the timeout (30 seconds by default), so a hung upstream cannot hold a slot forever. Throw from `fetch` and stale-if-error takes over.
-
-Optional per query: `timeout`, `lease`, and `source`. Everything from here on is wiring that array to a scheduler and a store.
 
 ## Wiring a scheduler and a store
 
@@ -101,7 +92,22 @@ Who fetches on a timer, and where the data goes.
 
 - `d1(env.DB)` - your D1.
 
-Either side mixes freely with the other, and either can be your own implementation. A combination that cannot schedule safely is refused when you build the poller.
+Either side mixes freely with the other, and either can be your own implementation.
+
+## Initialization
+
+`datafridge init` writes the declarations your pieces need and prints whatever it could not fill in for you. You name the scheduler and the store, and it writes only that combination.
+
+```sh
+npx --no-install datafridge init --scheduler durable-object --store d1
+# or: --scheduler cron --store d1
+```
+
+It is idempotent and never rewrites configuration you already have.
+
+There is no migration to run first: a store creates the storage it needs before its first write. Anything left that is specific to your platform - a database to create, a binding to name - is in that platform's guide.
+
+Schedulers: `durable-object`, `cron`. Stores: `d1`. Platform guides: [Cloudflare](./docs/cloudflare.md).
 
 ## A complete example
 
@@ -143,19 +149,15 @@ export default {
 }
 ```
 
-The Durable Object is the scheduler: it wakes itself with alarms, runs each tick's due queries without ever overlapping two ticks, and keeps its schedule bookkeeping in its own SQLite. Envelopes go to your D1. The read itself goes straight to D1 and never touches the Durable Object - no scheduler, no lock, and no coordinator sits between your handler and the row.
+The Durable Object is the scheduler and `ensureStarted()` lights it - without that call nothing ever ticks. Reads go straight to D1 and never touch the Durable Object.
 
-`ensureStarted()` is a cheap idempotent RPC, and it is the one Durable Object hop in the sample above. It lights the alarm chain the first time and re-lights it after a deploy, so awaiting it on a read route is fine. To keep the request path clear of it entirely, hand it to the handler's `ExecutionContext` instead of awaiting it - `ctx.waitUntil(ensureStarted(env.POLLER))` - or call it from a post-deploy hook. It also notices a changed registry: the next tick creates rows for queries you added and drops both the row and the envelope for queries you deleted.
+The very first read returns `null`, because nothing has been fetched yet.
 
-The very first read returns `null`, because nothing has been fetched yet. Every read after the first successful refresh returns data.
-
-The infrastructure this Worker needs - the `wrangler` declarations, the `datafridge init` scaffold, the packaged D1 schema, the Cron Trigger setup, and the operational checklist - is in [docs/cloudflare.md](./docs/cloudflare.md).
-
-[`examples/cloudflare-basic`](./examples/cloudflare-basic) is this setup as a runnable app, polling a deliberately slow fake API under `wrangler dev`.
+[`examples/cloudflare-basic`](./examples/cloudflare-basic) is this as a runnable app, polling a deliberately slow fake API under `wrangler dev`.
 
 ## Reading a result
 
-A reader needs nothing but a result store. It has no fetchers and no schedule, so you can put one in a different Worker, a different service, or no TypeScript at all - envelopes are plain JSON rows.
+A reader needs nothing but a result store. It has no fetchers and no schedule, so you can put one in a different Worker, a different service, or no TypeScript at all - what is stored is a plain JSON row.
 
 ```ts
 const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-summary')
@@ -168,26 +170,22 @@ const result = await createReader({ store: d1(env.DB) }).read<Summary>('weekly-s
 - `fetchedAt` is when the data was actually fetched, in epoch milliseconds.
 - `age` is how old it is right now, so you can apply your own threshold ("show a warning past two hours").
 - `isStale` is `true` once `age` exceeds the query's `every`. It is a label, never a block: stale data is served immediately, exactly like fresh data.
-- `null` means there is no envelope under that key. Usually that is the first successful refresh not having landed yet, but a misspelled name or a params object no variant was registered with also reads as `null`, because a reader holds no registry to check the name against.
+- `null` means there is nothing stored under that key. Usually that is the first successful refresh not having landed yet, but a misspelled name or a params object no variant was registered with also reads as `null`, because a reader holds no registry to check the name against.
 
 If you already have a poller in the same process, use `poller.read(name, options)` instead - it reads the same store and additionally rejects names outside the registry.
 
 ## When the upstream fails
 
-Nothing is thrown away. A failed refresh keeps the previous envelope, attaches `lastError` to it, and reschedules with jittered exponential backoff: `min(every, 1m * 2^(failCount - 1))`. The cap is `every`, because retrying slower than the normal interval helps nobody. One success clears the counter.
+Nothing is thrown away. A failed refresh keeps the previously cached result, attaches `lastError` to it, and reschedules with jittered exponential backoff: `min(every, 1m * 2^(failCount - 1))`. The cap is `every`, because retrying slower than the normal interval helps nobody. One success clears the counter.
 
 | What happened | What the scheduler does | What `read()` returns |
 |---|---|---|
-| Upstream error or timeout | Count the failure, back off, keep the old envelope | Old data, `isStale`, `lastError` |
+| Upstream error or timeout | Count the failure, back off, keep the old result | Old data, `isStale`, `lastError` |
 | Executor died mid-fetch | Another tick re-claims it after the lease expires | Old data, `isStale` |
 | A zombie writes back late | Version mismatch, write rejected | Unaffected |
 | Squeezed out by a source budget | Stays due, rises in priority next tick | Old data, slightly older |
 | Failing for hours | Backoff converges at `every`, last-known-good kept forever | Old data, `lastError` |
 | Never fetched successfully | Keeps trying on schedule | `null` |
-
-Three independent gates make this work: `nextRunAt` decides whether a query should run, the lease decides who is running it, and the version decides whose result counts. Slow fetches, crashed executors, and zombie writes each break through one gate and get caught by the next.
-
-Each tick returns a `RunReport` of `{ ran, skippedLeased, deferredBudget, failed }`. Override `onRunReport(report)` on your `PollerDO` subclass to log it - counts and allowlisted names only, since error messages come from your fetchers and may carry upstream detail.
 
 ## Preset variants of one query
 
@@ -209,9 +207,7 @@ const queries = defineQueries([courseAnalytics])
 const result = await reader.read('course-analytics', { courseId: 'course-a', window: '30d' })
 ```
 
-Every variant becomes an ordinary independent registry entry with its own schedule, lease, backoff, failure count, and envelope. Adding or removing a variant reconciles exactly like adding or removing a named query.
-
-Params are identity, not storage. They are snapshotted at construction, must be finite JSON (object key order does not matter), and are hashed into a `@df/v1/<base-name>/<sha256>` storage key - so raw parameter values never appear in D1 keys or in a `RunReport`. Never put a credential in one; bindings and fetcher closures are where secrets belong.
+Every variant becomes an ordinary independent registry entry with its own schedule, lease, backoff, failure count, and stored result. Adding or removing a variant reconciles exactly like adding or removing a named query.
 
 Only variants in the finite registry are scheduled and readable. Arbitrary on-demand variants are not created at read time.
 
@@ -229,38 +225,9 @@ export default {
 }
 ```
 
-The same `sources` field works as a property on a `PollerDO` subclass. It is stateless, so it stays correct across concurrent executors, and it gives a hard ceiling: upstream calls can never exceed `maxPerTick × tick frequency`, however many queries you register. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+However many queries you register, upstream calls can never exceed `maxPerTick × tick frequency`. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
 
 Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
-
-## The semantic contract
-
-These six guarantees are the product. Every implementation must uphold them:
-
-1. **Reads always return immediately.** `read()` only touches the result store and never waits on upstream.
-2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
-3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
-4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
-5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
-6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and an unresolved schedule plane throw during construction.
-
-They are the specification, not a summary of one. [docs/concepts.md](./docs/concepts.md) explains the lease, version, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
-
-## What datafridge is not
-
-- **Not an API connector.** Fetchers are your code, always. There are no vendor integrations to keep up to date.
-- **Not a proxy.** Only queries you registered by name are served. Nothing is fetched because someone asked for it.
-- **Not a dashboard or a config DSL.** The config is code, in your repo, typechecked.
-- **Not request-triggered caching.** Refresh happens on schedule whether or not anybody reads.
-
-Not in 1.0 (the docs call the shipped scope Wave 1):
-
-- Node timer, Redis, SQLite, or Postgres adapters
-- Unbounded, on-demand, or arbitrary custom-range variants outside the finite registry
-- Precise shared quota-window accounting
-- Metrics exporters and dashboards
-- QStash or Inngest provisioning drivers
-- A documentation website
 
 ## Documentation
 
@@ -269,7 +236,6 @@ Not in 1.0 (the docs call the shipped scope Wave 1):
 - [Cloudflare setup and operations](./docs/cloudflare.md)
 - [Rate limiting](./docs/rate-limiting.md)
 - [Writing adapters](./docs/writing-adapters.md)
-- [Release process and package names](./docs/releasing.md)
 - [Runnable Cloudflare example](./examples/cloudflare-basic)
 
 ## License

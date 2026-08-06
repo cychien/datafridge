@@ -1,5 +1,5 @@
 import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
-import type { Driver, QueryDefinition, SourceBudget, Store } from '@datafridge/core'
+import type { Driver, QueryDefinition, RunReport, SourceBudget, Store } from '@datafridge/core'
 import { assertTimeoutsFitInvocation } from './limits.js'
 
 /**
@@ -15,6 +15,12 @@ export interface CronPollerConfig<Env> {
   queries: Queries | readonly QueryDefinition[]
   store: (env: Env) => Store
   sources?: Record<string, SourceBudget>
+  /**
+   * Operational hook after each tick. Do not log payloads or error details:
+   * they come from application fetchers. A throwing hook is absorbed so one
+   * bad log line cannot fail the invocation.
+   */
+  onRunReport?: (report: RunReport) => void | Promise<void>
 }
 
 export type CronScheduledHandler<Env> = (
@@ -40,11 +46,18 @@ export function cronPoller<Env>(config: CronPollerConfig<Env>): CronScheduledHan
     throw new ConfigError('cronPoller requires a store: pass store: (env) => d1(env.DB)')
   }
   return async (_controller, env, ctx) => {
-    await createPoller({
+    const report = await createPoller({
       queries,
       driver: cronDriver(ctx),
       store: config.store(env),
       ...(config.sources ? { sources: config.sources } : {}),
     }).runDue()
+    if (!config.onRunReport) return
+    try {
+      await config.onRunReport(report)
+    } catch {
+      // Error objects from application hooks can contain secrets.
+      console.error('datafridge: onRunReport failed; the tick itself succeeded')
+    }
   }
 }

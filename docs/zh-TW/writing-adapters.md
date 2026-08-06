@@ -30,6 +30,10 @@ interface Store {
 
 一個 store 同時持有兩個半邊。應用程式只會遇到這一個 interface。
 
+**store 必須自己建立它需要的儲存空間。** 在第一次寫入前，它得自己套用需要的 table、key 或 collection，這樣任何 adapter 都不會丟一個「使用者要記得跑」的 migration 出來。使用者手動套用等價 schema 時必須是 no-op；儲存空間在暖 process 底下消失時，必須重建並重試，而不是一路失敗到那個 process 被回收；而 `readResult` 必須維持單純讀取：還不存在的儲存空間讀起來就是 `null`，和空的完全一樣。`@datafridge/cloudflare` 的 `test/schema.test.ts` 是可以照抄的參考測試 - 契約套件無法強制這一點，因為準備後端的正是套件的 factory。
+
+這條義務就是 `datafridge init <平台>` 在每個平台上都一樣小的原因。
+
 兩個半邊的一致性需求仍然不同，而且已出貨的程式碼裡就有一個例子證明這點：有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半。`PollerDO` 正是如此 - 它的簿記放在 Durable Object 自己的 SQLite，envelope 則寫進你交給它的 store。`SchedulePlane` 屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
 
 ## 能力矩陣

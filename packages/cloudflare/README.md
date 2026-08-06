@@ -1,6 +1,6 @@
 # @datafridge/cloudflare
 
-Cloudflare adapters for [datafridge](https://github.com/cychien/datafridge): Durable Object alarms, D1 result and schedule stores, Cron Triggers, migrations, and the `datafridge init cloudflare` CLI.
+Cloudflare adapters for [datafridge](https://github.com/cychien/datafridge): Durable Object alarms, D1 result and schedule stores, Cron Triggers, migrations, and the `datafridge init` CLI.
 
 ```sh
 pnpm add @datafridge/core @datafridge/cloudflare

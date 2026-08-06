@@ -2,7 +2,7 @@
 
 English | [繁體中文](./zh-TW/api.md)
 
-This document describes the shipped Wave 1 API. The [six-guarantee semantic contract](../README.md#the-semantic-contract) is authoritative.
+This document describes the shipped Wave 1 API. The [six-guarantee semantic contract](./concepts.md#the-semantic-contract) is authoritative.
 
 ## `@datafridge/core`
 
@@ -177,7 +177,7 @@ The registry, source budgets, and Cloudflare timeout ceiling are validated when 
 
 - `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `PollerDO` carries its own schedule plane and simply leaves D1's unused.
 
-It requires the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
+It applies its own tables before the first write, so the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` is optional; a dropped table under a warm isolate is repaired and retried once. The read path never applies schema - a result table that does not exist yet reads as `null`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
 
 ### Cron Triggers
 
@@ -189,20 +189,21 @@ export default {
     queries,
     store: (env) => d1(env.DB),
     sources: { analytics: { maxPerTick: 2 } },
+    onRunReport: (report) => logSanitized(report),
   }),
 }
 ```
 
-It validates the query registry, timeout ceiling, and schedule-plane shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createPoller` directly and consume its `RunReport`.
+`onRunReport` carries the same contract as the `PollerDO` hook: sanitize before logging, and a throwing hook is absorbed so it cannot fail the tick. It validates the query registry, timeout ceiling, and store shape at module construction. `cronDriver(ctx)` is the lower-level non-serialized driver for applications that need to call `createPoller` directly and consume its `RunReport`.
 
 ### Init CLI
 
 The package installs a `datafridge` binary:
 
 ```sh
-pnpm exec datafridge init cloudflare [--config wrangler.toml]
+pnpm exec datafridge init --scheduler <durable-object|cron> --store <d1> [--config wrangler.toml]
 ```
 
-It adds the Durable Object binding and migration, a one-minute Cron Trigger, and a D1 binding. Existing declarations are preserved. The CLI only edits TOML and refuses to create a conflicting TOML file beside `wrangler.json` or `wrangler.jsonc`.
+Both flags are required: there is no default pairing, and only the selected combination's declarations are written. Existing declarations are preserved. The CLI only edits TOML and refuses to create a conflicting TOML file beside `wrangler.json` or `wrangler.jsonc`.
 
 See [Cloudflare setup and operations](./cloudflare.md) for the full deployment sequence.
