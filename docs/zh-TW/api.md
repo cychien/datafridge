@@ -170,7 +170,7 @@ class Poller extends PollerDO<Env> {
 
 `ensureStarted(namespace, instanceName?)` 會 idempotently 啟動一個具名 `PollerDO` instance。預設 instance name 是 `datafridge-poller`。
 
-Registry 與 Cloudflare timeout ceiling 會在 object 啟動及每次 alarm 前驗證。`timeout` 必須短於 15 分鐘。
+Registry、source budgets 與 Cloudflare timeout ceiling 會在 object 啟動及每次 alarm 前驗證。`timeout` 必須短於 15 分鐘，每個 `maxPerTick` 必須是正整數。
 
 ### D1 stores
 

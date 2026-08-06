@@ -186,7 +186,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 ## 建構時驗證
 
 - `defineQueries` 驗證 names、durations、fetchers、duplicate variants 與 `timeout < lease`。
-- `PollerDO` 在啟動與每次 alarm 前驗證 registry 與 Cloudflare wall-clock ceiling。
+- `PollerDO` 在啟動與每次 alarm 前驗證 registry、source budgets 與 Cloudflare wall-clock ceiling。
 - `cronPoller` 在建構時驗證 registry、store-factory shape、schedule-plane resolution 與 wall-clock ceiling。
 - Cloudflare query timeout 必須短於 15 分鐘。
 - Source budget 必須是正整數。

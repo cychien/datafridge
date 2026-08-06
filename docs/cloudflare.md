@@ -186,7 +186,7 @@ Do not combine Cron Triggers with `d1Results` alone. It has no schedule plane, a
 ## Construction-time validation
 
 - `defineQueries` validates names, durations, fetchers, duplicate variants, and `timeout < lease`.
-- `PollerDO` validates its registry and the Cloudflare wall-clock ceiling during ignition and before alarms.
+- `PollerDO` validates its registry, source budgets, and the Cloudflare wall-clock ceiling during ignition and before alarms.
 - `cronPoller` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
 - Source budgets must be positive integers.

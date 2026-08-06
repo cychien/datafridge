@@ -171,7 +171,7 @@ class Poller extends PollerDO<Env> {
 
 `ensureStarted(namespace, instanceName?)` idempotently ignites one named `PollerDO` instance. The default instance name is `datafridge-poller`.
 
-The registry and Cloudflare timeout ceiling are validated when the object is ignited and before every alarm run. `timeout` must be shorter than 15 minutes.
+The registry, source budgets, and Cloudflare timeout ceiling are validated when the object is ignited and before every alarm run. `timeout` must be shorter than 15 minutes, and every `maxPerTick` must be a positive integer.
 
 ### D1 stores
 
