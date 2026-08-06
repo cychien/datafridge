@@ -1,5 +1,5 @@
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test'
-import { createReader, defineParameterizedQuery, queryKey } from '@datafridge/core'
+import { createReader, defineParameterizedQuery, queryKey, variantBaseOf } from '@datafridge/core'
 import type { QueryDef, QueryDefinition } from '@datafridge/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -78,6 +78,38 @@ beforeEach(async () => {
 })
 
 describe('PollerDO alarm loop', () => {
+  it('drives dynamic variants: rows come from the table, and the alarm covers them', async () => {
+    const stub = pollerStub('dynamic')
+    const dynamicDef = defineParameterizedQuery({
+      name: 'per-course',
+      every: '1m',
+      variants: async () => [{ courseId: 'alpha' }],
+      fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
+    })
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestPoller).queries = [dynamicDef]
+    })
+    await stub.ensureStarted()
+
+    await vi.waitFor(
+      async () => {
+        const rows = await scheduleRows(stub)
+        expect(rows.map((r) => variantBaseOf(r.name))).toEqual(['per-course'])
+        expect(rows[0]!.next_run_at).toBeGreaterThan(Date.now())
+      },
+      { timeout: 5_000 },
+    )
+
+    const withRegistry = createReader({ store: d1(env.DB), queries: [dynamicDef] })
+    const read = await withRegistry.read<{ course: string }>('per-course', { courseId: 'alpha' })
+    expect(read).not.toBeNull()
+    expect(read!.data).toEqual({ course: 'alpha' })
+
+    // The next alarm exists and points at the dynamic row.
+    const alarm = await currentAlarm(stub)
+    expect(alarm).not.toBeNull()
+  })
+
   it('runs due queries, lands envelopes in D1, and re-sets the alarm to min(nextRunAt)', async () => {
     const stub = pollerStub('due')
     await configure(stub, [counting('alpha', '1m'), counting('beta', '5m')])

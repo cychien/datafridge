@@ -116,7 +116,7 @@ Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 
 4. 呼叫 `onRunReport(report)`。
 5. 在 `finally` 排定下一個 alarm，即使 reconcile、storage 或 report hook 失敗也一樣。
 
-有限 parameter variants 改變時，從 `queries` getter 回傳重新建構的 registry。新增 variant 會建立 row；移除 variant 會刪除 row 與 envelope。詳見 [parameterized API](./api.md#parameterized-queries)。
+Variant 清單會在執行期改變時，把它宣告成函式 - 每次 alarm 都會重新解析，而且可以是 async。新增 variant 會建立 row；移除 variant 會刪除 row 與 envelope。詳見 [parameterized API](./api.md#parameterized-queries)。
 
 `onRunReport` 用於 operational evidence，不是 payload logging。建議只記錄 category count 或 allowlisted identity。Error message 來自 application fetcher，可能含有 sensitive data，寫 log 前必須 sanitize。
 

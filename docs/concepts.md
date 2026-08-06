@@ -50,6 +50,7 @@ interface Envelope<T> {
   data: T
   fetchedAt: number            // epoch ms
   freshUntil: number           // fetchedAt + every; after this, isStale = true
+  validUntil?: number          // the data's own expiry; past it, status = 'invalid'
   lastError?: { at: number; message: string; count: number }
 }
 ```

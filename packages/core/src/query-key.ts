@@ -20,6 +20,19 @@ export function queryKey(name: string, params?: QueryParams): string {
   return `${VARIANT_KEY_PREFIX}${encodeURIComponent(name)}/${sha256(canonicalJson(params))}`
 }
 
+/** The base name a variant storage key was minted from, or undefined for fixed names. */
+export function variantBaseOf(key: string): string | undefined {
+  if (!key.startsWith(VARIANT_KEY_PREFIX)) return undefined
+  const rest = key.slice(VARIANT_KEY_PREFIX.length)
+  const slash = rest.lastIndexOf('/')
+  if (slash <= 0) return undefined
+  try {
+    return decodeURIComponent(rest.slice(0, slash))
+  } catch {
+    return undefined
+  }
+}
+
 export function snapshotQueryParams(params: QueryParams): QueryParams {
   return deepFreeze(JSON.parse(canonicalJson(params)) as QueryParams)
 }

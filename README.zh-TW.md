@@ -178,7 +178,7 @@ const result = await reader.read<Summary>('weekly-summary')
 
 ## 同一個 query 的 preset variants
 
-當同一個 fetch 適用於一組有限、且在部署時就已知的維度（course ID、preset 時間窗），宣告一次就好，不必自己寫迴圈：
+當同一個 fetch 適用於一組有限的維度（course ID、preset 時間窗），宣告一次就好，不必自己寫迴圈。陣列在建構時展開；函式每個 tick 重新解析、可以是 async，清單放在你的資料庫裡也行：
 
 ```ts
 import { defineParameterizedQuery, defineQueries } from '@datafridge/core'

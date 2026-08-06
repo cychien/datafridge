@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { ConfigError, createPoller, defineQueries, Queries } from '@datafridge/core'
+import { ConfigError, createPoller, defineQueries, Queries, variantBaseOf } from '@datafridge/core'
 import type {
   QueryDefinition,
   RunReport,
@@ -125,11 +125,12 @@ function validateSourceBudgets(sources: Record<string, SourceBudget> | undefined
 }
 
 function registrySignature(queries: Queries): string {
-  return JSON.stringify(
-    queries.all
-      .map((q) => [q.name, q.everyMs])
-      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
-  )
+  const names = (entries: Array<[string, number]>) =>
+    entries.sort((a, b) => a[0].localeCompare(b[0]))
+  return JSON.stringify([
+    names(queries.all.map((q) => [q.name, q.everyMs])),
+    names(queries.dynamic.map((d) => [d.baseName, d.everyMs])),
+  ])
 }
 
 /**
@@ -168,7 +169,11 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
     const signature = registrySignature(queries)
     const upToDate = this.#readMeta(REGISTRY_META_KEY) === signature
     if (upToDate && (await this.ctx.storage.getAlarm()) !== null) return
-    if (queries.all.length === 0 && this.#scheduleRowCount() === 0) {
+    if (
+      queries.all.length === 0 &&
+      queries.dynamic.length === 0 &&
+      this.#scheduleRowCount() === 0
+    ) {
       this.#writeMeta(REGISTRY_META_KEY, signature)
       return
     }
@@ -210,16 +215,38 @@ export abstract class PollerDO<Env = unknown> extends DurableObject<Env> {
 
   async #scheduleNextAlarm(queries: Queries): Promise<void> {
     const now = Date.now()
+    const rows = this.ctx.storage.sql
+      .exec<{
+        name: string
+        next_run_at: number
+      }>('SELECT name, next_run_at FROM datafridge_schedule')
+      .toArray()
+    const byName = new Map(rows.map((row) => [row.name, row.next_run_at]))
+
     let next: number | null = null
-    for (const query of queries.all) {
-      const record = this.ctx.storage.sql
-        .exec<{
-          next_run_at: number
-        }>('SELECT next_run_at FROM datafridge_schedule WHERE name = ?', query.name)
-        .toArray()[0]
-      const at = record ? record.next_run_at : now
+    const consider = (at: number): void => {
       next = next === null ? at : Math.min(next, at)
     }
+    for (const query of queries.all) consider(byName.get(query.name) ?? now)
+
+    if (queries.dynamic.length > 0) {
+      // Dynamic variants exist only as rows, so the alarm has to come from the
+      // table; a base with no rows yet (or whose resolution keeps failing)
+      // still gets one, so resolution is retried on its own cadence.
+      const bases = new Set(queries.dynamic.map((entry) => entry.baseName))
+      const covered = new Set<string>()
+      for (const row of rows) {
+        const base = variantBaseOf(row.name)
+        if (base !== undefined && bases.has(base)) {
+          consider(row.next_run_at)
+          covered.add(base)
+        }
+      }
+      for (const entry of queries.dynamic) {
+        if (!covered.has(entry.baseName)) consider(now + entry.everyMs)
+      }
+    }
+
     if (next === null) return
     await this.ctx.storage.setAlarm(Math.max(next, now + MIN_ALARM_DELAY_MS))
   }

@@ -116,7 +116,7 @@ Every alarm:
 4. Calls `onRunReport(report)`.
 5. Schedules the next alarm in `finally`, even if reconciliation, storage, or the report hook fails.
 
-For changing finite parameter variants, return a newly constructed registry from a `queries` getter. Added variants get new rows; removed variants lose both their row and envelope. See the [parameterized API](./api.md#parameterized-queries).
+For a variant list that changes at runtime, declare it as a function - it is resolved at every alarm, and may be async. Added variants get new rows; removed variants lose both their row and envelope. See the [parameterized API](./api.md#parameterized-queries).
 
 `onRunReport` is for operational evidence, not payload logging. Prefer category counts or allowlisted identities. Error messages originate in application fetchers and may be sensitive, so sanitize them before logging.
 

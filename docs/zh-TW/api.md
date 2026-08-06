@@ -29,26 +29,50 @@ Non-array registry、空白或重複名稱、缺少 fetcher、非法 duration，
 - `now`：tick 的 epoch milliseconds timestamp
 - `attempt`：目前連續失敗次數加一
 
+另外兩個選填欄位決定存進去的東西長什麼樣：
+
+```ts
+{
+  name: 'lesson-engagement',
+  every: '15m',
+  codec: {
+    encode: (v) => ({ rows: [...v.byPath] }),
+    decode: (raw) => ({ byPath: new Map(raw.rows) }),
+  },
+  validUntil: ({ now }) => endOfTodayUtc(now),
+  fetch: ...,
+}
+```
+
+`codec` 在寫入時把抓到的值轉成純 JSON、讀出時轉回來，存 `Map`、`Set`、`Date` 不再需要手寫的中間型別。存的 row 依然是純 JSON - 任何語言都讀得動 - 只有持有 registry 的 reader 會 decode；裸 reader 看到的是編碼後的形式。`encode` 拋錯視為一次 fetch 失敗，保留前一筆結果。
+
+`validUntil` 給那種自己會過期的資料用：「今天的流量」到了午夜就不再是今天的，不管它多新。它回傳那個邊界（epoch ms，收得到 `params` 與 `now`）；邊界存在結果上，過了邊界的讀取回報 `status: 'invalid'` 但照樣給資料，而 scheduler 會在邊界重抓、而不是等完整個週期 - `nextRunAt` 變成 `min(完成時間 + every, validUntil)`。以年齡計的新鮮度（`isStale`）和時間窗的有效性是兩條獨立的軸。
+
 ### Parameterized queries
 
-已接受的 Wave 2 slice 讓有限的 runtime variants 共用同一份 definition：
+一份 definition 涵蓋一組有限的 variants：
 
 ```ts
 const analytics = defineParameterizedQuery({
   name: 'course-analytics',
   every: '10m',
-  variants: () => courseIds.flatMap((courseId) =>
-    ['7d', '30d'].map((window) => ({ courseId, window })),
-  ),
+  dimensions: {
+    window: ['7d', '30d'],
+    courseId: async () => listCourseIds(db),
+  },
   fetch: ({ params, signal }) => fetchAnalytics(params, { signal }),
 })
 
 const queries = defineQueries([analytics])
 ```
 
-`variants` 可以是 array，或回傳 array 的 synchronous function。每次 `defineQueries` 建構 registry 時都會求值。有限 runtime set 改變時，`PollerDO` 可從 `queries` getter 回傳重新建構的 registry。每個 variant 都有獨立的 schedule row、lease、failure count、backoff 與 result envelope。一般 registry reconcile 會建立新增的 variants，並刪除移除的 variants 與 envelopes。
+`dimensions` 展開成各項的笛卡兒積，每個 dimension 是 params 的一個欄位；`variants` 則直接列出 params 物件。兩者擇一。無論哪種，每個 variant 都有獨立的 schedule row、lease、failure count、backoff 與 result envelope。
 
-Params 必須是由有限數字、字串、boolean、null、array 與 plain object 組成的 JSON value。Hash 前會排序 object keys。Cycle、class instance、`undefined` 與非有限數字會在 registry 建構時失敗。Canonical params 相同時會視為 duplicate variant。
+**陣列是靜態的，函式是動態的。** 陣列在建構時展開一次。函式 - 不論是 `variants` 本身，或任何一個 dimension - 在每個 tick 重新解析、可以是 async，清單活在資料庫裡時就用它。Reconcile 會替新出現的 variant 建 row，替離開的 variant 刪掉 row 與結果。解析拋錯時什麼都不會被刪：該 base 保留手上已有的一切，失敗記進那個 tick 的 `RunReport`，名字是 base name。
+
+讀取 dynamic variant 刻意不對稱：已存的結果直接回、不查清單；只有 miss 才解析 - 為了抓一個成員，或拒絕不是成員的 params。
+
+Params 必須是由有限數字、字串、boolean、null、array 與 plain object 組成的 JSON value。Hash 前會排序 object keys。Cycle、class instance、`undefined` 與非有限數字會在 variant 展開時被拒絕。Canonical params 相同視為 duplicate variant - 靜態清單在建構時擋下，動態清單則成為那個 tick 的失敗。
 
 `queryKey(name, params?)` 是穩定的 storage identity function。Fixed name 保持不變。Variant identity 使用保留的 `@df/v1/` namespace、encoded public base name，以及 canonical params 的 SHA-256。Raw params 不會出現在 schedule rows、D1 keys 或 `RunReport`。不要把 credential、token 或 private payload 放入 params。Secret 應放在 binding 或 fetcher closure。
 
@@ -99,7 +123,7 @@ await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
 })
 ```
 
-結果 stale 時，`swrRefresh` 會收到一個刷新 promise，而 read 不會等它。Miss 不需要這種交接：讀取自己會去抓。那個 promise 受排程節制：query 沒到期時它什麼都不做，所以流量無法超越失敗上游的 backoff；lease 則讓併發刷新只產生一次上游呼叫。
+結果 stale 或時間窗已過時，`swrRefresh` 會收到一個刷新 promise，而 read 不會等它。Miss 不需要這種交接：讀取自己會去抓。那個 promise 受排程節制：query 沒到期時它什麼都不做，所以流量無法超越失敗上游的 backoff；lease 則讓併發刷新只產生一次上游呼叫。
 
 完全沒有資料的讀取會等第一筆結果，最多等該 query 自己的 `timeout` 那麼久。沒有東西要設定：一個 query，一個「最多多久」的答案。已經有結果時（不論 stale）一律立刻回傳。
 
@@ -128,6 +152,8 @@ interface ReadResult<T> {
   fetchedAt: number
   isStale: boolean
   age: number
+  status: 'ok' | 'invalid' // 資料自己的時間窗過了就是 'invalid'；資料照樣回傳
+  validUntil?: number
   lastError?: { at: number; message: string; count: number }
 }
 ```

@@ -29,26 +29,50 @@ Construction throws `ConfigError` for a non-array registry, an empty or duplicat
 - `now`: the tick timestamp in epoch milliseconds
 - `attempt`: one plus the current consecutive failure count
 
+Two more optional fields shape what gets stored:
+
+```ts
+{
+  name: 'lesson-engagement',
+  every: '15m',
+  codec: {
+    encode: (v) => ({ rows: [...v.byPath] }),
+    decode: (raw) => ({ byPath: new Map(raw.rows) }),
+  },
+  validUntil: ({ now }) => endOfTodayUtc(now),
+  fetch: ...,
+}
+```
+
+`codec` converts the fetched value to plain JSON on write and back on read, so a `Map`, `Set`, or `Date` needs no hand-rolled wrapper types. The stored row stays plain JSON - readable from any language - and only a reader holding the query registry decodes it; a bare reader sees the encoded form. An `encode` that throws counts as a fetch failure and keeps the previous result.
+
+`validUntil` is for data that expires on its own clock: "today's traffic" stops being today's at midnight however recently it was fetched. It returns that boundary in epoch ms (it receives `params` and `now`); the boundary is stored on the result, reads past it report `status: 'invalid'` while still serving the data, and the scheduler re-fetches at the boundary instead of a full period later - `nextRunAt` becomes `min(completion + every, validUntil)`. Freshness by age (`isStale`) and validity of the window are independent axes.
+
 ### Parameterized queries
 
-The accepted Wave 2 slice supports finite runtime variants without generating definitions manually:
+One definition covers a finite set of variants:
 
 ```ts
 const analytics = defineParameterizedQuery({
   name: 'course-analytics',
   every: '10m',
-  variants: () => courseIds.flatMap((courseId) =>
-    ['7d', '30d'].map((window) => ({ courseId, window })),
-  ),
+  dimensions: {
+    window: ['7d', '30d'],
+    courseId: async () => listCourseIds(db),
+  },
   fetch: ({ params, signal }) => fetchAnalytics(params, { signal }),
 })
 
 const queries = defineQueries([analytics])
 ```
 
-`variants` is an array or a synchronous function returning an array. It is evaluated whenever `defineQueries` constructs a registry. A `PollerDO` can return a newly constructed registry from its `queries` getter when its finite runtime set changes. Every variant gets an independent schedule row, lease, failure count, backoff, and result envelope. Normal registry reconciliation creates added variants and deletes removed variants and their envelopes.
+`dimensions` expands to the cartesian product of its entries, one param field per dimension; `variants` names the param objects directly. Pass exactly one of the two. Either way, every variant gets an independent schedule row, lease, failure count, backoff, and result envelope.
 
-Params must be JSON values containing finite numbers, strings, booleans, nulls, arrays, and plain objects. Object keys are sorted before hashing. Cycles, class instances, `undefined`, and non-finite numbers fail during registry construction. Duplicate canonical params fail as duplicate variants.
+**Arrays are static, functions are dynamic.** An array is expanded once at construction. A function - `variants` itself, or any single dimension - is resolved at every tick, may be async, and is where a list that lives in a database belongs. Reconciliation then creates rows for variants that appeared and deletes the row and result of variants that left. A resolution that throws removes nothing: the base keeps everything it already has, and the failure lands in that tick's `RunReport` under the base name.
+
+Reading a dynamic variant is asymmetric on purpose: a stored result is served without consulting the list, and only a miss resolves it - to fetch a member, or to reject params that are not one.
+
+Params must be JSON values containing finite numbers, strings, booleans, nulls, arrays, and plain objects. Object keys are sorted before hashing. Cycles, class instances, `undefined`, and non-finite numbers are rejected when the variant is expanded. Duplicate canonical params fail as duplicate variants - at construction for static lists, as that tick's failure for dynamic ones.
 
 `queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from schedule rows, D1 keys, and `RunReport`. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
 
@@ -99,7 +123,7 @@ await poller.read('course-analytics', { courseId: 'course-a', window: '7d' }, {
 })
 ```
 
-`swrRefresh` receives a refresh promise when the result is stale, and the read returns without awaiting it. A miss needs no such hand-off: the read fetches it. That promise is gated by the schedule: it does nothing unless the query is due, so traffic cannot outpace a failing upstream's backoff, and the lease keeps concurrent refreshes to one upstream call.
+`swrRefresh` receives a refresh promise when the result is stale or its window has expired, and the read returns without awaiting it. A miss needs no such hand-off: the read fetches it. That promise is gated by the schedule: it does nothing unless the query is due, so traffic cannot outpace a failing upstream's backoff, and the lease keeps concurrent refreshes to one upstream call.
 
 A read with **nothing** stored waits for the first result, for as long as that query's `timeout` allows. There is nothing to configure: one query, one answer to how long it may take. An existing result, stale or not, always returns immediately.
 
@@ -128,6 +152,8 @@ interface ReadResult<T> {
   fetchedAt: number
   isStale: boolean
   age: number
+  status: 'ok' | 'invalid' // 'invalid' once the data's own window passed; data still served
+  validUntil?: number
   lastError?: { at: number; message: string; count: number }
 }
 ```

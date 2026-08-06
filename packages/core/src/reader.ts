@@ -3,7 +3,14 @@ import { defineQueries, Queries } from './define-queries.js'
 import { ConfigError } from './errors.js'
 import { queryKey } from './query-key.js'
 import { systemClock } from './system-clock.js'
-import type { Envelope, QueryDefinition, QueryParams, ReadResult, Store } from './types.js'
+import type {
+  Envelope,
+  QueryCodec,
+  QueryDefinition,
+  QueryParams,
+  ReadResult,
+  Store,
+} from './types.js'
 
 // How often a waiting read looks for an envelope another executor is fetching.
 // Cheap enough to poll, long enough not to hammer the store.
@@ -16,8 +23,18 @@ export function shapeRead<T>(env: Envelope | null, now: number): ReadResult<T> |
     fetchedAt: env.fetchedAt,
     isStale: now >= env.freshUntil,
     age: now - env.fetchedAt,
+    status: env.validUntil !== undefined && now >= env.validUntil ? 'invalid' : 'ok',
+    ...(env.validUntil !== undefined ? { validUntil: env.validUntil } : {}),
     ...(env.lastError ? { lastError: env.lastError } : {}),
   }
+}
+
+export function decodeRead<T>(
+  result: ReadResult<T> | null,
+  codec: QueryCodec | undefined,
+): ReadResult<T> | null {
+  if (!result || !codec) return result
+  return { ...result, data: codec.decode(result.data) as T }
 }
 
 function sleep(clock: Clock, ms: number): Promise<void> {
@@ -76,14 +93,25 @@ export function createReader(config: ReaderConfig): Reader {
     async read<T>(name: string, params?: QueryParams): Promise<ReadResult<T> | null> {
       const key = queryKey(name, params)
       const query = registry?.getByKey(key)
-      if (registry && !query) throw new ConfigError(`unknown query '${name}'`)
+      const dynamic = !query && registry ? registry.dynamicFor(name) : undefined
+      if (registry && !query && !dynamic) throw new ConfigError(`unknown query '${name}'`)
+      const codec = query?.codec ?? dynamic?.codec
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
       // A hit never waits. A miss waits for whichever executor is fetching, for
       // as long as that query may take - but only a registry knows how long.
-      if (shaped !== null || !query) return shaped
-      const deadline = clock.now() + query.timeoutMs
+      if (shaped !== null) return decodeRead(shaped, codec)
+      if (!registry) return null
+      let timeoutMs: number
+      if (query) {
+        timeoutMs = query.timeoutMs
+      } else {
+        const found = await dynamic!.member(key)
+        if (!found) throw new ConfigError(`unknown query '${name}'`)
+        timeoutMs = found.timeoutMs
+      }
+      const deadline = clock.now() + timeoutMs
       const waited = await waitForEnvelope((k) => store.readResult(k), key, deadline, clock)
-      return shapeRead<T>(waited, clock.now())
+      return decodeRead(shapeRead<T>(waited, clock.now()), codec)
     },
   }
 }

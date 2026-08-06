@@ -178,7 +178,7 @@ Nothing is thrown away. A failed refresh keeps the previously cached result, att
 
 ## Preset variants of one query
 
-When the same fetch applies to a finite, known-at-deploy-time set of dimensions - a course ID, a preset time window - declare it once instead of writing the loop yourself:
+When the same fetch applies to a finite set of dimensions - a course ID, a preset time window - declare it once instead of writing the loop yourself. An array expands at construction; a function is re-resolved every tick and may be async, so the list can live in your database:
 
 ```ts
 import { defineParameterizedQuery, defineQueries } from '@datafridge/core'

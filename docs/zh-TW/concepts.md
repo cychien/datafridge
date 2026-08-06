@@ -50,6 +50,7 @@ interface Envelope<T> {
   data: T
   fetchedAt: number            // epoch ms
   freshUntil: number           // fetchedAt + every; after this, isStale = true
+  validUntil?: number          // 資料自己的到期時間；過了它 status = 'invalid'
   lastError?: { at: number; message: string; count: number }
 }
 ```

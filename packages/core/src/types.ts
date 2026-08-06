@@ -14,6 +14,21 @@ export interface FetchCtx {
   attempt: number
 }
 
+/**
+ * Turns a fetched value into plain JSON for storage and back. The stored form
+ * stays readable from any language; only a reader holding the query registry
+ * can decode it.
+ */
+export interface QueryCodec<T = unknown> {
+  encode(value: T): unknown
+  decode(raw: unknown): T
+}
+
+export interface ValidityCtx {
+  params?: QueryParams
+  now: number
+}
+
 export interface ParameterizedFetchCtx<P extends QueryParams> extends FetchCtx {
   params: P
 }
@@ -28,15 +43,40 @@ interface QuerySettings {
 
 export interface QueryDef<T = unknown> extends QuerySettings {
   fetch: (ctx: FetchCtx) => Promise<T>
+  codec?: QueryCodec<T>
+  /**
+   * When the data itself expires - "today's traffic" stops being today's at
+   * midnight however recently it was fetched. Returns that boundary in epoch
+   * ms; the result is invalid past it, and the scheduler re-fetches at the
+   * boundary instead of a full period later.
+   */
+  validUntil?: (ctx: ValidityCtx) => number
 }
 
-export interface ParameterizedQueryDef<
-  P extends QueryParams = QueryParams,
-  T = unknown,
-> extends QuerySettings {
-  variants: readonly P[] | (() => readonly P[])
+export type DimensionValues =
+  readonly QueryParams[] | (() => readonly QueryParams[] | Promise<readonly QueryParams[]>)
+
+interface ParameterizedBase<P extends QueryParams, T> extends QuerySettings {
   fetch(ctx: ParameterizedFetchCtx<P>): Promise<T>
+  codec?: QueryCodec<T>
+  validUntil?: (ctx: ValidityCtx) => number
 }
+
+/**
+ * Arrays are static: expanded once at construction. Functions are dynamic:
+ * resolved at every tick, so the list can live in a database, and they may be
+ * async. `dimensions` is the cartesian product of its entries, one param field
+ * per dimension.
+ */
+export type ParameterizedQueryDef<P extends QueryParams = QueryParams, T = unknown> =
+  | (ParameterizedBase<P, T> & {
+      variants: readonly P[] | (() => readonly P[] | Promise<readonly P[]>)
+      dimensions?: never
+    })
+  | (ParameterizedBase<P, T> & {
+      dimensions: Readonly<Record<string, DimensionValues>>
+      variants?: never
+    })
 
 export type QueryDefinition = QueryDef | ParameterizedQueryDef
 
@@ -49,6 +89,8 @@ export interface ResolvedQuery<T = unknown> {
   readonly leaseMs: number
   readonly source: string
   readonly fetch: (ctx: FetchCtx) => Promise<T>
+  readonly codec?: QueryCodec
+  readonly validUntil?: (now: number) => number
 }
 
 export interface LastError {
@@ -61,6 +103,7 @@ export interface Envelope<T = unknown> {
   data: T
   fetchedAt: number
   freshUntil: number
+  validUntil?: number
   lastError?: LastError
 }
 
@@ -116,6 +159,9 @@ export interface ReadResult<T = unknown> {
   fetchedAt: number
   isStale: boolean
   age: number
+  /** 'invalid' once the data's own window has passed; the data is still served. */
+  status: 'ok' | 'invalid'
+  validUntil?: number
   lastError?: LastError
 }
 

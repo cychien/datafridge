@@ -4,8 +4,8 @@ import { defineQueries, Queries } from './define-queries.js'
 import { ConfigError, TimeoutError } from './errors.js'
 import type { Candidate } from './planner.js'
 import { planTick, virtualRow } from './planner.js'
-import { queryKey } from './query-key.js'
-import { shapeRead, waitForEnvelope } from './reader.js'
+import { queryKey, variantBaseOf } from './query-key.js'
+import { decodeRead, shapeRead, waitForEnvelope } from './reader.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
@@ -85,12 +85,26 @@ export function createPoller(config: PollerConfig): Poller {
         report.failed.push({ name, message: 'write discarded (lease reclaimed)' })
         return
       }
-      const envelope: Envelope = { data, fetchedAt: done, freshUntil: done + query.everyMs }
+      const stored = query.codec ? query.codec.encode(data) : data
+      const validUntil = query.validUntil?.(done)
+      if (validUntil !== undefined && !Number.isFinite(validUntil)) {
+        throw new ConfigError(`query '${name}': validUntil must return a finite epoch-ms timestamp`)
+      }
+      const envelope: Envelope = {
+        data: stored,
+        fetchedAt: done,
+        freshUntil: done + query.everyMs,
+        ...(validUntil !== undefined ? { validUntil } : {}),
+      }
       await store.writeResult(name, envelope)
       const jitter = token === 1 ? firstRunJitterMs(query.everyMs, random) : 0
+      const periodic = done + query.everyMs + jitter
+      // Data with its own expiry re-fetches at the boundary, not a period later.
+      const nextRunAt =
+        validUntil === undefined ? periodic : Math.min(periodic, Math.max(validUntil, done))
       await schedule.writeSchedule({
         name,
-        nextRunAt: done + query.everyMs + jitter,
+        nextRunAt,
         failCount: 0,
         leaseUntil: null,
         version: token,
@@ -127,16 +141,59 @@ export function createPoller(config: PollerConfig): Poller {
     }
   }
 
-  const reconcile = async (now: number): Promise<void> => {
+  interface EffectiveRegistry {
+    list: readonly ResolvedQuery[]
+    byKey: ReadonlyMap<string, ResolvedQuery>
+    failures: Array<{ name: string; message: string }>
+    failedBases: ReadonlySet<string>
+  }
+
+  /**
+   * The tick's working set: every static query plus each dynamic definition's
+   * variant list as of right now. A resolution failure removes nothing - the
+   * base keeps whatever it already has, and the failure lands in the report.
+   */
+  const resolveEffective = async (): Promise<EffectiveRegistry> => {
+    const list: ResolvedQuery[] = [...queries.all]
+    const byKey = new Map(queries.all.map((query) => [query.name, query]))
+    const failures: Array<{ name: string; message: string }> = []
+    const failedBases = new Set<string>()
+    for (const dynamic of queries.dynamic) {
+      try {
+        const additions: ResolvedQuery[] = []
+        const seen = new Set<string>()
+        for (const params of await dynamic.resolve()) {
+          const query = dynamic.instantiate(params)
+          if (byKey.has(query.name) || seen.has(query.name)) {
+            throw new ConfigError(`query '${dynamic.baseName}': duplicate variant params`)
+          }
+          seen.add(query.name)
+          additions.push(query)
+        }
+        for (const query of additions) {
+          byKey.set(query.name, query)
+          list.push(query)
+        }
+      } catch (err) {
+        failures.push({ name: dynamic.baseName, message: errorMessage(err) })
+        failedBases.add(dynamic.baseName)
+      }
+    }
+    return { list, byKey, failures, failedBases }
+  }
+
+  const reconcile = async (now: number, effective: EffectiveRegistry): Promise<void> => {
     if (schedule.capabilities.listDue && schedule.listDue) {
       const all = await schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
       for (const row of all) {
-        if (queries.getByKey(row.name)) continue
+        if (effective.byKey.has(row.name)) continue
+        const base = variantBaseOf(row.name)
+        if (base !== undefined && effective.failedBases.has(base)) continue
         await schedule.deleteSchedule(row.name)
         await store.deleteResult(row.name)
       }
     }
-    for (const query of queries.all) {
+    for (const query of effective.list) {
       const row = await schedule.readSchedule(query.name)
       if (!row || row.failCount > 0) continue
       if (row.leaseUntil !== null && row.leaseUntil > now) continue
@@ -151,9 +208,18 @@ export function createPoller(config: PollerConfig): Poller {
     }
   }
 
+  const dynamicOfKey = (key: string) => {
+    const base = variantBaseOf(key)
+    return base !== undefined ? queries.dynamicFor(base) : undefined
+  }
+
   const refreshOne = async (key: string): Promise<void> => {
-    const query = queries.getByKey(key)
-    if (!query) return
+    let query = queries.getByKey(key)
+    if (!query) {
+      const dynamic = dynamicOfKey(key)
+      query = dynamic ? await dynamic.member(key) : undefined
+      if (!query) return
+    }
     const now = clock.now()
     const row = (await schedule.readSchedule(key)) ?? virtualRow(key, now)
     if (row.nextRunAt > now) return
@@ -223,14 +289,16 @@ export function createPoller(config: PollerConfig): Poller {
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
       const now = nowArg ?? clock.now()
-      await reconcile(now)
+      const effective = await resolveEffective()
+      await reconcile(now, effective)
       const rowsByName = new Map(
         await Promise.all(
-          queries.all.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
+          effective.list.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
         ),
       )
-      const { toRun, deferredBudget } = planTick(queries.all, rowsByName, now, sources)
+      const { toRun, deferredBudget } = planTick(effective.list, rowsByName, now, sources)
       const report = emptyReport()
+      report.failed.push(...effective.failures)
       report.deferredBudget.push(...deferredBudget)
       await Promise.allSettled(toRun.map((candidate) => executeOne(candidate, now, report)))
       return report
@@ -242,18 +310,25 @@ export function createPoller(config: PollerConfig): Poller {
       options?: PollerReadOptions,
     ): Promise<ReadResult<T> | null> {
       const key = queryKey(name, params)
-      const query = queries.getByKey(key)
-      if (!query) throw new ConfigError(`unknown query '${name}'`)
+      let query = queries.getByKey(key)
+      const dynamic = query ? undefined : queries.dynamicFor(name)
+      if (!query && !dynamic) throw new ConfigError(`unknown query '${name}'`)
+      const codec = query?.codec ?? dynamic?.codec
       const shaped = shapeRead<T>(await store.readResult(key), clock.now())
-      // Only staleness needs a background refresh: a miss is served by the read
-      // itself below, so handing out a second refresh would be redundant.
-      if (options?.swrRefresh && shaped?.isStale) {
+      // Staleness and an expired window both refresh in the background; a miss
+      // is served by the read itself below.
+      if (options?.swrRefresh && shaped && (shaped.isStale || shaped.status === 'invalid')) {
         options.swrRefresh(refreshOne(key))
       }
       // A hit never waits; a miss fetches or waits for whoever is, bounded by
-      // this query's own timeout.
-      if (shaped !== null) return shaped
-      return readThrough<T>(query, key)
+      // this query's own timeout. A dynamic hit skips membership resolution -
+      // reconcile is the enforcer that removes departed variants.
+      if (shaped !== null) return decodeRead(shaped, codec)
+      if (!query) {
+        query = await dynamic!.member(key)
+        if (!query) throw new ConfigError(`unknown query '${name}'`)
+      }
+      return decodeRead(await readThrough<T>(query, key), codec)
     },
   }
 }

@@ -23,6 +23,7 @@ describe('read() contract', () => {
       fetchedAt: 0,
       isStale: false,
       age: 0,
+      status: 'ok',
     })
 
     await clock.advance(100_000)
@@ -43,6 +44,7 @@ describe('read() contract', () => {
       data: { nested: [1, 2, 3] },
       fetchedAt: 0,
       isStale: false,
+      status: 'ok',
       age: 0,
     })
     expect(await reader.read('unknown')).toBeNull()
