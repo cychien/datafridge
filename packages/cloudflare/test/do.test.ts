@@ -192,6 +192,25 @@ describe('PollerDO alarm loop', () => {
     expect(fetchCounts.get('solo')).toBe(1)
   })
 
+  it('rejects a registry whose timeout cannot fit the alarm invocation, at ignition', async () => {
+    const stub = pollerStub('timeout-limit')
+    await configure(stub, [{ name: 'slow', every: '1h', timeout: '15m', fetch: async () => 0 }])
+    // Caught inside the DO so the RPC rejection is not also reported as an
+    // unhandled error by workerd.
+    const message = await runInDurableObject(stub, async (instance) => {
+      try {
+        await (instance as TestPoller).ensureStarted()
+        return null
+      } catch (err) {
+        return (err as Error).message
+      }
+    })
+    expect(message).toBe(
+      "query 'slow': timeout (900000ms) must be shorter than the 900000ms wall-clock limit " +
+        'of a Cloudflare Durable Object alarm invocation; lower the timeout',
+    )
+  })
+
   it('reconciles a changed registry: adds run, removed rows and envelopes vanish, every changes reschedule', async () => {
     const stub = pollerStub('reconcile')
     await configure(stub, [counting('keep', '5m'), counting('drop', '5m')])

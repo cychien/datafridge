@@ -289,8 +289,8 @@ function resolveStores(
 function requireClaimSafety(schedule: ScheduleStore, driver: Driver, which: string): void {
   if (!schedule.capabilities.atomicClaim && !driver.serialized) {
     throw new ConfigError(
-      `${which} lacks atomicClaim and the driver is not serialized; ` +
-        'concurrent runDue calls could double-fetch',
+      `${which} lacks atomicClaim and the driver is not serialized, so concurrent runDue ` +
+        'calls could double-fetch; use a schedule store with atomic claims or a serialized driver',
     )
   }
 }

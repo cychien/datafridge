@@ -354,11 +354,11 @@ crons = ["* * * * *"]   # 粒度下限 1 分鐘
 | 併發保護 | driver 序列化，零成本 | D1 CAS claim |
 | 元件 | DO + D1 | 只有 D1 |
 
-計劃提供 `npx datafridge init cloudflare` 自動寫入兩種組合的 wrangler 宣告。
+提供 `npx datafridge init cloudflare` 自動寫入兩種組合的 wrangler 宣告。
 
 ### 平台限制備忘
 
-- fetch `timeout` 上限受 invocation 時長限制，`defineQueries` 建構時驗證。
+- fetch `timeout` 上限受 invocation 時長限制（cron trigger 與 DO alarm 均為 15 分鐘），adapter 以 `assertTimeoutsFitInvocation` 在 `cronPoller` 建構與 PollerDO ignition/alarm 時驗證。
 - D1 單區域：遠端 PoP 的讀有跨區延遲；對本產品語意可接受，文件標明。大流量讀取的加速複本見 roadmap。
 - envelope 大小受 D1 單 row 上限約束，實作時以當前官方文件為準並在 `writeResult` 防呆。
 

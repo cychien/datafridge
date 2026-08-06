@@ -8,5 +8,6 @@
       "@datafridge/core/contract-tests": ["../core/src/contract-tests.ts"]
     }
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "exclude": ["src/cli"]
 }

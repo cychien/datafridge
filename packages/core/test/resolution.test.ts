@@ -121,6 +121,90 @@ describe('schedule plane resolution (fail at config time)', () => {
   })
 })
 
+describe('schedule plane resolution failures carry exact, actionable messages', () => {
+  function configErrorMessage(fn: () => unknown): string {
+    try {
+      fn()
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError)
+      return (err as ConfigError).message
+    }
+    return expect.unreachable('expected a ConfigError')
+  }
+
+  it('rule 4: nothing can host the schedule plane', () => {
+    expect(
+      configErrorMessage(() =>
+        createPoller({
+          results: resultsOnly(memoryStore()),
+          driver: makeDriver({ serialized: false }),
+          queries,
+          clock: clock(),
+        }),
+      ),
+    ).toBe(
+      'no valid schedule plane: pass an explicit schedule store, use a driver that provides ' +
+        'one, or use a full Store (with atomicClaim, or under a serialized driver); ' +
+        'refusing to silently degrade',
+    )
+  })
+
+  it('rule 4: the store is a ScheduleStore but cannot claim safely', () => {
+    expect(
+      configErrorMessage(() =>
+        createPoller({
+          store: withoutAtomicClaim(memoryStore()),
+          driver: makeDriver({ serialized: false }),
+          queries,
+          clock: clock(),
+        }),
+      ),
+    ).toBe(
+      'no valid schedule plane: the store implements ScheduleStore but lacks atomicClaim ' +
+        'and the driver is not serialized; use a store with atomic claims, a serialized ' +
+        'driver, or an explicit schedule store',
+    )
+  })
+
+  it('rule 1: an explicit schedule store that cannot claim safely', () => {
+    expect(
+      configErrorMessage(() =>
+        createPoller({
+          results: resultsOnly(memoryStore()),
+          schedule: scheduleOnly(withoutAtomicClaim(memoryStore())),
+          driver: makeDriver({ serialized: false }),
+          queries,
+          clock: clock(),
+        }),
+      ),
+    ).toBe(
+      'the explicit schedule store lacks atomicClaim and the driver is not serialized, ' +
+        'so concurrent runDue calls could double-fetch; use a schedule store with atomic ' +
+        'claims or a serialized driver',
+    )
+  })
+
+  it("rule 2: a driver's schedule store that cannot claim safely", () => {
+    expect(
+      configErrorMessage(() =>
+        createPoller({
+          results: resultsOnly(memoryStore()),
+          driver: makeDriver({
+            serialized: false,
+            schedule: scheduleOnly(withoutAtomicClaim(memoryStore())),
+          }),
+          queries,
+          clock: clock(),
+        }),
+      ),
+    ).toBe(
+      "the driver's schedule store lacks atomicClaim and the driver is not serialized, " +
+        'so concurrent runDue calls could double-fetch; use a schedule store with atomic ' +
+        'claims or a serialized driver',
+    )
+  })
+})
+
 describe('createPoller config validation', () => {
   it('rejects passing both store and results', () => {
     expect(() =>

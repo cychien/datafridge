@@ -1,0 +1,15 @@
+# My worker - hand-maintained, datafridge must never touch any of this.
+name = "my-app"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+[vars]
+API_URL = "https://example.com"
+RETRIES = 3
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "abc123"
+
+[env.staging]
+name = "my-app-staging"
