@@ -48,7 +48,7 @@ Before giving up it waits, inside its own `timeout`, for the window to roll - so
 
 ## The smoothing: `maxConcurrent`
 
-`maxConcurrent` bounds how many calls to a source are in flight at once - across every executor sharing the store, not per process. It bounds concurrency, not volume: a hundred due queries behind `maxConcurrent: 4` still make a hundred calls, four at a time. Use it when a vendor tolerates the rate but not the burst, and keep in mind that a tick then lasts as long as its slowest chain of four (see the [Cloudflare invocation limits](./cloudflare.md#limits-and-ceilings)).
+`maxConcurrent` bounds how many calls to a source are in flight at once - across every executor sharing the store, not per process. It bounds concurrency, not volume: a hundred due queries behind `maxConcurrent: 4` still make a hundred calls, four at a time. Use it when a vendor tolerates the rate but not the burst, and keep in mind that a tick then lasts as long as its slowest chain of four (see [what one invocation will take on](#the-capacity-what-one-invocation-will-take-on)).
 
 It is a permit in the store, taken for the length of the call and given back when it ends. A holder that dies never gives its permit back, so a permit also expires; until then it counts, and after it does not. That is what makes the number mean the same thing to a Durable Object, a cron trigger and fifty concurrent Worker invocations - the alternative is a limit each, which is not a limit.
 

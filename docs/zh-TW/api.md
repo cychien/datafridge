@@ -76,7 +76,7 @@ const queries = defineQueries([analytics])
 
 Params 必須是由有限數字、字串、boolean、null、array 與 plain object 組成的 JSON value。Hash 前會排序 object keys。Cycle、class instance、`undefined` 與非有限數字會在 variant 展開時被拒絕。Canonical params 相同視為 duplicate variant - 靜態清單在建構時擋下，動態清單則成為那個 tick 的失敗。
 
-`queryKey(name, params?)` 是穩定的 storage identity function。Fixed name 保持不變。Variant identity 使用保留的 `@df/v1/` namespace、encoded public base name，以及 canonical params 的 SHA-256。Raw params 不會出現在 schedule rows、D1 keys 或 `RunReport`。不要把 credential、token 或 private payload 放入 params。Secret 應放在 binding 或 fetcher closure。
+`queryKey(name, params?)` 是穩定的 storage identity function。Fixed name 保持不變。Variant identity 使用保留的 `@df/v1/` namespace、encoded public base name，以及 canonical params 的 SHA-256。Raw params 不會出現在 D1 keys 或 `RunReport`；variant 的 schedule row 則會用一個獨立欄位把它們存在 hash 過的名字旁邊。不要把 credential、token 或 private payload 放入 params。Secret 應放在 binding 或 fetcher closure。
 
 ### 開放的 parameter 空間
 
@@ -100,7 +100,7 @@ const funnel = defineParameterizedQuery({
 
 **重疊的讀取仍然會合流。** 同一個 `queryKey` 的第一個讀者發出呼叫；在它還在跑的時候抵達的每一個讀者都加入那個 flight，並拿走它的答案。一百個同時進來的請求就是一次上游呼叫、一格額度，不管它們落在幾個 Worker 上 - flight 協調在 store 裡，不在某個 process 的記憶體裡。在那個 flight 結束**之後**才抵達的讀取，是一個新的 flight、一次新的呼叫：答案屬於等它的那批讀者，把它交給下一個來問的人就會變成快取，而那正是未指名組合不該有的東西。
 
-- **它永遠不會被排程。** Open base 對 tick 沒有任何貢獻，所以它不宣告 `every`、`lease` 或 `validUntil`。什麼都不存，所以也不吃 `codec`；四者都在建構時被拒絕。
+- **它永遠不會被排程。** Open base 對 tick 沒有任何貢獻，所以它不宣告 `every`、`lease` 或 `validUntil`，這三者由型別擋下。什麼都不存，所以也不吃 `codec` - `codec`、與 `anyParams` 並列的清單，以及不是 `true` 的 `anyParams`，都在建構時被拒絕。
 - **Flight 是暫時的。** 它不存結果、會自己過期，並由下一個 tick 清掉。Leader 死了之後，過了它的期限就由下一個讀者接手；已結束的答案在那批讀者拿到後不久就不再被交出去。
 - **讀取必須帶 params。** 沒有 params 的 open base 什麼組合都沒指名。
 - **Reader 必須有能力發出那次呼叫。** `createReader` 需要完整的 store - 能 claim、能計額度的那種，例如 `d1(env.DB)` - 不能是 results-only。這在建構 reader 時就檢查，不是等到有人來讀。
@@ -206,7 +206,7 @@ interface ReadResult<T> {
 }
 ```
 
-`read()` 只在第一次成功 refresh 前回傳 `null`，絕不呼叫上游。
+`read()` 只在什麼都還沒存下來時回傳 `null` - 第一次成功 refresh 之前，或失敗的 query 還在兩次重試之間。Results-only reader 絕不呼叫上游；持有完整 store 的那個則走 tick 走的同一個 dispatcher 自己抓，所以它的 miss 也可能回 `status: 'throttled'`。
 
 ### Stores 與 test utilities
 

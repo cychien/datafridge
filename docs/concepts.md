@@ -90,6 +90,7 @@ interface ScheduleRow {
   failCount: number
   leaseUntil: number | null
   version: number              // for CAS; can be relaxed under serialized execution
+  params?: QueryParams         // the variant's own params, beside its hashed name
 }
 ```
 

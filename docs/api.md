@@ -76,7 +76,7 @@ Reading a dynamic variant is asymmetric on purpose: a stored result is served wi
 
 Params must be JSON values containing finite numbers, strings, booleans, nulls, arrays, and plain objects. Object keys are sorted before hashing. Cycles, class instances, `undefined`, and non-finite numbers are rejected when the variant is expanded. Duplicate canonical params fail as duplicate variants - at construction for static lists, as that tick's failure for dynamic ones.
 
-`queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from schedule rows, D1 keys, and `RunReport`. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
+`queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from D1 keys and `RunReport`; a variant's schedule row carries them in a column of their own, beside the hashed name. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
 
 ### Open parameter spaces
 
@@ -100,7 +100,7 @@ That call still leaves through the same dispatcher everything else does, so it d
 
 **Reads that overlap still coalesce.** The first reader of a given `queryKey` makes the call; every reader that arrives while it is running joins that flight and takes its answer. A cohort of a hundred concurrent requests is one upstream call and one quota slot, however many Workers they landed in - the flight is coordinated in the store, not in one process's memory. A read that arrives *after* that flight settles is a new flight and a new call: an answer belongs to the readers who waited for it, and handing it to whoever asks next would be a cache, which is exactly what an unnamed combination does not get.
 
-- **It is never scheduled.** An open base contributes nothing to a tick, so it declares no `every`, no `lease` and no `validUntil`. Nothing is stored, so it takes no `codec` either; all four are rejected at construction.
+- **It is never scheduled.** An open base contributes nothing to a tick, so it declares no `every`, no `lease` and no `validUntil`; the types reject all three. Nothing is stored, so it takes no `codec` either - that one, a list beside `anyParams`, and an `anyParams` that is not `true` are rejected at construction.
 - **The flight is transient.** It holds no result, expires on its own, and is swept by the next tick. A leader that dies is taken over by the next reader once its deadline passes, and a settled answer stops being handed out shortly after the cohort has had it.
 - **A read must pass params.** An open base with no params names no combination at all.
 - **The reader has to be able to make the call.** `createReader` needs the whole store - one that can claim and meter, like `d1(env.DB)` - not a results-only one. That is checked when the reader is constructed, not when somebody reads.
@@ -206,7 +206,7 @@ interface ReadResult<T> {
 }
 ```
 
-`read()` returns `null` only before the first successful refresh. It never invokes upstream code.
+`read()` answers `null` only when there is nothing stored - before the first successful refresh, or while a failed query is between retries. A results-only reader never invokes upstream code; one holding the whole store fetches through the same dispatcher a tick uses, so its misses can also answer `status: 'throttled'`.
 
 ### Stores and test utilities
 

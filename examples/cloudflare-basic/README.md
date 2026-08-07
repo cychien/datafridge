@@ -19,9 +19,11 @@ Then in this folder:
 pnpm dev       # wrangler dev; the tables are created on the first write
 ```
 
-Hit the read endpoint. The first call ignites the alarm chain and waits for
-that first poll instead of answering `null`, for at most the query's `timeout`,
-which this app sets to 5s. Every later call is a plain D1 read:
+Hit the read endpoint. The first call ignites the alarm chain and, finding
+nothing stored, fetches it there and then instead of answering `null` - through
+the same dispatcher the alarm uses, so whichever of the two got there first is
+the one upstream call. It waits at most the query's `timeout`, which this app
+sets to 5s. Every later call is a plain D1 read:
 
 ```sh
 curl http://localhost:8787/read

@@ -170,9 +170,9 @@ export interface ScheduleRow {
   leaseUntil: number | null
   version: number
   /**
-   * The variant's params, for rows the registry does not name. A key is a hash,
-   * so an on-demand entry that nothing declared cannot be rebuilt from its name
-   * alone; carrying the params makes the row enough to run the work by itself.
+   * The variant's params. A key is a hash, so a row cannot say what it is from
+   * its name alone; carrying the params makes it self-describing without the
+   * registry having to be consulted.
    */
   params?: QueryParams
 }

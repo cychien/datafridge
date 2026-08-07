@@ -48,7 +48,7 @@ if (result?.status === 'throttled') {
 
 ## 平滑：`maxConcurrent`
 
-`maxConcurrent` 限制某個 source 同時在途的呼叫數 - 跨越所有共用這個 store 的 executor，不是每個 process 各算一份。它限制的是併發，不是總量：一百個到期的 query 配上 `maxConcurrent: 4` 仍然會打一百次，只是四個四個來。供應商能接受這個速率但不能接受突發時用它，並且要記得這樣一來一個 tick 會拖到它最慢的那條四人鏈那麼久（見 [Cloudflare invocation 上限](./cloudflare.md#上限與天花板)）。
+`maxConcurrent` 限制某個 source 同時在途的呼叫數 - 跨越所有共用這個 store 的 executor，不是每個 process 各算一份。它限制的是併發，不是總量：一百個到期的 query 配上 `maxConcurrent: 4` 仍然會打一百次，只是四個四個來。供應商能接受這個速率但不能接受突發時用它，並且要記得這樣一來一個 tick 會拖到它最慢的那條四人鏈那麼久（見[單次 invocation 願意承接多少](#容量單次-invocation-願意承接多少)）。
 
 它是 store 裡的一張 permit，在呼叫期間持有、結束時歸還。死掉的持有者永遠不會歸還，所以 permit 也會過期；過期之前它算數，之後就不算。這才讓那個數字對一個 Durable Object、一個 cron trigger 和五十個併發 Worker invocation 是同一個意思 - 否則就是各有一份上限，那就不是上限。
 
