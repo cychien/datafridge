@@ -273,21 +273,29 @@ export function d1(db: D1Database): Store {
 
     // One statement decides and takes: the count and the insert cannot be
     // separated by a peer, so two Workers cannot both read "one slot left". A
-    // holder id already in the table is a different caller wearing the same
-    // name, so the insert is skipped rather than allowed to overwrite it.
-    async acquirePermit(source, limit, holder, expiresAt, now) {
+    // live holder id already in the table is a different caller wearing the same
+    // name, so nothing is written rather than its permit being overwritten; an
+    // expired one is nobody's, and the row is taken over in place.
+    //
+    // Deciding costs exactly that statement. Saying *why* a refusal happened
+    // costs two more, and a source at its ceiling is refusing far more often
+    // than it grants, so a caller that will just look again shortly says it
+    // does not need the reason and pays none of it.
+    async acquirePermit(source, limit, holder, expiresAt, now, explainRefusal = true) {
       return withSchema(db, async () => {
         const taken = await db
           .prepare(
             'INSERT INTO datafridge_permit (holder, source, expires_at) SELECT ?, ?, ? ' +
               'WHERE (SELECT COUNT(*) FROM datafridge_permit ' +
               'WHERE source = ? AND expires_at > ?) < ? ' +
-              'ON CONFLICT (holder) DO NOTHING',
+              'ON CONFLICT (holder) DO UPDATE SET source = excluded.source, ' +
+              'expires_at = excluded.expires_at WHERE datafridge_permit.expires_at <= ?',
           )
-          .bind(holder, source, expiresAt, source, now, limit)
+          .bind(holder, source, expiresAt, source, now, limit, now)
           .run()
         if (taken.meta.changes === 1) return { granted: true }
-        // Refused: this is the moment worth paying to collect the permits of
+        if (!explainRefusal) return { granted: false, retryAt: null }
+        // Explaining is the moment worth paying to collect the permits of
         // holders that died, so the next caller sees the real count.
         await db.prepare('DELETE FROM datafridge_permit WHERE expires_at <= ?').bind(now).run()
         const live = await db

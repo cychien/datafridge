@@ -33,10 +33,11 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  *   one it has moved past, and never drives usage below zero
  * - listDue is the only enumeration core performs, and it is always given a limit
  * - acquirePermit grants at most `limit` live permits per source and never waits; an
- *   expired permit stops counting, which is how a holder that died is recovered from,
- *   a holder id already holding one is refused rather than sharing or overwriting it,
- *   and a refusal names the soonest a permit could free (or `now` when the source has
- *   room and only the id was in the way)
+ *   expired permit stops counting, which is how a holder that died is recovered from
+ *   and how the same id may take one again, a holder id already holding a live one is
+ *   refused rather than sharing or overwriting it, and a refusal the caller asked to
+ *   have explained names the soonest a permit could free (or `now` when the source has
+ *   room and only the id was in the way) while one it did not may name nothing at all
  * - sweepFlights removes settled flights past their handoff window and running ones past
  *   their expiry, and never a running flight whose expiry is still ahead
  * - joinFlight makes one caller the leader and everyone overlapping it a follower; an
@@ -361,6 +362,36 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         // Nobody released it; the expiry is what recovers the slot.
         expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 5_000)).toEqual({
           granted: true,
+        })
+      })
+
+      it('lets an id whose own permit expired take one again', async () => {
+        expect(await store.acquirePermit('posthog', 1, 'holder', 5_000, 1_000)).toEqual({
+          granted: true,
+        })
+        // Its row may well still be sitting there, but an expired permit is
+        // nobody's claim on anything - least of all its own holder's.
+        expect(await store.acquirePermit('posthog', 1, 'holder', LIVE, 5_000)).toEqual({
+          granted: true,
+        })
+      })
+
+      it('may leave a refusal unexplained when the caller says it needs no reason', async () => {
+        expect(await store.acquirePermit('posthog', 1, 'a', LIVE, 1_000, false)).toEqual({
+          granted: true,
+        })
+        const grant = await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000, false)
+        expect(grant.granted).toBe(false)
+        // Whether the reason costs anything is the store's business; a reason
+        // that is wrong is nobody's. Silence is `null`, never a made-up moment.
+        if (!grant.granted && grant.retryAt !== null) expect(grant.retryAt).toBe(LIVE)
+      })
+
+      it('always explains a refusal the caller asked to have explained', async () => {
+        await store.acquirePermit('posthog', 1, 'a', LIVE, 1_000, false)
+        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000, true)).toEqual({
+          granted: false,
+          retryAt: LIVE,
         })
       })
 

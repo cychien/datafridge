@@ -211,11 +211,15 @@ export function createFridge(config: FridgeConfig): Fridge {
    * future one, and a row nothing refreshes only climbs towards the front. A
    * full page means there may be more behind it, and the tick says so by asking
    * to be woken again immediately rather than by reading further.
+   *
+   * `listed` is whether a page was read at all. A plane without `listDue` reads
+   * none, and an empty page from a plane that cannot list is not evidence that
+   * the table is empty - it is evidence of nothing.
    */
-  const listRows = async (): Promise<ScheduleRow[]> =>
+  const listRows = async (): Promise<{ listed: boolean; page: ScheduleRow[] }> =>
     schedule.capabilities.listDue && schedule.listDue
-      ? schedule.listDue(Number.MAX_SAFE_INTEGER, SCHEDULE_PAGE)
-      : []
+      ? { listed: true, page: await schedule.listDue(Number.MAX_SAFE_INTEGER, SCHEDULE_PAGE) }
+      : { listed: false, page: [] }
 
   /**
    * Rows the registry no longer names lose their row and their result. Bounded
@@ -274,10 +278,10 @@ export function createFridge(config: FridgeConfig): Fridge {
   ): Promise<void> => {
     const missing = list.filter((query) => rows.get(query.name) === undefined)
     if (missing.length === 0) return
-    // The page is asked for with no upper bound on `nextRunAt`, so a page that
-    // came back short is the whole table: a name missing from it provably has
-    // no row, and looking it up would only confirm that at the cost of a round
-    // trip per never-run query, every tick.
+    // A page read with no upper bound on `nextRunAt` that came back short is
+    // the whole table: a name missing from it provably has no row, and looking
+    // it up would only confirm that at the cost of a round trip per never-run
+    // query, every tick. A page nobody read proves nothing at all.
     if (pageHeldEveryRow) {
       for (const query of missing) rows.remember(query.name, null)
       return
@@ -305,7 +309,6 @@ export function createFridge(config: FridgeConfig): Fridge {
     plan: readonly Candidate[],
     now: number,
     startedAt: number,
-    report: RunReport,
     onOutcome: (candidate: Candidate, outcome: DispatchOutcome) => void,
     /** `null` means "as soon as there is an invocation", not "at some time". */
     onDeferred: (name: string, retryAt: number | null) => void,
@@ -376,7 +379,7 @@ export function createFridge(config: FridgeConfig): Fridge {
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
       const startedAt = clock.now()
-      const page = await listRows()
+      const { listed, page } = await listRows()
       const rows = new Rows()
       for (const row of page) rows.remember(row.name, row)
       const effective = await resolveEffective(nowArg ?? clock.now(), rows)
@@ -391,7 +394,7 @@ export function createFridge(config: FridgeConfig): Fridge {
       // every registry past one page look permanently behind.
       const moreDueBehindPage =
         page.length >= SCHEDULE_PAGE && page[page.length - 1]!.nextRunAt <= now
-      await fillMissingRows(effective.list, rows, page.length < SCHEDULE_PAGE)
+      await fillMissingRows(effective.list, rows, listed && page.length < SCHEDULE_PAGE)
       const { moreToRemove } = await reconcile(now, effective, page, rows)
       // Flights are transient by construction, but nothing else would ever
       // collect the settled ones; the tick is the only thing that runs anyway.
@@ -411,7 +414,6 @@ export function createFridge(config: FridgeConfig): Fridge {
         plan,
         now,
         startedAt,
-        report,
         (candidate, outcome) => {
           dispatched.add(candidate.query.name)
           recordOutcome(report, candidate.query.name, outcome)

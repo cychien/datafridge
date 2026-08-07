@@ -215,9 +215,27 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     }
     let interval = PERMIT_POLL_MS
     let collisions = 0
+    let attempts = 0
+    let retryingId = false
     let holder = nextHolder()
     for (;;) {
-      const grant = await schedule.acquirePermit(source, max, holder, expiresAt, clock.now())
+      const now = clock.now()
+      // Scheduled work never queues for a permit: staying due and coming back
+      // more overdue is cheaper than holding an invocation open for a peer.
+      const wait = deadline === undefined ? 0 : Math.min(interval, deadline - now)
+      // Giving up at the deadline is giving up too late: the reader stops
+      // listening at that same instant, and would hear nothing rather than why.
+      const lastAttempt = wait <= 0 || now + wait >= (deadline as number)
+      // A refusal is worth a reason only where one gets acted on: an attempt
+      // that is telling a colliding id apart from a full source, and the
+      // attempt whose answer the caller reports. The polls in between mint a
+      // fresh id and look again regardless, so asking a saturated source why -
+      // over and over, per waiting reader - would be paying for an answer
+      // nobody reads.
+      const explainRefusal = attempts === 0 || retryingId || lastAttempt
+      retryingId = false
+      const grant = await schedule.acquirePermit(source, max, holder, expiresAt, now, explainRefusal)
+      attempts += 1
       if (grant.granted) {
         const taken = holder
         return {
@@ -233,19 +251,13 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
         }
       }
       // The source has room, so the id was what stood in the way.
-      if (grant.retryAt <= clock.now() && collisions < PERMIT_ID_ATTEMPTS) {
+      if (grant.retryAt !== null && grant.retryAt <= now && collisions < PERMIT_ID_ATTEMPTS) {
         collisions += 1
+        retryingId = true
         holder = nextHolder()
         continue
       }
-      // Scheduled work never queues for a permit: staying due and coming back
-      // more overdue is cheaper than holding an invocation open for a peer.
-      const wait = deadline === undefined ? 0 : Math.min(interval, deadline - clock.now())
-      // Giving up at the deadline is giving up too late: the reader stops
-      // listening at that same instant, and would hear nothing rather than why.
-      if (wait <= 0 || clock.now() + wait >= (deadline as number)) {
-        return { ok: false, retryAt: grant.retryAt }
-      }
+      if (lastAttempt) return { ok: false, retryAt: grant.retryAt ?? now }
       await sleepFor(wait)
       interval = Math.min(interval * 2, MAX_PERMIT_POLL_MS)
       holder = nextHolder()

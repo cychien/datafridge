@@ -28,8 +28,9 @@ interface Store {
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // maxConcurrent across every executor: take one of `limit` permits, give it
   // back when the call ends, and let it expire if the holder never does. A
-  // refusal names the soonest one could free.
-  acquirePermit(source, limit, holder, expiresAt, now): Promise<PermitGrant>
+  // refusal names the soonest one could free, unless the caller said it will
+  // not act on the answer.
+  acquirePermit(source, limit, holder, expiresAt, now, explainRefusal?): Promise<PermitGrant>
   releasePermit(source: string, holder: string): Promise<void>
   // transient flights: overlapping reads of the same key make one call, and the
   // answer is handed only to the generation that waited for it
@@ -76,7 +77,9 @@ A backend with no conditional-write primitive cannot host the schedule half at a
 
 `acquirePermit` is `maxConcurrent` made real across executors. It grants at most `limit` live permits per source and never waits - waiting is the caller's business - and every permit carries an expiry, because the one thing a holder that died will never do is release it. On SQL that is a single conditional insert (`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`), so the count and the take cannot be split by a peer.
 
-Two details make it safe to build on. A refusal reports **when it could stop being one** - the soonest live permit for that source expires - so a caller can wait for something rather than poll for nothing; a scheduler uses that as its next wake time instead of trying again every second. And a `holder` that already holds a live permit is **refused, never allowed to take a second or to overwrite the first**: holder ids come from the caller, `random` is injectable, and a store that treated a duplicate as the same call would quietly hand two callers one permit. That refusal reports `retryAt: now`, because the source has room and only the id was in the way; the caller mints another and takes the slot.
+Two details make it safe to build on. A refusal reports **when it could stop being one** - the soonest live permit for that source expires - so a caller can wait for something rather than poll for nothing; a scheduler uses that as its next wake time instead of trying again every second. And a `holder` that already holds a **live** permit is **refused, never allowed to take a second or to overwrite the first**: holder ids come from the caller, `random` is injectable, and a store that treated a duplicate as the same call would quietly hand two callers one permit. That refusal reports `retryAt: now`, because the source has room and only the id was in the way; the caller mints another and takes the slot. An id whose own permit has *expired* is not that caller: the table no longer counts that permit, so the id may take one again like any other.
+
+`explainRefusal` is the caller saying whether it will act on `retryAt`. A reader waiting out a saturated source polls until its timeout, and only the last of those refusals is ever reported; the rest mint a fresh id and look again regardless. Deciding a refusal is one statement, but explaining it is a couple more - a count, and whatever collecting expired rows costs - and paying that per poll per waiting reader loads the store hardest exactly when the source is already saturated. So a store may answer `retryAt: null` when `explainRefusal` is false. Granting and refusing are unaffected; only the reason is optional, and a store that finds the reason free (an in-memory one does) may always give it. What a store must never do is invent one: `null` is the way to say "I did not look".
 
 `readSchedules` is the batched form of `readSchedule`, and it exists for one case: a registry larger than the page a tick reads has to establish, by name, whether the rows it did not reach exist. Without it core asks one at a time. `names` is always a bounded batch, so a single `WHERE name IN (...)` is the whole implementation.
 

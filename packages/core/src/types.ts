@@ -187,8 +187,12 @@ export interface StoreCapabilities {
  * moment the answer could change - the soonest live permit for that source
  * expires, or `now` when the source has room and only this holder id was in the
  * way - so a caller can wait for something rather than poll for nothing.
+ *
+ * `retryAt` is `null` when the caller said it did not need the reason and the
+ * store took it at its word. It is never a moment that is merely plausible: a
+ * store either knows when the answer could change, or says it does not.
  */
-export type PermitGrant = { granted: true } | { granted: false; retryAt: number }
+export type PermitGrant = { granted: true } | { granted: false; retryAt: number | null }
 
 /** What one upstream call for params no entry exists for came back with. */
 export type FlightOutcome =
@@ -256,7 +260,15 @@ export interface SchedulePlane {
    * A `holder` already holding a live permit is refused rather than allowed to
    * take a second or to overwrite the first: one id is one call's claim on one
    * permit, and two callers arriving with the same id are still two callers.
-   * That refusal reports `retryAt: now`, because the source itself has room.
+   * That refusal reports `retryAt: now`, because the source itself has room. A
+   * `holder` whose own permit has expired is not that caller: it may take one
+   * again, the same as any other id the table no longer counts.
+   *
+   * `explainRefusal` is the caller saying whether it will act on `retryAt`. A
+   * caller that is going to look again in a moment will not, and telling it so
+   * costs a store extra work on precisely the path a saturated source makes
+   * hottest, so a store may answer `retryAt: null` instead. Refusing and
+   * granting are unaffected; only the reason is optional. Defaults to explaining.
    */
   acquirePermit(
     source: string,
@@ -264,6 +276,7 @@ export interface SchedulePlane {
     holder: string,
     expiresAt: number,
     now: number,
+    explainRefusal?: boolean,
   ): Promise<PermitGrant>
   /** Gives a permit back the moment the call it was taken for is done. */
   releasePermit(source: string, holder: string): Promise<void>

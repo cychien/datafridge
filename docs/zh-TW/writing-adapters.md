@@ -28,8 +28,9 @@ interface Store {
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // maxConcurrent across every executor: take one of `limit` permits, give it
   // back when the call ends, and let it expire if the holder never does. A
-  // refusal names the soonest one could free.
-  acquirePermit(source, limit, holder, expiresAt, now): Promise<PermitGrant>
+  // refusal names the soonest one could free, unless the caller said it will
+  // not act on the answer.
+  acquirePermit(source, limit, holder, expiresAt, now, explainRefusal?): Promise<PermitGrant>
   releasePermit(source: string, holder: string): Promise<void>
   // transient flights: overlapping reads of the same key make one call, and the
   // answer is handed only to the generation that waited for it
@@ -76,7 +77,9 @@ interface Store {
 
 `acquirePermit` 是把 `maxConcurrent` 落實到跨 executor 的東西。它每個 source 最多發出 `limit` 張有效 permit，而且從不等待 - 等待是呼叫端的事 - 每張 permit 都帶著到期時間，因為死掉的持有者唯一不會做的事就是歸還它。在 SQL 上這是一條有條件的 insert（`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`），所以計數與取用無法被同儕從中切開。
 
-有兩個細節讓它可以被信賴地建構在上面。拒絕會回報**它何時可能不再是拒絕** - 該 source 最快到期的那張有效 permit - 讓呼叫端能等一件會發生的事，而不是空轉輪詢；scheduler 用它當下一次喚醒時間，而不是每秒再試一次。以及，已經持有有效 permit 的 `holder` 會被**拒絕，既不准拿第二張，也不准覆蓋第一張**：holder id 由呼叫端給、`random` 可注入，而把重複視為同一個呼叫的 store 會悄悄把一張 permit 發給兩個呼叫者。那個拒絕回報 `retryAt: now`，因為 source 有空位，擋路的只是那個 id；呼叫端換一個再拿就好。
+有兩個細節讓它可以被信賴地建構在上面。拒絕會回報**它何時可能不再是拒絕** - 該 source 最快到期的那張有效 permit - 讓呼叫端能等一件會發生的事，而不是空轉輪詢；scheduler 用它當下一次喚醒時間，而不是每秒再試一次。以及，已經持有**有效** permit 的 `holder` 會被**拒絕，既不准拿第二張，也不准覆蓋第一張**：holder id 由呼叫端給、`random` 可注入，而把重複視為同一個呼叫的 store 會悄悄把一張 permit 發給兩個呼叫者。那個拒絕回報 `retryAt: now`，因為 source 有空位，擋路的只是那個 id；呼叫端換一個再拿就好。至於自己那張 permit 已經**過期**的 id，就不是那個呼叫者了：表上已經不再把那張算進去，所以它跟任何其他 id 一樣可以再拿一張。
+
+`explainRefusal` 是呼叫端在說它會不會真的用到 `retryAt`。等待一個已飽和 source 的 reader 會一路輪詢到自己的 timeout，而這些拒絕裡只有最後一個會被回報出去；中間那些無論如何都會換一個新的 id 再看一次。判定一次拒絕只要一條 statement，但解釋它還要多幾條 - 一次計數，加上回收過期資料列的代價 - 而每個等待中的 reader 每次輪詢都付這筆錢，正好是在 source 已經飽和的時候把 store 壓得最重。所以當 `explainRefusal` 是 false 時，store 可以回答 `retryAt: null`。發放與拒絕本身不受影響，可有可無的只有理由；而覺得理由不花錢的 store（in-memory 的就是）永遠給也可以。store 唯一不可以做的是憑空編一個：`null` 就是「我沒去看」的說法。
 
 `readSchedules` 是 `readSchedule` 的批次版，存在的理由只有一個：比一個 tick 讀的那頁還大的 registry，必須逐名確認它沒讀到的那些 row 是否存在。沒有它，core 就一筆一筆問。`names` 一定是有界的批次，所以一條 `WHERE name IN (...)` 就是全部的實作。
 
