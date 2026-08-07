@@ -90,7 +90,7 @@ export function createReadPath(config: ReadPathConfig): ReadFn {
 
       let outcome: DispatchOutcome | undefined
       const running = dispatcher!
-        .run({ query, row, priority: 'demand', deadline }, start)
+        .run({ query, row, priority: 'demand', deadline })
         .then((result) => {
           outcome = result
         })
@@ -162,11 +162,9 @@ export function createReadPath(config: ReadPathConfig): ReadFn {
             'store that can claim and meter - pass the full store, not a results-only one',
         )
       }
-      const now = clock.now()
       const outcome = await dispatcher!.runEphemeral(
         open.instantiate(params),
-        now + open.timeoutMs,
-        now,
+        clock.now() + open.timeoutMs,
       )
       if (outcome.status === 'throttled') {
         return { status: 'throttled', retryAt: outcome.retryAt }

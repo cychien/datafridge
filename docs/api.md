@@ -231,7 +231,7 @@ All runtime exports are available from the package root. Independent subpaths ar
 
 ### Durable Object alarms
 
-Subclass `FridgeDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps its own schedule bookkeeping in its SQLite storage, so only the store's result half is used.
+Subclass `FridgeDO<Env>`, provide `queries` and `store(env)`, and optionally provide `sources`. The Durable Object keeps no coordination state of its own: schedule rows, leases, the quota ledger, permits, flights and results all live in the store you give it, and its own SQLite holds one row recording which registry it last ignited for. It orchestrates alarms, and nothing else.
 
 ```ts
 class Poller extends FridgeDO<Env> {
@@ -256,7 +256,7 @@ The registry, source policies, and Cloudflare timeout ceiling are validated when
 
 ### D1 stores
 
-- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. `FridgeDO` carries its own schedule plane and simply leaves D1's unused.
+- `d1(db)` implements the full atomic `Store`: result envelopes plus schedule rows claimed with a version-checked `UPDATE`, so it stays safe under a non-serialized driver. It is the whole coordination plane - `FridgeDO`, a cron trigger and any number of request-path readers over the same `d1(env.DB)` share its rows, leases, quota ledger, permits and flights.
 
 It applies its own tables before the first write, so the packaged migration at `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` is optional; a dropped table under a warm isolate is repaired and retried once. The read path never applies schema - a result table that does not exist yet reads as `null`. Writes larger than D1's 2,000,000-byte row limit are rejected while the previous envelope remains intact.
 

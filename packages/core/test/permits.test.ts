@@ -244,14 +244,11 @@ describe('a permit-starved read whose budget runs out mid-admission', () => {
     const acquires = { count: 0 }
     const live = { count: 0 }
     const held = deferred<string>()
-    const { fridge } = makeHarness(
-      [{ ...gated('cold', held.promise, live), timeout: 200 }],
-      {
-        store: withLatency(base, clock, 60, acquires),
-        clock,
-        sources: { posthog: { maxConcurrent: 1 } },
-      },
-    )
+    const { fridge } = makeHarness([{ ...gated('cold', held.promise, live), timeout: 200 }], {
+      store: withLatency(base, clock, 60, acquires),
+      clock,
+      sources: { posthog: { maxConcurrent: 1 } },
+    })
     await base.acquirePermit('posthog', 1, 'peer', 900_000, 0)
 
     const read = fridge.read('cold')
@@ -272,14 +269,11 @@ describe('a permit-starved read whose budget runs out mid-admission', () => {
     const acquires = { count: 0 }
     const live = { count: 0 }
     const held = deferred<string>()
-    const { fridge } = makeHarness(
-      [{ ...gated('cold', held.promise, live), timeout: 60_250 }],
-      {
-        store: withLatency(base, clock, 100, acquires),
-        clock,
-        sources: { posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 } },
-      },
-    )
+    const { fridge } = makeHarness([{ ...gated('cold', held.promise, live), timeout: 60_250 }], {
+      store: withLatency(base, clock, 100, acquires),
+      clock,
+      sources: { posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 } },
+    })
     // The window is spent, so the reader waits it out - and arrives at the
     // permit with less budget left than asking for one would cost.
     expect(await base.takeQuota('posthog', 1, 60_000, 0)).toBe(true)

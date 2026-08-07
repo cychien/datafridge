@@ -130,6 +130,72 @@ describe('reads of the same unnamed params that overlap', () => {
     expect(calls).toEqual(['alpha'])
   })
 
+  it('hand the cohort an answer when the store itself fails the leader', async () => {
+    const calls: string[] = []
+    const store = memoryStore()
+    let breaks = true
+    const brittle: Store = {
+      ...store,
+      takeQuota: async (source, limit, windowMs, now) => {
+        if (!breaks) return store.takeQuota(source, limit, windowMs, now)
+        throw new Error('D1_ERROR: network connection lost')
+      },
+    }
+    const { clock, fridge } = makeHarness(
+      funnel(
+        async (params) => {
+          calls.push((params as { courseId: string }).courseId)
+          return 'funnel:alpha'
+        },
+        { source: 'posthog' },
+      ),
+      { store: brittle, sources: { posthog: { limit: { requests: 5, per: '1m' } } } },
+    )
+
+    const first = fridge.read('course-funnel', alpha)
+    const second = fridge.read('course-funnel', alpha)
+    await clock.advance(0)
+    // One poll is all the follower needs, because the answer is already there.
+    await clock.advance(100)
+
+    // A leader that walks away without settling would leave these two polling a
+    // flight nobody is going to answer, until their own deadlines run out.
+    expect(await first).toBeNull()
+    expect(await second).toBeNull()
+    expect(calls).toEqual([])
+
+    // And the flight it left behind is finished, not still running: the next
+    // reader leads a new one rather than joining a corpse.
+    breaks = false
+    expect(stored(await fridge.read<string>('course-funnel', alpha))).toMatchObject({
+      data: 'funnel:alpha',
+    })
+    expect(calls).toEqual(['alpha'])
+  })
+
+  it('hand the quota back when the leader never reaches upstream', async () => {
+    const store = memoryStore()
+    const brittle: Store = {
+      ...store,
+      acquirePermit: async () => {
+        throw new Error('D1_ERROR: network connection lost')
+      },
+    }
+    const { clock, fridge } = makeHarness(
+      funnel(async () => 'funnel:alpha', { source: 'posthog' }),
+      {
+        store: brittle,
+        sources: { posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 } },
+      },
+    )
+
+    expect(await fridge.read('course-funnel', alpha)).toBeNull()
+    await clock.advance(0)
+
+    // Nothing reached upstream, so the window's single call is still there.
+    expect(await store.takeQuota('posthog', 1, MINUTE, 0)).toBe(true)
+  })
+
   it('hand the same failure to the whole cohort, and charge nobody twice', async () => {
     const gate = deferred<string>()
     const calls: string[] = []

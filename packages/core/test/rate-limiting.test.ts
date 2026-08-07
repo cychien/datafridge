@@ -106,6 +106,53 @@ describe('a read that runs out of quota', () => {
     // Nothing is wrong and nothing is missing - it is only not this reader's turn.
     expect(calls).toEqual({ a: 1 })
   })
+
+  it('leases from when the call starts, so the wait does not eat the lease', async () => {
+    const calls: Record<string, number> = {}
+    const gate = deferred<string>()
+    const cold: QueryDef = {
+      name: 'cold',
+      every: '5m',
+      source: 'posthog',
+      timeout: '2m',
+      lease: 150_000,
+      fetch: async () => {
+        calls['cold'] = (calls['cold'] ?? 0) + 1
+        return gate.promise
+      },
+    }
+    const { clock, store, fridge } = makeHarness([counted('a', calls), cold], {
+      sources: { posthog: { limit: { requests: 1, per: '1m' } } },
+    })
+    await fridge.runDue()
+
+    const read = fridge.read<string>('cold')
+    await flushMicrotasks()
+    expect(calls).toEqual({ a: 1 })
+
+    // Almost the whole window goes by before this call is admitted.
+    await clock.advance(MINUTE)
+    expect(calls).toEqual({ a: 1, cold: 1 })
+
+    // A lease measured from before the wait would already be part-spent here.
+    // It has to outlive the timeout the fetch is still running under.
+    const claimed = await store.readSchedule('cold')
+    expect(claimed?.leaseUntil).toBe(MINUTE + 150_000)
+
+    // Past where that part-spent lease would have expired, and a peer must
+    // still find this row held rather than call upstream a second time.
+    await clock.advance(100_000)
+    expect((await fridge.runDue()).skippedLeased).toEqual(['cold'])
+    expect(calls).toEqual({ a: 1, cold: 1 })
+
+    gate.resolve('cold')
+    await clock.advance(0)
+    // The reader's own budget ran out while it waited, but the call it started
+    // still owns the row, so its write-back lands instead of being discarded.
+    expect(await read).toBeNull()
+    expect(await store.readResult('cold')).toMatchObject({ data: 'cold' })
+    expect(calls).toEqual({ a: 1, cold: 1 })
+  })
 })
 
 describe('a dispatch that never reaches upstream', () => {

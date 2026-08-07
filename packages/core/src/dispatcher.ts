@@ -70,7 +70,13 @@ export interface DispatcherConfig {
  * nowhere else - there is no second path that could skip one of them.
  */
 export interface Dispatcher {
-  run(task: FetchTask, now: number): Promise<DispatchOutcome>
+  /**
+   * Times itself off the injected clock rather than from a `now` the caller
+   * took: admission can wait out a quota window or queue for a permit, and a
+   * lease, a permit or a fetcher's `now` measured from before that wait would
+   * already be part-spent when the call finally starts.
+   */
+  run(task: FetchTask): Promise<DispatchOutcome>
   /**
    * A call for params the registry does not name. It draws on the same source
    * window a reader's miss does, takes the same concurrency permit and is
@@ -83,7 +89,7 @@ export interface Dispatcher {
    * A read arriving after that flight settles is a new flight and a new call -
    * an answer belongs to the people who waited for it, not to whoever asks next.
    */
-  runEphemeral(query: EphemeralQuery, deadline: number, now: number): Promise<EphemeralOutcome>
+  runEphemeral(query: EphemeralQuery, deadline: number): Promise<EphemeralOutcome>
 }
 
 /** Runs a wait with this call's concurrency slot handed back for the duration. */
@@ -236,7 +242,12 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
    */
   const takePermit = async (
     source: string,
-    expiresAt: number,
+    /**
+     * When the permit stops counting, from the moment it is actually taken -
+     * queueing for one can outlast the wait that led here, so a lifetime
+     * measured from before the queue would be part-spent on arrival.
+     */
+    expiresAt: (takenAt: number) => number,
     deadline: number | undefined,
     trips: RoundTrips,
     /** Round trips the caller still owes on the way out of a refusal. */
@@ -276,7 +287,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       const explainRefusal = attempts === 0 || retryingId || lastAttempt
       retryingId = false
       const grant = await trips.observe(() =>
-        schedule.acquirePermit(source, max, holder, expiresAt, now, explainRefusal),
+        schedule.acquirePermit(source, max, holder, expiresAt(now), now, explainRefusal),
       )
       attempts += 1
       if (grant.granted) {
@@ -390,11 +401,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     return { status: 'failed', message, ...(nextRunAt !== undefined ? { nextRunAt } : {}) }
   }
 
-  const dispatch = async (
-    task: FetchTask,
-    now: number,
-    unslotted: Unslotted,
-  ): Promise<DispatchOutcome> => {
+  const dispatch = async (task: FetchTask, unslotted: Unslotted): Promise<DispatchOutcome> => {
     const { query, row } = task
     const { name, source } = query
     const policy = sources.get(source)
@@ -419,7 +426,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     }
     const permit = await takePermit(
       source,
-      now + query.leaseMs + PERMIT_GRACE_MS,
+      (takenAt) => takenAt + query.leaseMs + PERMIT_GRACE_MS,
       task.priority === 'demand' ? task.deadline : undefined,
       trips,
       metered ? 1 : 0,
@@ -429,7 +436,13 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       return { status: 'deferred', retryAt: permit.retryAt }
     }
     try {
-      const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
+      // Waiting out a quota window and queueing for a permit both spend wall
+      // clock, so the lease is measured from here rather than from when this
+      // dispatch was handed its `now`: a lease that started expiring before the
+      // call began is one a peer can reclaim mid-flight, which is exactly what
+      // `timeout` being shorter than `lease` exists to rule out.
+      const startedAt = clock.now()
+      const claimed = await schedule.claim(name, row.version, startedAt + query.leaseMs, startedAt)
       if (!claimed) {
         // Someone else is doing this work; nothing leaves for upstream here, so
         // the slot this call was counted for goes back to the window.
@@ -439,7 +452,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       const token = row.version + 1
       try {
         const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
-          query.fetch({ signal, now, attempt: row.failCount + 1 }),
+          query.fetch({ signal, now: startedAt, attempt: row.failCount + 1 }),
         )
         return await succeed(query, token, data, clock.now())
       } catch (err) {
@@ -479,7 +492,6 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     query: EphemeralQuery,
     generation: number,
     deadline: number,
-    now: number,
     unslotted: Unslotted,
   ): Promise<EphemeralOutcome> => {
     const { name, source } = query
@@ -497,39 +509,57 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     const policy = sources.get(source)
     const metered = policy !== undefined && policy.windowMs !== Infinity
     const trips = measureRoundTrips()
-    let takenAt = 0
-    if (metered) {
-      // A reader is waiting, so this draws on the same ceiling a miss does,
-      // reserve included - once, for everyone who joined.
-      const taken = await takeQuota(policy, source, policy.demandLimit, deadline, unslotted, trips)
-      if (!taken.ok) return settle({ status: 'throttled', retryAt: taken.retryAt })
-      takenAt = taken.takenAt
-    }
-    // A refusal here still has to hand the answer to the cohort, and the quota
-    // back if it took any.
-    const permit = await takePermit(
-      source,
-      deadline + PERMIT_GRACE_MS,
-      deadline,
-      trips,
-      metered ? 2 : 1,
-    )
-    if (!permit.ok) {
-      // Nothing reached upstream, so the slot goes back and the cohort is told
-      // it is not their turn - never that there is nothing.
-      if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-      return settle({ status: 'throttled', retryAt: permit.retryAt })
-    }
+    let charged: number | null = null
+    // Every exit from here settles: a leader that walks away without one leaves
+    // its cohort polling a flight nobody is ever going to answer, until their
+    // own deadlines run out. A store that throws mid-admission is the ordinary
+    // way that happens, and the cohort is owed an answer for it too.
     try {
-      const remaining = Math.max(0, Math.min(query.timeoutMs, deadline - clock.now()))
-      const data = await withDeadline(clock, remaining, `query '${name}'`, (signal) =>
-        query.fetch({ signal, now, attempt: 1 }),
+      if (metered) {
+        // A reader is waiting, so this draws on the same ceiling a miss does,
+        // reserve included - once, for everyone who joined.
+        const taken = await takeQuota(
+          policy,
+          source,
+          policy.demandLimit,
+          deadline,
+          unslotted,
+          trips,
+        )
+        if (!taken.ok) return await settle({ status: 'throttled', retryAt: taken.retryAt })
+        charged = taken.takenAt
+      }
+      // A refusal here still has to hand the answer to the cohort, and the quota
+      // back if it took any.
+      const permit = await takePermit(
+        source,
+        () => deadline + PERMIT_GRACE_MS,
+        deadline,
+        trips,
+        metered ? 2 : 1,
       )
-      return await settle({ status: 'ran', data })
+      if (!permit.ok) {
+        // Nothing reached upstream, so the slot goes back and the cohort is told
+        // it is not their turn - never that there is nothing.
+        if (charged !== null) await giveQuotaBack(source, policy!.windowMs, charged)
+        return await settle({ status: 'throttled', retryAt: permit.retryAt })
+      }
+      charged = null
+      try {
+        const startedAt = clock.now()
+        const remaining = Math.max(0, Math.min(query.timeoutMs, deadline - startedAt))
+        const data = await withDeadline(clock, remaining, `query '${name}'`, (signal) =>
+          query.fetch({ signal, now: startedAt, attempt: 1 }),
+        )
+        return await settle({ status: 'ran', data })
+      } catch (err) {
+        return await settle({ status: 'failed', message: errorMessage(err) })
+      } finally {
+        await permit.release()
+      }
     } catch (err) {
+      if (charged !== null) await giveQuotaBack(source, policy!.windowMs, charged)
       return await settle({ status: 'failed', message: errorMessage(err) })
-    } finally {
-      await permit.release()
     }
   }
 
@@ -558,23 +588,19 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
   }
 
   return {
-    run(task: FetchTask, now: number): Promise<DispatchOutcome> {
-      return inSlot(task.query.source, (unslotted) => dispatch(task, now, unslotted))
+    run(task: FetchTask): Promise<DispatchOutcome> {
+      return inSlot(task.query.source, (unslotted) => dispatch(task, unslotted))
     },
 
-    async runEphemeral(
-      query: EphemeralQuery,
-      deadline: number,
-      now: number,
-    ): Promise<EphemeralOutcome> {
+    async runEphemeral(query: EphemeralQuery, deadline: number): Promise<EphemeralOutcome> {
       // Joining happens before any slot is taken: a follower makes no call, so
       // it must not sit on the budget that bounds the ones that do.
-      const ticket = await schedule.joinFlight(query.name, deadline + PERMIT_GRACE_MS, now)
+      const ticket = await schedule.joinFlight(query.name, deadline + PERMIT_GRACE_MS, clock.now())
       if (ticket.role === 'follower') {
         return awaitFlight(query.name, ticket.generation, deadline)
       }
       return inSlot(query.source, (unslotted) =>
-        leadFlight(query, ticket.generation, deadline, now, unslotted),
+        leadFlight(query, ticket.generation, deadline, unslotted),
       )
     },
   }

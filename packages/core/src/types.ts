@@ -400,6 +400,10 @@ export interface SourceLimit {
 export interface SourcePolicy {
   /** The hard ceiling, counted in the store's ledger and shared by every executor. */
   limit?: SourceLimit
-  /** Instantaneous smoothing inside one instance. Does not bound total volume. */
+  /**
+   * How many calls to this source may be in flight at once, across every
+   * executor sharing the store - it is a permit taken there for the length of
+   * the call, not per-process smoothing. It bounds concurrency, not volume.
+   */
   maxConcurrent?: number
 }

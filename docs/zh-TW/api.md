@@ -231,7 +231,7 @@ Runtime exports 都可從 package root 使用，也提供獨立 subpaths：
 
 ### Durable Object alarms
 
-Subclass `FridgeDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提供 `sources`。Durable Object 把自己的排程簿記放在它的 SQLite storage，所以 store 只有 result 那一半會被用到。
+Subclass `FridgeDO<Env>`、提供 `queries` 與 `store(env)`，並可選擇提供 `sources`。Durable Object 自己不留任何協調狀態：schedule row、lease、quota ledger、permit、flight 與 result 全都住在你給它的 store 裡，它自己的 SQLite 只有一列，記著它上次是為哪一份 registry 點的火。它只負責調度 alarm，除此之外什麼都不做。
 
 ```ts
 class Poller extends FridgeDO<Env> {
@@ -256,7 +256,7 @@ Registry、source policies 與 Cloudflare timeout ceiling 會在 object 啟動�
 
 ### D1 stores
 
-- `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。`FridgeDO` 自帶 schedule plane，會直接把 D1 的那一半閒置。
+- `d1(db)` 實作完整的 atomic `Store`：result envelopes，加上以檢查 version 的 `UPDATE` 進行 claim 的 schedule rows，因此在非 serialized driver 下也安全。它就是整個協調平面 - `FridgeDO`、cron trigger，以及任意多個對著同一份 `d1(env.DB)` 的 request path reader，共用它的 row、lease、quota ledger、permit 與 flight。
 
 它會在第一次寫入前自己建表，所以 `@datafridge/cloudflare/migrations/0001_datafridge_init.sql` 是可選的；暖 isolate 底下表被刪掉時會重建並重試一次。讀取路徑從不建表 - 還不存在的 result table 讀起來就是 `null`。超過 D1 2,000,000-byte row limit 的寫入會被拒絕，舊資料保持不變。
 

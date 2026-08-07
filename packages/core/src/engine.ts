@@ -307,7 +307,6 @@ export function createFridge(config: FridgeConfig): Fridge {
    */
   const dispatchDue = async (
     plan: readonly Candidate[],
-    now: number,
     startedAt: number,
     onOutcome: (candidate: Candidate, outcome: DispatchOutcome) => void,
     /** `null` means "as soon as there is an invocation", not "at some time". */
@@ -342,7 +341,7 @@ export function createFridge(config: FridgeConfig): Fridge {
           if (admitted.length === 0) continue
           await Promise.allSettled(
             admitted.map(async (candidate) => {
-              const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
+              const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' })
               // One refusal is the whole answer for this source this tick,
               // whether the window is spent or its calls are all in flight.
               if (outcome.status === 'throttled' || outcome.status === 'deferred') {
@@ -412,7 +411,6 @@ export function createFridge(config: FridgeConfig): Fridge {
 
       await dispatchDue(
         plan,
-        now,
         startedAt,
         (candidate, outcome) => {
           dispatched.add(candidate.query.name)
