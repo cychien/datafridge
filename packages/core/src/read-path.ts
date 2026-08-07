@@ -101,9 +101,12 @@ export function createReadPath(config: ReadPathConfig): ReadFn {
       if (outcome.status === 'ran') {
         return shapeRead<T>(await store.readResult(key), clock.now())
       }
-      // The source is spent for this window. The row stays due, so the next
-      // tick picks the work up and the reader after this one finds it there.
-      if (outcome.status === 'throttled') return { status: 'throttled', retryAt: outcome.retryAt }
+      // The source is spent for this window, or every call it may have in
+      // flight is already out. Either way nothing reached upstream and the row
+      // stays due: "not your turn yet" is an answer, and it is not `null`.
+      if (outcome.status === 'throttled' || outcome.status === 'deferred') {
+        return { status: 'throttled', retryAt: outcome.retryAt }
+      }
       // Lost the claim to an executor that got there first: wait for it.
     }
 

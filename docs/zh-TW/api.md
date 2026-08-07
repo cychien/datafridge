@@ -147,7 +147,7 @@ interface RunReport {
 }
 ```
 
-`throttled` 是 source 的窗口，`deferred` 是這次 invocation 承接不了的其他一切 - 剩餘的 wall clock，或該 source 的併發上限。兩者都讓 row 維持原樣，所以兩者都只是更過期地回來，不會遺失。`nextRunAt` 是這個 fridge 下一次有工作的時間，由該 tick 手上既有的 row 算出來 - 自己排喚醒的 driver 用它，而不必再問一次 storage；`null` 代表根本沒有任何排程。
+`throttled` 是 source 的窗口，`deferred` 是這次 invocation 承接不了的其他一切 - 剩餘的 wall clock，或該 source 的併發上限。兩者都讓 row 維持原樣，所以兩者都只是更過期地回來，不會遺失，而且兩者都會餵給 `nextRunAt`：天花板會說出自己何時可能鬆開，用完 wall clock 則是請求下一次 invocation。`nextRunAt` 是這個 fridge 下一次有工作的時間，由該 tick 手上既有的 row 算出來 - 自己排喚醒的 driver 用它，而不必再問一次 storage；`null` 代表根本沒有任何排程。
 
 成功 refresh 會從完成時間排定下一次執行。失敗會保留舊 envelope，並以有 jitter 的 exponential backoff 重試，上限為 `every`。
 
@@ -164,7 +164,7 @@ await fridge.read('course-analytics', { courseId: 'course-a', window: '7d' })
 
 Fridge 在沒有人持有 lease 時自己抓，有人持有就等那個人，所以同時來多少讀者都只有一次上游呼叫 - 和讓併發 tick 只跑一次的是同一個 lease。Query 正處於 backoff 之間時直接回 `null`，不為一個不會來的東西等待；到達 timeout 時，那次抓取會像在排程 tick 上一樣被 abort 並記為失敗，讀取則回 `null`。
 
-Source 額度用完時的 miss 回傳第三種 status，而不是 `null` - 因為「還沒輪到你」不等於「沒有這個東西」：
+Source 額度用完 - 或者它的呼叫全都已經在途 - 時的 miss 回傳第三種 status，而不是 `null`，因為「還沒輪到你」不等於「沒有這個東西」：
 
 ```ts
 const result = await fridge.read<Result>('analytics-7d')

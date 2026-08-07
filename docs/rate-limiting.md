@@ -52,7 +52,9 @@ Before giving up it waits, inside its own `timeout`, for the window to roll - so
 
 It is a permit in the store, taken for the length of the call and given back when it ends. A holder that dies never gives its permit back, so a permit also expires; until then it counts, and after it does not. That is what makes the number mean the same thing to a Durable Object, a cron trigger and fifty concurrent Worker invocations - the alternative is a limit each, which is not a limit.
 
-In flight means in flight: a reader waiting out a quota window holds no permit, so a call that is doing nothing cannot sit on the budget that exists to bound calls that are. A scheduled refresh that finds no permit does not queue for one either - it stays due, comes back more overdue, and arrives in `RunReport.deferred`.
+In flight means in flight: a reader waiting out a quota window holds no permit, so a call that is doing nothing cannot sit on the budget that exists to bound calls that are.
+
+The two kinds of caller wait differently, for the same reason they do at the quota window. A **read** queues for a permit inside its own `timeout`, and if the deadline arrives first it answers `status: 'throttled'` with the `retryAt` of the soonest permit that could free - never `null`, because nothing reached upstream and nothing is missing. A **scheduled refresh** does not queue at all: it stays due, comes back more overdue, and arrives in `RunReport.deferred`. Either way the quota that call reserved is handed straight back, because no call happened.
 
 ## The capacity: what one invocation will take on
 
@@ -60,7 +62,8 @@ Capacity is not a rate limit and does not belong to a source, and it is not a nu
 
 - It reads **one bounded page** of the earliest rows. Page size is an implementation detail; what matters is that no registry size can make a tick read more storage than that.
 - It admits a call only while that call's own **`timeout`** still fits in the invocation's remaining wall clock, which the driver reports as `budgetMs`. Work that could not have finished is never begun.
-- It stops asking a source that has **already refused this tick**. One `takeQuota` answer is how it learns the window is spent; the rest of that source's work is deferred without paying a round trip to be told the same thing.
+- It stops asking a source that has **already refused this tick**, whether the window is spent or its permits are all out. One answer is how it learns; the rest of that source's work is deferred without paying a round trip to be told the same thing.
+- It **waits for the refusal to mean something**. A ceiling names the moment it could give way - the window boundary, or the soonest permit expiry - so the next wake is then, not a second later and not three hundred times over. Running out of wall clock names nothing, and only that asks to be followed immediately.
 - It removes at most a **bounded number of departed rows** per tick, because a list that dropped ten thousand variants at once is a deployment, not an emergency.
 
 What does not fit is not touched: no lease, no store write, nothing asked of upstream. Those names come back in `RunReport.deferred`, and because priority is the overdue ratio they are the most overdue thing the next tick sees. The tick also reports `nextRunAt`, so a `FridgeDO` re-arms straight away when there is a backlog and drains it at the one-second alarm floor rather than in one invocation that risks the wall clock.

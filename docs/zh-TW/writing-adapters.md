@@ -27,8 +27,9 @@ interface Store {
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // maxConcurrent across every executor: take one of `limit` permits, give it
-  // back when the call ends, and let it expire if the holder never does
-  acquirePermit(source, limit, holder, expiresAt, now): Promise<boolean>
+  // back when the call ends, and let it expire if the holder never does. A
+  // refusal names the soonest one could free.
+  acquirePermit(source, limit, holder, expiresAt, now): Promise<PermitGrant>
   releasePermit(source: string, holder: string): Promise<void>
   // transient flights: overlapping reads of the same key make one call, and the
   // answer is handed only to the generation that waited for it
@@ -36,6 +37,8 @@ interface Store {
   readFlight(key: string, now: number): Promise<FlightState | null>
   settleFlight(key, generation, outcome, keepUntil): Promise<boolean>
   sweepFlights(before: number, limit: number): Promise<number>
+  // optional capability: one bounded batch of rows by name, in the order asked
+  readSchedules?(names: readonly string[]): Promise<Array<ScheduleRow | null>>
   // optional capability: SQL backends can fetch a page of the earliest rows in
   // one query; without it, core reads row by row. `limit` is always finite -
   // core never asks a store to enumerate itself
@@ -73,7 +76,11 @@ interface Store {
 
 `acquirePermit` 是把 `maxConcurrent` 落實到跨 executor 的東西。它每個 source 最多發出 `limit` 張有效 permit，而且從不等待 - 等待是呼叫端的事 - 每張 permit 都帶著到期時間，因為死掉的持有者唯一不會做的事就是歸還它。在 SQL 上這是一條有條件的 insert（`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`），所以計數與取用無法被同儕從中切開。
 
-`joinFlight` 是讓「registry 沒有指名的 parameter 組合」在重疊讀取時只發一次呼叫的機制。第一個呼叫者是 leader；在它執行期間抵達的都是那個 `generation` 的 follower。`settleFlight` 為該 generation 寫下答案，一旦 generation 前進就會被拒絕 - 這正是遲到的答案不會被交給錯誤群組的原因。在 flight 結束後才抵達的呼叫者會開一個新的 generation - 答案屬於等它的那批讀者，重用它就會讓那個組合變成一個快取 entry，而它正好不是。Flight 是暫時的：它們會過期，`sweepFlights` 以有界的批次丟掉已結束的那些。
+有兩個細節讓它可以被信賴地建構在上面。拒絕會回報**它何時可能不再是拒絕** - 該 source 最快到期的那張有效 permit - 讓呼叫端能等一件會發生的事，而不是空轉輪詢；scheduler 用它當下一次喚醒時間，而不是每秒再試一次。以及，已經持有有效 permit 的 `holder` 會被**拒絕，既不准拿第二張，也不准覆蓋第一張**：holder id 由呼叫端給、`random` 可注入，而把重複視為同一個呼叫的 store 會悄悄把一張 permit 發給兩個呼叫者。那個拒絕回報 `retryAt: now`，因為 source 有空位，擋路的只是那個 id；呼叫端換一個再拿就好。
+
+`readSchedules` 是 `readSchedule` 的批次版，存在的理由只有一個：比一個 tick 讀的那頁還大的 registry，必須逐名確認它沒讀到的那些 row 是否存在。沒有它，core 就一筆一筆問。`names` 一定是有界的批次，所以一條 `WHERE name IN (...)` 就是全部的實作。
+
+`joinFlight` 是讓「registry 沒有指名的 parameter 組合」在重疊讀取時只發一次呼叫的機制。第一個呼叫者是 leader；在它執行期間抵達的都是那個 `generation` 的 follower。`settleFlight` 為該 generation 寫下答案，一旦 generation 前進就會被拒絕 - 這正是遲到的答案不會被交給錯誤群組的原因。在 flight 結束後才抵達的呼叫者會開一個新的 generation - 答案屬於等它的那批讀者，重用它就會讓那個組合變成一個快取 entry，而它正好不是。Flight 是暫時的：它們會過期，`sweepFlights` 以有界的批次丟掉已結束的那些。它也會丟掉過了期限仍在跑的那些，而呼叫端傳進來的 `before` 刻意遠遠落後 `now`，理由是：刪掉一個還在跑的 flight，會讓下一個呼叫者從 generation 一重新開始，而那正好是遲到的 leader 手上還握著的那個值。那段餘裕就是讓 generation 只增不減的東西。
 
 ## 排程那一半從哪來（建構時就決定）
 

@@ -33,7 +33,12 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  *   one it has moved past, and never drives usage below zero
  * - listDue is the only enumeration core performs, and it is always given a limit
  * - acquirePermit grants at most `limit` live permits per source and never waits; an
- *   expired permit stops counting, which is how a holder that died is recovered from
+ *   expired permit stops counting, which is how a holder that died is recovered from,
+ *   a holder id already holding one is refused rather than sharing or overwriting it,
+ *   and a refusal names the soonest a permit could free (or `now` when the source has
+ *   room and only the id was in the way)
+ * - sweepFlights removes settled flights past their handoff window and running ones past
+ *   their expiry, and never a running flight whose expiry is still ahead
  * - joinFlight makes one caller the leader and everyone overlapping it a follower; an
  *   answer is handed only to the generation that waited for it, a caller arriving after
  *   a flight settles starts a new one, and a dead leader is taken over
@@ -192,6 +197,19 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         expect(store.capabilities.listDue).toBe(typeof store.listDue === 'function')
       })
 
+      it('readSchedules answers in the order asked, with null for what is missing', async () => {
+        if (!store.readSchedules) return
+        await store.writeSchedule(row({ name: 'one', nextRunAt: 100 }))
+        await store.writeSchedule(row({ name: 'two', nextRunAt: 200 }))
+
+        expect(await store.readSchedules(['two', 'missing', 'one'])).toEqual([
+          row({ name: 'two', nextRunAt: 200 }),
+          null,
+          row({ name: 'one', nextRunAt: 100 }),
+        ])
+        expect(await store.readSchedules([])).toEqual([])
+      })
+
       it('listDue returns only due rows, ordered, honoring the limit (listDue stores)', async () => {
         if (!store.capabilities.listDue || !store.listDue) return
         await store.writeSchedule(row({ name: 'late', nextRunAt: 100 }))
@@ -287,24 +305,63 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
       const LIVE = 90_000
 
       it('grants up to the limit and refuses beyond it, per source', async () => {
-        expect(await store.acquirePermit('posthog', 2, 'a', LIVE, 1_000)).toBe(true)
-        expect(await store.acquirePermit('posthog', 2, 'b', LIVE, 1_000)).toBe(true)
-        expect(await store.acquirePermit('posthog', 2, 'c', LIVE, 1_000)).toBe(false)
-        expect(await store.acquirePermit('stripe', 2, 'd', LIVE, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 2, 'a', LIVE, 1_000)).toEqual({ granted: true })
+        expect(await store.acquirePermit('posthog', 2, 'b', LIVE, 1_000)).toEqual({ granted: true })
+        expect(await store.acquirePermit('posthog', 2, 'c', LIVE, 1_000)).toEqual({
+          granted: false,
+          retryAt: LIVE,
+        })
+        expect(await store.acquirePermit('stripe', 2, 'd', LIVE, 1_000)).toEqual({ granted: true })
+      })
+
+      it('names the soonest a permit could free when it refuses', async () => {
+        await store.acquirePermit('posthog', 2, 'early', 20_000, 1_000)
+        await store.acquirePermit('posthog', 2, 'late', 50_000, 1_000)
+        expect(await store.acquirePermit('posthog', 2, 'third', LIVE, 1_000)).toEqual({
+          granted: false,
+          retryAt: 20_000,
+        })
+      })
+
+      it('refuses a holder id that is already holding one, and says the source has room', async () => {
+        expect(await store.acquirePermit('posthog', 4, 'same', LIVE, 1_000)).toEqual({
+          granted: true,
+        })
+        // One id is one call's claim. A second caller wearing it is still a
+        // second caller: it must neither share the row nor overwrite it.
+        expect(await store.acquirePermit('posthog', 4, 'same', LIVE, 1_000)).toEqual({
+          granted: false,
+          retryAt: 1_000,
+        })
+        // The first holder still has exactly one permit, and releasing once
+        // frees exactly one.
+        await store.releasePermit('posthog', 'same')
+        expect(await store.acquirePermit('posthog', 1, 'other', LIVE, 1_000)).toEqual({
+          granted: true,
+        })
       })
 
       it('frees the slot when the holder gives it back', async () => {
-        expect(await store.acquirePermit('posthog', 1, 'a', LIVE, 1_000)).toBe(true)
-        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toBe(false)
+        expect(await store.acquirePermit('posthog', 1, 'a', LIVE, 1_000)).toEqual({ granted: true })
+        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toMatchObject({
+          granted: false,
+        })
         await store.releasePermit('posthog', 'a')
-        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toEqual({ granted: true })
       })
 
       it('stops counting a holder that died, once its permit expires', async () => {
-        expect(await store.acquirePermit('posthog', 1, 'gone', 5_000, 1_000)).toBe(true)
-        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 4_999)).toBe(false)
+        expect(await store.acquirePermit('posthog', 1, 'gone', 5_000, 1_000)).toEqual({
+          granted: true,
+        })
+        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 4_999)).toEqual({
+          granted: false,
+          retryAt: 5_000,
+        })
         // Nobody released it; the expiry is what recovers the slot.
-        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 5_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 5_000)).toEqual({
+          granted: true,
+        })
       })
 
       it('releasing a permit nobody holds is not an error', async () => {
@@ -318,7 +375,15 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
             store.acquirePermit('posthog', 5, `h${i}`, LIVE, 1_000),
           ),
         )
-        expect(outcomes.filter(Boolean)).toHaveLength(5)
+        expect(outcomes.filter((grant) => grant.granted)).toHaveLength(5)
+      })
+
+      it('grants exactly one permit to a colliding id under concurrent acquires', async () => {
+        if (!store.capabilities.atomicClaim) return
+        const outcomes = await Promise.all(
+          Array.from({ length: 8 }, () => store.acquirePermit('posthog', 8, 'same', LIVE, 1_000)),
+        )
+        expect(outcomes.filter((grant) => grant.granted)).toHaveLength(1)
       })
     })
 
@@ -383,6 +448,16 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         expect(await store.readFlight('cold', 6_000)).toBeNull()
         expect(await store.readFlight('live', 6_000)).toMatchObject({ running: 1 })
         expect(await store.sweepFlights(6_000, 0)).toBe(0)
+      })
+
+      it('keeps a running flight until its expiry is behind the sweep', async () => {
+        await store.joinFlight('k', 9_000, 1_000)
+        // A leader is still entitled to settle right up to its expiry, and the
+        // row is the only thing keeping its generation from being handed out
+        // again to somebody else.
+        expect(await store.sweepFlights(8_999, 10)).toBe(0)
+        expect(await store.readFlight('k', 2_000)).toMatchObject({ running: 1 })
+        expect(await store.sweepFlights(9_000, 10)).toBe(1)
       })
 
       it('answers null for a flight nobody has ever joined', async () => {

@@ -24,6 +24,10 @@ const MAX_FLIGHT_POLL_MS = 500
 const PERMIT_GRACE_MS = 30_000
 const PERMIT_POLL_MS = 25
 const MAX_PERMIT_POLL_MS = 500
+// A refusal that says the source has room was this holder id colliding with a
+// peer's. Mint another and take the slot; the bound is only there so a store
+// that always refuses cannot spin.
+const PERMIT_ID_ATTEMPTS = 8
 
 export type FetchTask = {
   query: ResolvedQuery
@@ -40,8 +44,12 @@ export type DispatchOutcome =
   | { status: 'ran'; nextRunAt: number }
   | { status: 'leased' }
   | { status: 'throttled'; retryAt: number }
-  /** The source is at its concurrency ceiling; nothing was claimed or called. */
-  | { status: 'deferred' }
+  /**
+   * The source is at its concurrency ceiling; nothing was claimed or called.
+   * `retryAt` is the soonest a permit can free - a peer's expiry - so nobody
+   * has to poll for a thing that cannot change before then.
+   */
+  | { status: 'deferred'; retryAt: number }
   | { status: 'failed'; message: string; nextRunAt?: number }
 
 /** A call with no entry behind it: it either brings data back, or it does not. */
@@ -118,8 +126,16 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
   const { store, schedule, clock, random, sources } = config
   const semaphores = makeSemaphores(sources)
   let holderSeq = 0
-  const holderPrefix = Math.floor(random() * 0x1_0000_0000).toString(36)
-  const nextHolder = (): string => `${holderPrefix}-${(holderSeq += 1).toString(36)}`
+  // Entropy where there is any, and a per-call counter where there is not:
+  // `random` is injectable and pinned in tests, so uniqueness is never assumed.
+  // The store refuses a duplicate holder outright, which is what makes a
+  // collision cost one retry rather than a breached ceiling.
+  const nextHolder = (): string =>
+    [
+      Math.floor(random() * 0x1_0000_0000).toString(36),
+      clock.now().toString(36),
+      (holderSeq += 1).toString(36),
+    ].join('-')
 
   const isOwner = async (name: string, token: number): Promise<boolean> => {
     const current = await schedule.readSchedule(name)
@@ -192,32 +208,47 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     source: string,
     expiresAt: number,
     deadline: number | undefined,
-  ): Promise<{ ok: true; release: () => Promise<void> } | { ok: false }> => {
+  ): Promise<{ ok: true; release: () => Promise<void> } | { ok: false; retryAt: number }> => {
     const max = sources.get(source)?.maxConcurrent
     if (max === undefined || !Number.isFinite(max)) {
       return { ok: true, release: async () => undefined }
     }
-    const holder = nextHolder()
     let interval = PERMIT_POLL_MS
+    let collisions = 0
+    let holder = nextHolder()
     for (;;) {
-      if (await schedule.acquirePermit(source, max, holder, expiresAt, clock.now())) break
+      const grant = await schedule.acquirePermit(source, max, holder, expiresAt, clock.now())
+      if (grant.granted) {
+        const taken = holder
+        return {
+          ok: true,
+          release: async () => {
+            try {
+              await schedule.releasePermit(source, taken)
+            } catch {
+              // The permit expires on its own; a failed release costs a little
+              // headroom until then, never correctness.
+            }
+          },
+        }
+      }
+      // The source has room, so the id was what stood in the way.
+      if (grant.retryAt <= clock.now() && collisions < PERMIT_ID_ATTEMPTS) {
+        collisions += 1
+        holder = nextHolder()
+        continue
+      }
       // Scheduled work never queues for a permit: staying due and coming back
       // more overdue is cheaper than holding an invocation open for a peer.
-      const remaining = deadline === undefined ? 0 : deadline - clock.now()
-      if (remaining <= 0) return { ok: false }
-      await sleepFor(Math.min(interval, remaining))
+      const wait = deadline === undefined ? 0 : Math.min(interval, deadline - clock.now())
+      // Giving up at the deadline is giving up too late: the reader stops
+      // listening at that same instant, and would hear nothing rather than why.
+      if (wait <= 0 || clock.now() + wait >= (deadline as number)) {
+        return { ok: false, retryAt: grant.retryAt }
+      }
+      await sleepFor(wait)
       interval = Math.min(interval * 2, MAX_PERMIT_POLL_MS)
-    }
-    return {
-      ok: true,
-      release: async () => {
-        try {
-          await schedule.releasePermit(source, holder)
-        } catch {
-          // The permit expires on its own; a failed release costs a little
-          // headroom until then, never correctness.
-        }
-      },
+      holder = nextHolder()
     }
   }
 
@@ -335,7 +366,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     )
     if (!permit.ok) {
       if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-      return { status: 'deferred' }
+      return { status: 'deferred', retryAt: permit.retryAt }
     }
     try {
       const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
@@ -415,8 +446,10 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     }
     const permit = await takePermit(source, deadline + PERMIT_GRACE_MS, deadline)
     if (!permit.ok) {
+      // Nothing reached upstream, so the slot goes back and the cohort is told
+      // it is not their turn - never that there is nothing.
       if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-      return settle({ status: 'failed', message: `query '${name}': no permit before the deadline` })
+      return settle({ status: 'throttled', retryAt: permit.retryAt })
     }
     try {
       const remaining = Math.max(0, Math.min(query.timeoutMs, deadline - clock.now()))

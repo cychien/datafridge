@@ -141,6 +141,25 @@ export function d1(db: D1Database): Store {
       }
     },
 
+    // One statement for a bounded batch, keyed by the primary key. Reads apply
+    // no schema, exactly as the single-row read above does not.
+    async readSchedules(names) {
+      if (names.length === 0) return []
+      try {
+        const { results } = await db
+          .prepare(
+            `SELECT * FROM datafridge_schedule WHERE name IN (${names.map(() => '?').join(', ')})`,
+          )
+          .bind(...names)
+          .all<ScheduleRecord>()
+        const found = new Map(results.map((record) => [record.name, toScheduleRow(record)]))
+        return names.map((name) => found.get(name) ?? null)
+      } catch (err) {
+        if (isMissingTable(err)) return names.map(() => null)
+        throw err
+      }
+    },
+
     async writeSchedule(row) {
       return withSchema(db, async () => {
         await db
@@ -253,22 +272,34 @@ export function d1(db: D1Database): Store {
     },
 
     // One statement decides and takes: the count and the insert cannot be
-    // separated by a peer, so two Workers cannot both read "one slot left".
+    // separated by a peer, so two Workers cannot both read "one slot left". A
+    // holder id already in the table is a different caller wearing the same
+    // name, so the insert is skipped rather than allowed to overwrite it.
     async acquirePermit(source, limit, holder, expiresAt, now) {
       return withSchema(db, async () => {
         const taken = await db
           .prepare(
             'INSERT INTO datafridge_permit (holder, source, expires_at) SELECT ?, ?, ? ' +
               'WHERE (SELECT COUNT(*) FROM datafridge_permit ' +
-              'WHERE source = ? AND expires_at > ?) < ?',
+              'WHERE source = ? AND expires_at > ?) < ? ' +
+              'ON CONFLICT (holder) DO NOTHING',
           )
           .bind(holder, source, expiresAt, source, now, limit)
           .run()
-        if (taken.meta.changes === 1) return true
+        if (taken.meta.changes === 1) return { granted: true }
         // Refused: this is the moment worth paying to collect the permits of
         // holders that died, so the next caller sees the real count.
         await db.prepare('DELETE FROM datafridge_permit WHERE expires_at <= ?').bind(now).run()
-        return false
+        const live = await db
+          .prepare(
+            'SELECT COUNT(*) AS held, MIN(expires_at) AS soonest FROM datafridge_permit ' +
+              'WHERE source = ? AND expires_at > ?',
+          )
+          .bind(source, now)
+          .first<{ held: number; soonest: number | null }>()
+        // Room to spare means the holder id was the only thing in the way.
+        if (!live || live.held < limit) return { granted: false, retryAt: now }
+        return { granted: false, retryAt: live.soonest ?? now }
       })
     },
 

@@ -23,6 +23,7 @@ export type {
   FlightOutcome,
   FlightState,
   FlightTicket,
+  PermitGrant,
   LastError,
   ParameterizedFetchCtx,
   ParameterizedQueryDef,

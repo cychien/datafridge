@@ -147,7 +147,7 @@ interface RunReport {
 }
 ```
 
-`throttled` is the source's window and `deferred` is everything else this invocation could not take on - its remaining wall clock, or the source's concurrency ceiling. Both leave the row exactly as it was, so both come back more overdue rather than lost. `nextRunAt` is when this fridge next has work, computed from the rows the tick already held - a driver that schedules its own wake-ups uses it instead of asking storage again, and `null` means there is nothing scheduled at all.
+`throttled` is the source's window and `deferred` is everything else this invocation could not take on - its remaining wall clock, or the source's concurrency ceiling. Both leave the row exactly as it was, so both come back more overdue rather than lost, and both feed `nextRunAt`: a ceiling names when it could give way, while running out of wall clock asks for the next invocation. `nextRunAt` is when this fridge next has work, computed from the rows the tick already held - a driver that schedules its own wake-ups uses it instead of asking storage again, and `null` means there is nothing scheduled at all.
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 
@@ -164,7 +164,7 @@ A read has exactly two behaviours, and no options that change them:
 
 The fridge fetches when nobody else holds the lease and waits for whoever does, so however many readers arrive at once there is one upstream call - the same lease that keeps concurrent ticks to one. A query between backoff attempts answers `null` rather than waiting for something that is not coming, and when the timeout is reached the fetch is aborted and counted as a failure exactly as on a scheduled tick, leaving the read to answer `null`.
 
-A miss on a source that has run out of quota answers a third status rather than `null`, because "not your turn yet" is not "there is nothing":
+A miss on a source that has run out of quota - or whose calls are all already in flight - answers a third status rather than `null`, because "not your turn yet" is not "there is nothing":
 
 ```ts
 const result = await fridge.read<Result>('analytics-7d')

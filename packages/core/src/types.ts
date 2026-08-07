@@ -182,6 +182,14 @@ export interface StoreCapabilities {
   listDue: boolean
 }
 
+/**
+ * Whether a concurrency permit was granted. A refusal carries the earliest
+ * moment the answer could change - the soonest live permit for that source
+ * expires, or `now` when the source has room and only this holder id was in the
+ * way - so a caller can wait for something rather than poll for nothing.
+ */
+export type PermitGrant = { granted: true } | { granted: false; retryAt: number }
+
 /** What one upstream call for params no entry exists for came back with. */
 export type FlightOutcome =
   | { status: 'ran'; data: unknown }
@@ -243,7 +251,12 @@ export interface SchedulePlane {
    * executor sharing this store. `holder` identifies this call so it can give
    * the permit back; `expiresAt` is when the permit stops counting even if it
    * never is, which is how a holder that died stops blocking everyone else.
-   * Answers whether the permit was granted; it never waits.
+   * It never waits.
+   *
+   * A `holder` already holding a live permit is refused rather than allowed to
+   * take a second or to overwrite the first: one id is one call's claim on one
+   * permit, and two callers arriving with the same id are still two callers.
+   * That refusal reports `retryAt: now`, because the source itself has room.
    */
   acquirePermit(
     source: string,
@@ -251,7 +264,7 @@ export interface SchedulePlane {
     holder: string,
     expiresAt: number,
     now: number,
-  ): Promise<boolean>
+  ): Promise<PermitGrant>
   /** Gives a permit back the moment the call it was taken for is done. */
   releasePermit(source: string, holder: string): Promise<void>
   /**
@@ -278,8 +291,21 @@ export interface SchedulePlane {
     outcome: FlightOutcome,
     keepUntil: number,
   ): Promise<boolean>
-  /** Drops settled flights past their handoff window. Bounded by `limit`. */
+  /**
+   * Drops flights nothing can still be waiting on: settled ones past their
+   * handoff window, and running ones past their expiry. Bounded by `limit`.
+   * Callers pass a `before` already behind `now` by more than a leader can
+   * outlive its own deadline, because deleting a running flight is what would
+   * let the next generation restart at one and match a late settle.
+   */
   sweepFlights(before: number, limit: number): Promise<number>
+  /**
+   * The rows for these names, in the order asked, `null` where there is none.
+   * Optional: without it core reads them one at a time, which is fine for a
+   * registry smaller than a page and needless once it is larger. `names` is
+   * always a bounded batch.
+   */
+  readSchedules?(names: readonly string[]): Promise<Array<ScheduleRow | null>>
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: StoreCapabilities
 }

@@ -40,6 +40,11 @@ const RECONCILE_DELETES_PER_TICK = 64
 const DISPATCH_CHUNK = 32
 const FLIGHT_SWEEP_PER_TICK = 128
 const ROW_FILL_CHUNK = 32
+// A flight is only swept once no leader could still be writing to it. A leader
+// is bounded by its own deadline, which is well inside the flight's expiry;
+// this margin on top is what keeps generations climbing, because a deleted
+// flight is one the next caller would restart at generation one.
+const FLIGHT_SWEEP_GRACE_MS = 60_000
 
 export interface FridgeConfig {
   queries: Queries | readonly QueryDefinition[]
@@ -262,12 +267,29 @@ export function createFridge(config: FridgeConfig): Fridge {
    * either re-claim rows that exist or never start queries that do not.
    * Costs nothing until a registry outgrows a page.
    */
-  const fillMissingRows = async (list: readonly ResolvedQuery[], rows: Rows): Promise<void> => {
+  const fillMissingRows = async (
+    list: readonly ResolvedQuery[],
+    rows: Rows,
+    pageHeldEveryRow: boolean,
+  ): Promise<void> => {
     const missing = list.filter((query) => rows.get(query.name) === undefined)
+    if (missing.length === 0) return
+    // The page is asked for with no upper bound on `nextRunAt`, so a page that
+    // came back short is the whole table: a name missing from it provably has
+    // no row, and looking it up would only confirm that at the cost of a round
+    // trip per never-run query, every tick.
+    if (pageHeldEveryRow) {
+      for (const query of missing) rows.remember(query.name, null)
+      return
+    }
     for (let start = 0; start < missing.length; start += ROW_FILL_CHUNK) {
-      await Promise.all(
-        missing.slice(start, start + ROW_FILL_CHUNK).map((query) => rows.read(query.name)),
-      )
+      const batch = missing.slice(start, start + ROW_FILL_CHUNK)
+      if (schedule.readSchedules) {
+        const found = await schedule.readSchedules(batch.map((query) => query.name))
+        batch.forEach((query, index) => rows.remember(query.name, found[index] ?? null))
+      } else {
+        await Promise.all(batch.map((query) => rows.read(query.name)))
+      }
     }
   }
 
@@ -285,6 +307,8 @@ export function createFridge(config: FridgeConfig): Fridge {
     startedAt: number,
     report: RunReport,
     onOutcome: (candidate: Candidate, outcome: DispatchOutcome) => void,
+    /** `null` means "as soon as there is an invocation", not "at some time". */
+    onDeferred: (name: string, retryAt: number | null) => void,
   ): Promise<void> => {
     const fits = (query: ResolvedQuery): boolean =>
       driver.budgetMs === undefined || clock.now() + query.timeoutMs <= startedAt + driver.budgetMs
@@ -299,11 +323,17 @@ export function createFridge(config: FridgeConfig): Fridge {
     await Promise.allSettled(
       [...bySource].map(async ([source, candidates]) => {
         const chunk = chunkFor(sources, source)
-        let sourceClosed = false
+        // Once a source has refused, the rest of its work this tick waits for
+        // the same moment the refusal named rather than asking again.
+        let closedUntil: number | null = null
+        let closed = false
         for (let start = 0; start < candidates.length; start += chunk) {
           const admitted: Candidate[] = []
           for (const candidate of candidates.slice(start, start + chunk)) {
-            if (sourceClosed || !fits(candidate.query)) report.deferred.push(candidate.query.name)
+            if (closed) onDeferred(candidate.query.name, closedUntil)
+            // Out of wall clock, not out of ceiling: the next invocation has a
+            // fresh budget, so this one asks to be followed immediately.
+            else if (!fits(candidate.query)) onDeferred(candidate.query.name, null)
             else admitted.push(candidate)
           }
           if (admitted.length === 0) continue
@@ -313,7 +343,9 @@ export function createFridge(config: FridgeConfig): Fridge {
               // One refusal is the whole answer for this source this tick,
               // whether the window is spent or its calls are all in flight.
               if (outcome.status === 'throttled' || outcome.status === 'deferred') {
-                sourceClosed = true
+                closed = true
+                closedUntil =
+                  closedUntil === null ? outcome.retryAt : Math.min(closedUntil, outcome.retryAt)
               }
               onOutcome(candidate, outcome)
             }),
@@ -325,7 +357,7 @@ export function createFridge(config: FridgeConfig): Fridge {
 
   const sweepSettledFlights = async (now: number): Promise<void> => {
     try {
-      await schedule.sweepFlights(now, FLIGHT_SWEEP_PER_TICK)
+      await schedule.sweepFlights(now - FLIGHT_SWEEP_GRACE_MS, FLIGHT_SWEEP_PER_TICK)
     } catch {
       // Housekeeping: a sweep that does not land leaves rows that expire on
       // their own terms and are answered as dead by the next caller.
@@ -359,7 +391,7 @@ export function createFridge(config: FridgeConfig): Fridge {
       // every registry past one page look permanently behind.
       const moreDueBehindPage =
         page.length >= SCHEDULE_PAGE && page[page.length - 1]!.nextRunAt <= now
-      await fillMissingRows(effective.list, rows)
+      await fillMissingRows(effective.list, rows, page.length < SCHEDULE_PAGE)
       const { moreToRemove } = await reconcile(now, effective, page, rows)
       // Flights are transient by construction, but nothing else would ever
       // collect the settled ones; the tick is the only thing that runs anyway.
@@ -375,18 +407,30 @@ export function createFridge(config: FridgeConfig): Fridge {
         soonest = soonest === null ? at : Math.min(soonest, at)
       }
 
-      await dispatchDue(plan, now, startedAt, report, (candidate, outcome) => {
-        dispatched.add(candidate.query.name)
-        recordOutcome(report, candidate.query.name, outcome)
-        if (outcome.status === 'throttled') consider(outcome.retryAt)
-        else if (outcome.status === 'leased') consider(candidate.row.leaseUntil ?? now)
-        else if (outcome.status === 'deferred') consider(now)
-        else if (outcome.nextRunAt !== undefined) consider(outcome.nextRunAt)
-      })
+      await dispatchDue(
+        plan,
+        now,
+        startedAt,
+        report,
+        (candidate, outcome) => {
+          dispatched.add(candidate.query.name)
+          recordOutcome(report, candidate.query.name, outcome)
+          if (outcome.status === 'throttled' || outcome.status === 'deferred') {
+            consider(outcome.retryAt)
+          } else if (outcome.status === 'leased') consider(candidate.row.leaseUntil ?? now)
+          else if (outcome.nextRunAt !== undefined) consider(outcome.nextRunAt)
+        },
+        (name, retryAt) => {
+          report.deferred.push(name)
+          // A ceiling names the moment it could give way; running out of wall
+          // clock names nothing, because the next invocation is the answer.
+          consider(retryAt ?? now)
+        },
+      )
 
-      // Anything held back is due right now, so the next wake is right now; the
-      // driver's own floor is what keeps that from becoming a hot loop.
-      if (report.deferred.length > 0 || moreToRemove || moreDueBehindPage) consider(now)
+      // Work this tick could not even look at is due right now; the driver's
+      // own floor is what keeps that from becoming a hot loop.
+      if (moreToRemove || moreDueBehindPage) consider(now)
       for (const query of effective.list) {
         if (dispatched.has(query.name)) continue
         const row = rows.get(query.name)

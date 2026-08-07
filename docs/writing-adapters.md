@@ -27,8 +27,9 @@ interface Store {
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // maxConcurrent across every executor: take one of `limit` permits, give it
-  // back when the call ends, and let it expire if the holder never does
-  acquirePermit(source, limit, holder, expiresAt, now): Promise<boolean>
+  // back when the call ends, and let it expire if the holder never does. A
+  // refusal names the soonest one could free.
+  acquirePermit(source, limit, holder, expiresAt, now): Promise<PermitGrant>
   releasePermit(source: string, holder: string): Promise<void>
   // transient flights: overlapping reads of the same key make one call, and the
   // answer is handed only to the generation that waited for it
@@ -36,6 +37,8 @@ interface Store {
   readFlight(key: string, now: number): Promise<FlightState | null>
   settleFlight(key, generation, outcome, keepUntil): Promise<boolean>
   sweepFlights(before: number, limit: number): Promise<number>
+  // optional capability: one bounded batch of rows by name, in the order asked
+  readSchedules?(names: readonly string[]): Promise<Array<ScheduleRow | null>>
   // optional capability: SQL backends can fetch a page of the earliest rows in
   // one query; without it, core reads row by row. `limit` is always finite -
   // core never asks a store to enumerate itself
@@ -73,7 +76,11 @@ A backend with no conditional-write primitive cannot host the schedule half at a
 
 `acquirePermit` is `maxConcurrent` made real across executors. It grants at most `limit` live permits per source and never waits - waiting is the caller's business - and every permit carries an expiry, because the one thing a holder that died will never do is release it. On SQL that is a single conditional insert (`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`), so the count and the take cannot be split by a peer.
 
-`joinFlight` is how overlapping reads of a parameter combination the registry does not name become one call. The first caller is the leader; anyone arriving while it runs is a follower of that `generation`. `settleFlight` writes the answer for that generation and is refused once the generation has moved on, which is what keeps a late answer from being handed to the wrong cohort. A caller arriving after a flight settles starts a new generation - the answer belongs to the readers who waited for it, and reusing it would make the combination a cached entry, which is exactly what it is not. Flights are transient: they expire, and `sweepFlights` drops the settled ones in bounded batches.
+Two details make it safe to build on. A refusal reports **when it could stop being one** - the soonest live permit for that source expires - so a caller can wait for something rather than poll for nothing; a scheduler uses that as its next wake time instead of trying again every second. And a `holder` that already holds a live permit is **refused, never allowed to take a second or to overwrite the first**: holder ids come from the caller, `random` is injectable, and a store that treated a duplicate as the same call would quietly hand two callers one permit. That refusal reports `retryAt: now`, because the source has room and only the id was in the way; the caller mints another and takes the slot.
+
+`readSchedules` is the batched form of `readSchedule`, and it exists for one case: a registry larger than the page a tick reads has to establish, by name, whether the rows it did not reach exist. Without it core asks one at a time. `names` is always a bounded batch, so a single `WHERE name IN (...)` is the whole implementation.
+
+`joinFlight` is how overlapping reads of a parameter combination the registry does not name become one call. The first caller is the leader; anyone arriving while it runs is a follower of that `generation`. `settleFlight` writes the answer for that generation and is refused once the generation has moved on, which is what keeps a late answer from being handed to the wrong cohort. A caller arriving after a flight settles starts a new generation - the answer belongs to the readers who waited for it, and reusing it would make the combination a cached entry, which is exactly what it is not. Flights are transient: they expire, and `sweepFlights` drops the settled ones in bounded batches. It also drops running ones past their expiry, and callers pass a `before` already well behind `now` for a reason - deleting a running flight lets the next caller restart at generation one, which is exactly the value a late leader would still be holding. The margin is what keeps generations climbing.
 
 ## Where the schedule half comes from (decided at config time)
 

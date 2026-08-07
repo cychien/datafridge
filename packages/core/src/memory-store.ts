@@ -47,6 +47,13 @@ export function memoryStore(): Store {
       return row ? cloneRow(row) : null
     },
 
+    async readSchedules(names) {
+      return names.map((name) => {
+        const row = rows.get(name)
+        return row ? cloneRow(row) : null
+      })
+    },
+
     async writeSchedule(row) {
       rows.set(row.name, cloneRow(row))
     },
@@ -94,13 +101,25 @@ export function memoryStore(): Store {
 
     async acquirePermit(source, limit, holder, expiresAt, now) {
       let live = 0
+      let soonest = Infinity
       for (const [key, permit] of [...permits]) {
-        if (permit.expiresAt <= now) permits.delete(key)
-        else if (permit.source === source) live += 1
+        if (permit.expiresAt <= now) {
+          permits.delete(key)
+          continue
+        }
+        if (permit.source !== source) continue
+        live += 1
+        soonest = Math.min(soonest, permit.expiresAt)
       }
-      if (live >= limit) return false
+      // One id is one call's claim on one permit. Two callers arriving with the
+      // same id are still two callers, so the second is refused rather than
+      // sharing a row - and told the source itself has room.
+      if (permits.has(holder)) return { granted: false, retryAt: now }
+      if (live >= limit) {
+        return { granted: false, retryAt: soonest === Infinity ? now : soonest }
+      }
       permits.set(holder, { source, expiresAt })
-      return true
+      return { granted: true }
     },
 
     async releasePermit(_source, holder) {
