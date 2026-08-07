@@ -153,6 +153,34 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     })
 
   /**
+   * The longest a coordination call has taken this dispatch, measured off the
+   * injected clock rather than configured. Admission consults it so it never
+   * starts a round trip whose answer would land after the reader has stopped
+   * listening: a read whose deadline passes mid-acquire hears "there is
+   * nothing", which is the one answer work that never reached upstream must
+   * never give.
+   */
+  const measureRoundTrips = () => {
+    let worst = 0
+    return {
+      async observe<T>(call: () => Promise<T>): Promise<T> {
+        const startedAt = clock.now()
+        try {
+          return await call()
+        } finally {
+          worst = Math.max(worst, clock.now() - startedAt)
+        }
+      },
+      /** Whether `count` more of them can start and still be heard by `deadline`. */
+      fits(deadline: number | undefined, count: number): boolean {
+        return deadline === undefined || deadline - clock.now() > worst * count
+      },
+    }
+  }
+
+  type RoundTrips = ReturnType<typeof measureRoundTrips>
+
+  /**
    * Scheduled work takes what is left after the window's reserve and never
    * waits: refusing it leaves the row due, and the next tick brings it back
    * with a higher overdue ratio, so nothing starves. A demand fetch has someone
@@ -166,11 +194,13 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     /** A reader's cut-off, or undefined for work nobody is waiting on. */
     deadline: number | undefined,
     unslotted: Unslotted,
+    trips: RoundTrips,
   ): Promise<{ ok: true; takenAt: number } | { ok: false; retryAt: number }> => {
     const { windowMs } = policy
     for (;;) {
       const now = clock.now()
-      if (await schedule.takeQuota(source, limit, windowMs, now)) return { ok: true, takenAt: now }
+      const taken = await trips.observe(() => schedule.takeQuota(source, limit, windowMs, now))
+      if (taken) return { ok: true, takenAt: now }
       const retryAt = windowStartOf(now, windowMs) + windowMs
       if (deadline === undefined || retryAt >= deadline) return { ok: false, retryAt }
       // Waiting out a window is not a call in flight, so the concurrency slot
@@ -208,6 +238,9 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     source: string,
     expiresAt: number,
     deadline: number | undefined,
+    trips: RoundTrips,
+    /** Round trips the caller still owes on the way out of a refusal. */
+    tailTrips: number,
   ): Promise<{ ok: true; release: () => Promise<void> } | { ok: false; retryAt: number }> => {
     const max = sources.get(source)?.maxConcurrent
     if (max === undefined || !Number.isFinite(max)) {
@@ -217,9 +250,17 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     let collisions = 0
     let attempts = 0
     let retryingId = false
+    let refusedUntil: number | null = null
     let holder = nextHolder()
     for (;;) {
       const now = clock.now()
+      // Asking costs a round trip, and so does the refund a refusal owes on the
+      // way out. Once the reader's budget cannot carry both, asking again would
+      // only turn "not your turn, come back at X" into silence, so the refusal
+      // already in hand is the answer.
+      if (!trips.fits(deadline, 1 + tailTrips)) {
+        return { ok: false, retryAt: refusedUntil ?? now }
+      }
       // Scheduled work never queues for a permit: staying due and coming back
       // more overdue is cheaper than holding an invocation open for a peer.
       const wait = deadline === undefined ? 0 : Math.min(interval, deadline - now)
@@ -234,7 +275,9 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       // nobody reads.
       const explainRefusal = attempts === 0 || retryingId || lastAttempt
       retryingId = false
-      const grant = await schedule.acquirePermit(source, max, holder, expiresAt, now, explainRefusal)
+      const grant = await trips.observe(() =>
+        schedule.acquirePermit(source, max, holder, expiresAt, now, explainRefusal),
+      )
       attempts += 1
       if (grant.granted) {
         const taken = holder
@@ -250,6 +293,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
           },
         }
       }
+      if (grant.retryAt !== null) refusedUntil = grant.retryAt
       // The source has room, so the id was what stood in the way.
       if (grant.retryAt !== null && grant.retryAt <= now && collisions < PERMIT_ID_ATTEMPTS) {
         collisions += 1
@@ -257,7 +301,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
         holder = nextHolder()
         continue
       }
-      if (lastAttempt) return { ok: false, retryAt: grant.retryAt ?? now }
+      if (lastAttempt) return { ok: false, retryAt: refusedUntil ?? now }
       await sleepFor(wait)
       interval = Math.min(interval * 2, MAX_PERMIT_POLL_MS)
       holder = nextHolder()
@@ -358,6 +402,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     // one, and before the claim so a call that has no quota never takes a lease
     // it would have to hand straight back.
     const metered = policy !== undefined && policy.windowMs !== Infinity
+    const trips = measureRoundTrips()
     let takenAt = 0
     if (metered) {
       const demand = task.priority === 'demand'
@@ -367,6 +412,7 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
         demand ? policy.demandLimit : policy.scheduledLimit,
         demand ? task.deadline : undefined,
         unslotted,
+        trips,
       )
       if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
       takenAt = taken.takenAt
@@ -375,6 +421,8 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       source,
       now + query.leaseMs + PERMIT_GRACE_MS,
       task.priority === 'demand' ? task.deadline : undefined,
+      trips,
+      metered ? 1 : 0,
     )
     if (!permit.ok) {
       if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
@@ -448,15 +496,24 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
 
     const policy = sources.get(source)
     const metered = policy !== undefined && policy.windowMs !== Infinity
+    const trips = measureRoundTrips()
     let takenAt = 0
     if (metered) {
       // A reader is waiting, so this draws on the same ceiling a miss does,
       // reserve included - once, for everyone who joined.
-      const taken = await takeQuota(policy, source, policy.demandLimit, deadline, unslotted)
+      const taken = await takeQuota(policy, source, policy.demandLimit, deadline, unslotted, trips)
       if (!taken.ok) return settle({ status: 'throttled', retryAt: taken.retryAt })
       takenAt = taken.takenAt
     }
-    const permit = await takePermit(source, deadline + PERMIT_GRACE_MS, deadline)
+    // A refusal here still has to hand the answer to the cohort, and the quota
+    // back if it took any.
+    const permit = await takePermit(
+      source,
+      deadline + PERMIT_GRACE_MS,
+      deadline,
+      trips,
+      metered ? 2 : 1,
+    )
     if (!permit.ok) {
       // Nothing reached upstream, so the slot goes back and the cohort is told
       // it is not their turn - never that there is nothing.

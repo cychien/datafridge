@@ -1,8 +1,40 @@
 import { describe, expect, it } from 'vitest'
 
-import { memoryStore } from '../src/index.js'
+import { FakeClock, memoryStore } from '../src/index.js'
 import type { QueryDef, Store } from '../src/index.js'
 import { deferred, makeHarness } from './helpers.js'
+
+/**
+ * A store whose coordination calls take time off the same fake clock the
+ * dispatcher runs on, so "the deadline passed mid-round-trip" is arithmetic
+ * rather than a race. Counts the acquires, because the point of admission
+ * backing off early is the one it does not make.
+ */
+function withLatency(
+  store: Store,
+  clock: FakeClock,
+  latencyMs: number,
+  acquires: { count: number },
+): Store {
+  const trip = (): Promise<void> =>
+    new Promise((resolve) => clock.setTimeout(() => resolve(), latencyMs))
+  return {
+    ...store,
+    async takeQuota(source, limit, windowMs, now) {
+      await trip()
+      return store.takeQuota(source, limit, windowMs, now)
+    },
+    async releaseQuota(source, windowMs, takenAt) {
+      await trip()
+      return store.releaseQuota(source, windowMs, takenAt)
+    },
+    async acquirePermit(source, limit, holder, expiresAt, now, explainRefusal) {
+      acquires.count += 1
+      await trip()
+      return store.acquirePermit(source, limit, holder, expiresAt, now, explainRefusal)
+    },
+  }
+}
 
 const gated = (name: string, promise: Promise<string>, live: { count: number }): QueryDef => ({
   name,
@@ -196,5 +228,72 @@ describe('maxConcurrent across executors', () => {
 
     await clock.advance(5_000)
     expect((await fridge.runDue()).ran).toEqual(['q'])
+  })
+})
+
+/**
+ * An answer that lands after the reader has stopped listening is `null`, which
+ * is "there is nothing" - the one thing work that never reached upstream must
+ * never say. Admission therefore stops asking once the budget left cannot carry
+ * the asking and the refund that follows it.
+ */
+describe('a permit-starved read whose budget runs out mid-admission', () => {
+  it('answers from the refusal it has rather than making one last doomed ask', async () => {
+    const clock = new FakeClock(0)
+    const base: Store = memoryStore()
+    const acquires = { count: 0 }
+    const live = { count: 0 }
+    const held = deferred<string>()
+    const { fridge } = makeHarness(
+      [{ ...gated('cold', held.promise, live), timeout: 200 }],
+      {
+        store: withLatency(base, clock, 60, acquires),
+        clock,
+        sources: { posthog: { maxConcurrent: 1 } },
+      },
+    )
+    await base.acquirePermit('posthog', 1, 'peer', 900_000, 0)
+
+    const read = fridge.read('cold')
+    await clock.advance(0)
+    await clock.advance(500)
+
+    // Two polls fit; the third would have answered at +255 against a deadline
+    // of 200, so it is not made and the peer's expiry is still the answer.
+    expect(await read).toEqual({ status: 'throttled', retryAt: 900_000 })
+    expect(acquires.count).toBe(2)
+    expect(live.count).toBe(0)
+    held.resolve('never used')
+  })
+
+  it('answers a reader whose wait for the window left no room to ask at all', async () => {
+    const clock = new FakeClock(0)
+    const base: Store = memoryStore()
+    const acquires = { count: 0 }
+    const live = { count: 0 }
+    const held = deferred<string>()
+    const { fridge } = makeHarness(
+      [{ ...gated('cold', held.promise, live), timeout: 60_250 }],
+      {
+        store: withLatency(base, clock, 100, acquires),
+        clock,
+        sources: { posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 } },
+      },
+    )
+    // The window is spent, so the reader waits it out - and arrives at the
+    // permit with less budget left than asking for one would cost.
+    expect(await base.takeQuota('posthog', 1, 60_000, 0)).toBe(true)
+    await base.acquirePermit('posthog', 1, 'peer', 900_000, 0)
+
+    const read = fridge.read('cold')
+    await clock.advance(0)
+    await clock.advance(61_000)
+
+    expect(await read).toEqual({ status: 'throttled', retryAt: 60_100 })
+    expect(acquires.count).toBe(0)
+    expect(live.count).toBe(0)
+    // The slot the wait won was never spent, so the new window is whole.
+    expect(await base.takeQuota('posthog', 1, 60_000, 60_000)).toBe(true)
+    held.resolve('never used')
   })
 })
