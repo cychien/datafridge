@@ -48,9 +48,11 @@ Before giving up it waits, inside its own `timeout`, for the window to roll - so
 
 ## The smoothing: `maxConcurrent`
 
-`maxConcurrent` bounds how many calls to a source are in flight from one instance at a time. It bounds concurrency, not volume - a hundred due queries behind `maxConcurrent: 4` still make a hundred calls, four at a time. Use it when a vendor tolerates the rate but not the burst, and keep in mind that a tick then lasts as long as its slowest chain of four (see the [Cloudflare invocation limits](./cloudflare.md#limits-and-ceilings)).
+`maxConcurrent` bounds how many calls to a source are in flight at once - across every executor sharing the store, not per process. It bounds concurrency, not volume: a hundred due queries behind `maxConcurrent: 4` still make a hundred calls, four at a time. Use it when a vendor tolerates the rate but not the burst, and keep in mind that a tick then lasts as long as its slowest chain of four (see the [Cloudflare invocation limits](./cloudflare.md#limits-and-ceilings)).
 
-In flight means in flight: a reader waiting out a window hands its slot back for the duration, so a call that is doing nothing cannot hold the budget that exists to bound calls that are.
+It is a permit in the store, taken for the length of the call and given back when it ends. A holder that dies never gives its permit back, so a permit also expires; until then it counts, and after it does not. That is what makes the number mean the same thing to a Durable Object, a cron trigger and fifty concurrent Worker invocations - the alternative is a limit each, which is not a limit.
+
+In flight means in flight: a reader waiting out a quota window holds no permit, so a call that is doing nothing cannot sit on the budget that exists to bound calls that are. A scheduled refresh that finds no permit does not queue for one either - it stays due, comes back more overdue, and arrives in `RunReport.deferred`.
 
 ## The capacity: what one invocation will take on
 

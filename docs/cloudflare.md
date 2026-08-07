@@ -217,7 +217,7 @@ export default {
 }
 ```
 
-Nothing here goes through the Durable Object. Reads scale with your Worker rather than queueing behind one singleton, and because every call still leaves through the dispatcher against the same D1, the source ceiling counts them alongside the scheduler's - the two coordinate through the store, which is the only place they meet.
+Nothing here goes through the Durable Object. Reads scale with your Worker rather than queueing behind one singleton, and every part of `sources` still applies: `limit` and `reserve` are counted in D1 alongside the scheduler's calls, `maxConcurrent` is a permit taken in D1 so fifty concurrent invocations share one ceiling rather than getting one each, and overlapping `anyParams` reads of the same params across those invocations coalesce into a single upstream call. The store is the only place they meet, and it is enough.
 
 Hand the reader a results-only store instead and it goes back to serving and waiting, which is the right shape for a consumer in another service that should never call upstream. A registry with an `anyParams` base then fails at construction rather than at read time.
 
@@ -231,6 +231,7 @@ Hand the reader a results-only store instead and it goes back to serving and wai
 | Late zombie write | Reject on version mismatch | Remain unchanged |
 | Per-source quota exhausted | Keep due for a later tick, more overdue | Return the current envelope; on a miss, `status: 'throttled'` |
 | Past this invocation's capacity | Leave the row untouched and name it in `RunReport.deferred`; the alarm re-arms on the tick's own `nextRunAt` | Unaffected: a read never waits on a tick |
+| Source at its concurrency ceiling | Defer without claiming; the permit expires if its holder died | A waiting read queues for a permit inside its own timeout |
 | No successful refresh yet | Continue scheduled attempts | Return `null` |
 | Alarm-level error | Schedule the next alarm in `finally` | Existing D1 envelopes remain readable |
 

@@ -31,7 +31,7 @@ All of them are answered in one place. Scheduled refreshes and read misses are t
 These six guarantees are the product. Every implementation must uphold them:
 
 1. **A read that has data never waits and never touches upstream.** Answering an existing result is one local read, fresh, stale or `invalid` alike.
-2. **A read with no data triggers exactly one upstream fetch.** Readers arriving together coalesce into that one call through a per-key lease, and wait no longer than that query's `timeout`.
+2. **A read with no data triggers exactly one upstream fetch.** Readers arriving together coalesce into that one call and wait no longer than that query's `timeout` - through a per-key lease for a scheduled entry, and through a transient flight for params the registry does not name. Both live in the store, so the coalescing holds across processes, not just inside one.
 3. **Upstream calls never exceed the rate a source declares, whatever caused them.** Scheduled refreshes and read-triggered fetches spend the same quota ledger.
 4. **Work the rate limit pushed back never starves and never fails for nothing.** A refused refresh stays due and climbs by overdue ratio; a refused read waits for the window inside its own timeout, and says `throttled` rather than pretending there is nothing.
 5. **A failure keeps the last-known-good result and retries with jittered backoff.** A dead executor's work is re-claimed once its lease expires, and a late write-back is rejected on version.
@@ -107,6 +107,8 @@ A parameterized query expands a finite runtime list into ordinary scheduled iden
 Variant params are canonical JSON. The storage key is `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`, so raw IDs and preset values do not appear in D1 keys or `RunReport`. SHA-256 provides a stable collision-resistant identity across object key ordering. Params are identifiers, not secret storage: credentials and private payloads must remain in bindings or fetcher closures.
 
 An `anyParams` base has no list, and no entries either. Being an entry is what the registry decides: params it names are persistent scheduled entries, and params it does not name are not entries at all - reading them is one fresh call through the same dispatcher, metered by the same source window and bounded by the same timeout, storing nothing. Nothing a reader happens to ask for can turn itself into work the scheduler then owns forever.
+
+Overlapping reads of such params still coalesce, through a transient flight rather than a lease: one call, one quota slot, one answer handed to everyone who was waiting for it. The flight expires on its own and holds no result, so a reader arriving after it settles gets a fresh call - the difference between coalescing and caching is exactly who the answer belongs to.
 
 ## Staleness semantics
 

@@ -48,6 +48,14 @@ export function scheduleOnly(store: Store): SchedulePlane {
       store.claim(name, expectedVersion, leaseUntil, now),
     takeQuota: (source, limit, windowMs, now) => store.takeQuota(source, limit, windowMs, now),
     releaseQuota: (source, windowMs, takenAt) => store.releaseQuota(source, windowMs, takenAt),
+    acquirePermit: (source, limit, holder, expiresAt, now) =>
+      store.acquirePermit(source, limit, holder, expiresAt, now),
+    releasePermit: (source, holder) => store.releasePermit(source, holder),
+    joinFlight: (key, expiresAt, now) => store.joinFlight(key, expiresAt, now),
+    readFlight: (key, now) => store.readFlight(key, now),
+    settleFlight: (key, generation, outcome, keepUntil) =>
+      store.settleFlight(key, generation, outcome, keepUntil),
+    sweepFlights: (before, limit) => store.sweepFlights(before, limit),
     listDue: (now, limit) => store.listDue!(now, limit),
     capabilities: store.capabilities,
   }

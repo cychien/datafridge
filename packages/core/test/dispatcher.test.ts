@@ -23,6 +23,19 @@ function tracing(inner: Store, log: string[]): Store {
       note('takeQuota', source, () => inner.takeQuota(source, limit, windowMs, now)),
     releaseQuota: (source, windowMs, takenAt) =>
       note('releaseQuota', source, () => inner.releaseQuota(source, windowMs, takenAt)),
+    acquirePermit: (source, limit, holder, expiresAt, now) =>
+      note('acquirePermit', source, () =>
+        inner.acquirePermit(source, limit, holder, expiresAt, now),
+      ),
+    releasePermit: (source, holder) =>
+      note('releasePermit', source, () => inner.releasePermit(source, holder)),
+    joinFlight: (key, expiresAt, now) =>
+      note('joinFlight', key, () => inner.joinFlight(key, expiresAt, now)),
+    readFlight: (key, now) => note('readFlight', key, () => inner.readFlight(key, now)),
+    settleFlight: (key, generation, outcome, keepUntil) =>
+      note('settleFlight', key, () => inner.settleFlight(key, generation, outcome, keepUntil)),
+    sweepFlights: (before, limit) =>
+      note('sweepFlights', '*', () => inner.sweepFlights(before, limit)),
     listDue: (now, limit) => note('listDue', '*', () => inner.listDue!(now, limit)),
   }
 }

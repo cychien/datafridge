@@ -31,7 +31,7 @@
 這六項保證就是產品本身。所有實作都必須遵守：
 
 1. **有資料的讀取永不等待、也永不觸碰上游。** 回答一筆已存的結果就是一次本地讀取，fresh、stale、`invalid` 一律如此。
-2. **沒資料的讀取觸發恰好一次上游抓取。** 同時到達的讀者透過 per-key lease 合流成那一次呼叫，等待上限是該 query 的 `timeout`。
+2. **沒資料的讀取觸發恰好一次上游抓取。** 同時到達的讀者會合流成那一次呼叫，等待上限是該 query 的 `timeout` - 排程 entry 走 per-key lease，registry 沒有指名的 params 走暫時性的 flight。兩者都住在 store 裡，所以合流跨 process 成立，不是只在單一 process 內。
 3. **上游呼叫永不超過該 source 宣告的速率，不論是誰引起的。** 排程刷新與讀取觸發的抓取花的是同一份 quota ledger。
 4. **被 rate limit 推遲的工作永不餓死、也不會白白失敗。** 被拒絕的刷新維持到期並以過期比例升權；被拒絕的讀取在自己的 timeout 內等窗口輪轉，並回 `throttled` 而不是假裝沒有這個東西。
 5. **失敗會保留 last-known-good 並以帶 jitter 的 backoff 重試。** 死掉的 executor 的工作在 lease 到期後被接手，遲到的寫回會被 version 拒絕。
@@ -107,6 +107,8 @@ Parameterized query 會把有限的 runtime list 展開成一般 scheduled ident
 Variant params 是 canonical JSON。Storage key 為 `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`，所以 raw ID 與 preset value 不會出現在 D1 key 或 `RunReport`。SHA-256 提供跨 object key ordering 的穩定 collision-resistant identity。Params 用來識別，不是 secret storage。Credential 與 private payload 必須留在 binding 或 fetcher closure。
 
 `anyParams` base 沒有清單，也沒有 entry。是不是 entry 由 registry 決定：它指名的 params 是持久的排程 entry，它沒有指名的 params 根本不是 entry - 讀它就是走同一個 dispatcher 的一次全新呼叫，扣同一個 source 窗口、受同一個 timeout 約束，什麼都不存。讀者剛好問了什麼，不能就此把自己變成 scheduler 從此得永遠負責的工作。
+
+這種 params 的重疊讀取仍然會合流，走的是暫時性的 flight 而不是 lease：一次呼叫、一格額度、一個答案交給所有在等它的人。Flight 會自己過期、不存結果，所以在它結束之後才抵達的讀者會拿到一次全新的呼叫 - 合流與快取的差別，正是「答案屬於誰」。
 
 ## Staleness 語意
 

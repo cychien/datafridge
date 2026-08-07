@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { cronFridge } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
-import { readOnly, stored } from './helpers.js'
+import { dropStore, readOnly, stored } from './helpers.js'
 
 interface SchemaEnv {
   DB: D1Database
@@ -14,11 +14,7 @@ interface SchemaEnv {
 // any other file. This file deliberately starts with no schema at all: it is the
 // proof that applying the packaged migration is optional.
 beforeEach(async () => {
-  await env.DB.batch([
-    env.DB.prepare('DROP TABLE IF EXISTS datafridge_results'),
-    env.DB.prepare('DROP TABLE IF EXISTS datafridge_schedule'),
-    env.DB.prepare('DROP TABLE IF EXISTS datafridge_quota'),
-  ])
+  await dropStore(env.DB)
 })
 
 async function invoke(handler: ReturnType<typeof cronFridge<SchemaEnv>>): Promise<void> {
@@ -76,11 +72,7 @@ describe('d1 applies its own schema', () => {
 
     // A dropped database or a destructive migration, with the schema already
     // remembered as applied for this binding.
-    await env.DB.batch([
-      env.DB.prepare('DROP TABLE datafridge_results'),
-      env.DB.prepare('DROP TABLE datafridge_schedule'),
-      env.DB.prepare('DROP TABLE datafridge_quota'),
-    ])
+    await dropStore(env.DB)
 
     await invoke(handler)
     expect(ticks).toBe(2)

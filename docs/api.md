@@ -96,9 +96,12 @@ Pass exactly one of `variants`, `dimensions`, or `anyParams`.
 
 **Being an entry is what the registry decides, never what somebody happened to ask for.** A parameter combination the registry names - declared in `variants`, produced by `dimensions`, or returned by a dynamic list - is a persistent scheduled entry with its own row, lease, backoff and stored result. A combination the registry does not name is not an entry, and reading it stores nothing: no result, no schedule row, no membership. It is a call, and it is answered as one.
 
-That call still leaves through the same dispatcher everything else does, so it draws on the source's window (with the reserve a waiting reader is entitled to), obeys `maxConcurrent`, is bounded by the base's own `timeout`, and honours `RateLimitError`. What it does not get is a lease, because there is no entry for it to be the current value of - so two simultaneous reads of the same unnamed params are two calls, and the source ceiling is what bounds them.
+That call still leaves through the same dispatcher everything else does, so it draws on the source's window (with the reserve a waiting reader is entitled to), obeys `maxConcurrent`, is bounded by the base's own `timeout`, and honours `RateLimitError`.
+
+**Reads that overlap still coalesce.** The first reader of a given `queryKey` makes the call; every reader that arrives while it is running joins that flight and takes its answer. A cohort of a hundred concurrent requests is one upstream call and one quota slot, however many Workers they landed in - the flight is coordinated in the store, not in one process's memory. A read that arrives *after* that flight settles is a new flight and a new call: an answer belongs to the readers who waited for it, and handing it to whoever asks next would be a cache, which is exactly what an unnamed combination does not get.
 
 - **It is never scheduled.** An open base contributes nothing to a tick, so it declares no `every`, no `lease` and no `validUntil`. Nothing is stored, so it takes no `codec` either; all four are rejected at construction.
+- **The flight is transient.** It holds no result, expires on its own, and is swept by the next tick. A leader that dies is taken over by the next reader once its deadline passes, and a settled answer stops being handed out shortly after the cohort has had it.
 - **A read must pass params.** An open base with no params names no combination at all.
 - **The reader has to be able to make the call.** `createReader` needs the whole store - one that can claim and meter, like `d1(env.DB)` - not a results-only one. That is checked when the reader is constructed, not when somebody reads.
 - **A failed call answers `null`**, and leaves no backoff behind, because there is nothing for a backoff to be attached to. Reach for a declared variant when you want failure to be remembered.
@@ -129,7 +132,7 @@ There is no knob for how much work one tick does. A tick reads one bounded page 
 
 Construction rejects a missing or malformed driver, a store missing either half, an invalid source policy, or a store that cannot claim atomically under a non-serialized driver.
 
-`sources` declares what each source will tolerate. `limit` is a hard ceiling counted in the store's quota ledger and shared by every executor; `reserve` holds part of each window back from scheduled refreshes so a waiting reader still gets through; `maxConcurrent` bounds in-flight calls inside one instance. See [rate limiting](./rate-limiting.md).
+`sources` declares what each source will tolerate. `limit` is a hard ceiling counted in the store's quota ledger and shared by every executor; `reserve` holds part of each window back from scheduled refreshes so a waiting reader still gets through; `maxConcurrent` bounds in-flight calls across every executor sharing the store. See [rate limiting](./rate-limiting.md).
 
 `runDue(now?)` reconciles the registry, selects due work most-overdue first, meters each source against its ledger, claims leases, runs fetchers concurrently, and returns:
 
@@ -144,7 +147,7 @@ interface RunReport {
 }
 ```
 
-`throttled` is the source ceiling and `deferred` is this invocation's capacity; both leave the row exactly as it was, so both come back more overdue rather than lost. `nextRunAt` is when this fridge next has work, computed from the rows the tick already held - a driver that schedules its own wake-ups uses it instead of asking storage again, and `null` means there is nothing scheduled at all.
+`throttled` is the source's window and `deferred` is everything else this invocation could not take on - its remaining wall clock, or the source's concurrency ceiling. Both leave the row exactly as it was, so both come back more overdue rather than lost. `nextRunAt` is when this fridge next has work, computed from the rows the tick already held - a driver that schedules its own wake-ups uses it instead of asking storage again, and `null` means there is nothing scheduled at all.
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 

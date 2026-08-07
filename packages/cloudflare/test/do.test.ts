@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { d1 } from '../src/d1.js'
 import type { TestFridge } from './worker.js'
-import { stored } from './helpers.js'
+import { stored, wipeStore } from './helpers.js'
 
 const fetchCounts = new Map<string, number>()
 
@@ -74,10 +74,7 @@ beforeEach(async () => {
   fetchCounts.clear()
   // Storage isolation is per test file, so wipe the shared D1 between tests;
   // each test uses its own DO instance for fresh bookkeeping.
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM datafridge_results'),
-    env.DB.prepare('DELETE FROM datafridge_schedule'),
-  ])
+  await wipeStore(env.DB)
 })
 
 describe('FridgeDO alarm loop', () => {
@@ -463,6 +460,47 @@ describe('FridgeDO alarm loop', () => {
         n: number
       }>(),
     ).toMatchObject({ n: 1 })
+  })
+
+  it('coalesces overlapping anyParams reads from separate readers into one call', async () => {
+    let calls = 0
+    let release: (value: { course: string }) => void = () => undefined
+    const inFlight = new Promise<{ course: string }>((resolve) => {
+      release = resolve
+    })
+    const funnel = defineParameterizedQuery({
+      name: 'course-funnel',
+      anyParams: true,
+      timeout: '20s',
+      fetch: async () => {
+        calls += 1
+        return inFlight
+      },
+    })
+    const params = { courseId: 'alpha' }
+    // Two readers with nothing in common but the database, which is how two
+    // Worker invocations meet.
+    const reader = () => createReader({ store: d1(env.DB), queries: [funnel] })
+
+    const first = reader().read('course-funnel', params)
+    const second = reader().read('course-funnel', params)
+    await vi.waitFor(() => expect(calls).toBe(1), { timeout: 5_000 })
+
+    release({ course: 'alpha' })
+    expect(stored(await first)).toMatchObject({ data: { course: 'alpha' } })
+    expect(stored(await second)).toMatchObject({ data: { course: 'alpha' } })
+    expect(calls).toBe(1)
+
+    // Coalescing is not caching: nothing lasting was created for these params.
+    expect(await scheduleRows()).toEqual([])
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS n FROM datafridge_results').first<{ n: number }>(),
+    ).toMatchObject({ n: 0 })
+
+    // A read that arrives after that flight settles is entitled to a fresh call.
+    release({ course: 'alpha' })
+    await reader().read('course-funnel', params)
+    expect(calls).toBe(2)
   })
 
   it('re-ignites after a deploy that changed nothing but an open base', async () => {

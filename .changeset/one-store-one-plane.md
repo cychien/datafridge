@@ -9,3 +9,5 @@ D1 is the coordination plane; the Durable Object is only a scheduler.
 This is what makes the rest composable. A cron trigger and a Durable Object over the same D1 now coordinate through D1 rather than through whichever object happens to be the singleton, and a request path can read - and fetch - against that same data without an RPC to it. A scheduler that owns the coordination plane is a scheduler you cannot put a second reader beside.
 
 The alarm follows from the tick instead of re-deriving it: `runDue` returns `nextRunAt`, computed from rows it already held, so re-arming costs no storage read at all - where it previously scanned the whole schedule table on every alarm. `cronDriver` and `FridgeDO` both declare the platform's 15-minute wall clock as the tick's `budgetMs`.
+
+Because the coordination plane is the store, a request path is complete without the object: `createReader` over the same `d1(env.DB)` serves what is stored, fills a cold entry through the same dispatcher, and shares the same quota ledger, the same concurrency permits and the same in-flight coalescing as the scheduler.

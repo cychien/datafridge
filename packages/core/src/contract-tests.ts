@@ -32,6 +32,11 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  * - releaseQuota credits back a slot taken in the window the ledger is still on, never
  *   one it has moved past, and never drives usage below zero
  * - listDue is the only enumeration core performs, and it is always given a limit
+ * - acquirePermit grants at most `limit` live permits per source and never waits; an
+ *   expired permit stops counting, which is how a holder that died is recovered from
+ * - joinFlight makes one caller the leader and everyone overlapping it a follower; an
+ *   answer is handed only to the generation that waited for it, a caller arriving after
+ *   a flight settles starts a new one, and a dead leader is taken over
  */
 export function storeContractSuite(label: string, makeStore: StoreFactory): void {
   describe(`store contract: ${label}`, () => {
@@ -275,6 +280,114 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         await store.releaseQuota('posthog', WINDOW, 120_000)
         expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
         expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(false)
+      })
+    })
+
+    describe('concurrency permits', () => {
+      const LIVE = 90_000
+
+      it('grants up to the limit and refuses beyond it, per source', async () => {
+        expect(await store.acquirePermit('posthog', 2, 'a', LIVE, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 2, 'b', LIVE, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 2, 'c', LIVE, 1_000)).toBe(false)
+        expect(await store.acquirePermit('stripe', 2, 'd', LIVE, 1_000)).toBe(true)
+      })
+
+      it('frees the slot when the holder gives it back', async () => {
+        expect(await store.acquirePermit('posthog', 1, 'a', LIVE, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toBe(false)
+        await store.releasePermit('posthog', 'a')
+        expect(await store.acquirePermit('posthog', 1, 'b', LIVE, 1_000)).toBe(true)
+      })
+
+      it('stops counting a holder that died, once its permit expires', async () => {
+        expect(await store.acquirePermit('posthog', 1, 'gone', 5_000, 1_000)).toBe(true)
+        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 4_999)).toBe(false)
+        // Nobody released it; the expiry is what recovers the slot.
+        expect(await store.acquirePermit('posthog', 1, 'next', LIVE, 5_000)).toBe(true)
+      })
+
+      it('releasing a permit nobody holds is not an error', async () => {
+        await expect(store.releasePermit('posthog', 'never-held')).resolves.not.toThrow()
+      })
+
+      it('grants exactly the limit under concurrent acquires (atomicClaim stores)', async () => {
+        if (!store.capabilities.atomicClaim) return
+        const outcomes = await Promise.all(
+          Array.from({ length: 16 }, (_, i) =>
+            store.acquirePermit('posthog', 5, `h${i}`, LIVE, 1_000),
+          ),
+        )
+        expect(outcomes.filter(Boolean)).toHaveLength(5)
+      })
+    })
+
+    describe('transient flights', () => {
+      const ANSWER = { status: 'ran', data: { rows: 1 } } as const
+
+      it('makes the first caller the leader and everyone overlapping a follower', async () => {
+        const first = await store.joinFlight('k', 9_000, 1_000)
+        expect(first).toEqual({ role: 'leader', generation: 1 })
+        expect(await store.joinFlight('k', 9_000, 1_000)).toEqual({
+          role: 'follower',
+          generation: 1,
+        })
+      })
+
+      it('hands the answer to the generation that waited for it', async () => {
+        const { generation } = await store.joinFlight('k', 9_000, 1_000)
+        expect(await store.readFlight('k', 1_000)).toEqual({ running: generation, settled: null })
+        expect(await store.settleFlight('k', generation, ANSWER, 11_000)).toBe(true)
+        expect(await store.readFlight('k', 2_000)).toEqual({
+          running: null,
+          settled: { generation, outcome: ANSWER },
+        })
+      })
+
+      it('starts a new flight for a caller that arrives after the last one settled', async () => {
+        const first = await store.joinFlight('k', 9_000, 1_000)
+        await store.settleFlight('k', first.generation, ANSWER, 11_000)
+        // A settled answer belongs to the cohort that waited for it.
+        const second = await store.joinFlight('k', 20_000, 12_000)
+        expect(second).toEqual({ role: 'leader', generation: 2 })
+        // And it does not cut off a follower still collecting the old one.
+        expect(await store.readFlight('k', 2_000)).toMatchObject({
+          running: 2,
+          settled: { generation: 1 },
+        })
+      })
+
+      it('lets the next caller take over a flight whose leader died', async () => {
+        const first = await store.joinFlight('k', 5_000, 1_000)
+        expect(await store.joinFlight('k', 9_000, 4_999)).toMatchObject({ role: 'follower' })
+        expect(await store.joinFlight('k', 20_000, 5_000)).toEqual({
+          role: 'leader',
+          generation: 2,
+        })
+        // The flight it lost can no longer hand anybody an answer.
+        expect(await store.settleFlight('k', first.generation, ANSWER, 30_000)).toBe(false)
+      })
+
+      it('forgets a settled answer once its handoff window closes', async () => {
+        const { generation } = await store.joinFlight('k', 9_000, 1_000)
+        await store.settleFlight('k', generation, ANSWER, 11_000)
+        expect(await store.readFlight('k', 11_000)).toEqual({ running: null, settled: null })
+      })
+
+      it('sweeps settled flights past their window, bounded, and keeps live ones', async () => {
+        const cold = await store.joinFlight('cold', 9_000, 1_000)
+        await store.settleFlight('cold', cold.generation, ANSWER, 5_000)
+        await store.joinFlight('live', 90_000, 1_000)
+
+        expect(await store.sweepFlights(6_000, 10)).toBe(1)
+        expect(await store.readFlight('cold', 6_000)).toBeNull()
+        expect(await store.readFlight('live', 6_000)).toMatchObject({ running: 1 })
+        expect(await store.sweepFlights(6_000, 0)).toBe(0)
+      })
+
+      it('answers null for a flight nobody has ever joined', async () => {
+        expect(await store.readFlight('never', 1_000)).toBeNull()
+        expect(await store.settleFlight('never', 1, ANSWER, 9_000)).toBe(false)
       })
     })
   })

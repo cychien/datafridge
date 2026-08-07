@@ -26,6 +26,16 @@ interface Store {
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
+  // maxConcurrent across every executor: take one of `limit` permits, give it
+  // back when the call ends, and let it expire if the holder never does
+  acquirePermit(source, limit, holder, expiresAt, now): Promise<boolean>
+  releasePermit(source: string, holder: string): Promise<void>
+  // transient flights: overlapping reads of the same key make one call, and the
+  // answer is handed only to the generation that waited for it
+  joinFlight(key: string, expiresAt: number, now: number): Promise<FlightTicket>
+  readFlight(key: string, now: number): Promise<FlightState | null>
+  settleFlight(key, generation, outcome, keepUntil): Promise<boolean>
+  sweepFlights(before: number, limit: number): Promise<number>
   // optional capability: SQL backends can fetch a page of the earliest rows in
   // one query; without it, core reads row by row. `limit` is always finite -
   // core never asks a store to enumerate itself
@@ -60,6 +70,10 @@ A backend with no conditional-write primitive cannot host the schedule half at a
 `takeQuota` uses the same primitive. Windows are fixed and aligned to the epoch - the one containing `now` starts at `floor(now / windowMs) * windowMs` and opens with a usage of zero - and a window is never rewound, so an executor whose clock lags cannot reopen one its peers have closed. `limit` arrives per call and is never stored: callers pass a lower one for work nobody is waiting on. One row per source is enough, so there is nothing to garbage-collect. Putting it in the store is what makes a shared rate limit free: two services pointing at one backend share one ledger, with no separate limiter to run.
 
 `releaseQuota` is its counterpart, and it is what keeps a ceiling a count of calls rather than of intentions: quota is taken before a lease is claimed, so a dispatch that loses the claim credits its slot back. It is a guarded decrement, not a CAS loop - only while `window_start` still matches the window `takenAt` fell in, and only while usage is above zero. Usage cannot move between windows, so a window that has already rolled is left alone; that leaves the previous one over-counting by one, which is the safe direction for a ceiling.
+
+`acquirePermit` is `maxConcurrent` made real across executors. It grants at most `limit` live permits per source and never waits - waiting is the caller's business - and every permit carries an expiry, because the one thing a holder that died will never do is release it. On SQL that is a single conditional insert (`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`), so the count and the take cannot be split by a peer.
+
+`joinFlight` is how overlapping reads of a parameter combination the registry does not name become one call. The first caller is the leader; anyone arriving while it runs is a follower of that `generation`. `settleFlight` writes the answer for that generation and is refused once the generation has moved on, which is what keeps a late answer from being handed to the wrong cohort. A caller arriving after a flight settles starts a new generation - the answer belongs to the readers who waited for it, and reusing it would make the combination a cached entry, which is exactly what it is not. Flights are transient: they expire, and `sweepFlights` drops the settled ones in bounded batches.
 
 ## Where the schedule half comes from (decided at config time)
 

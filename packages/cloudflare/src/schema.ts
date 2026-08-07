@@ -18,4 +18,13 @@ export const D1_SCHEMA: readonly string[] = [
     'ON datafridge_schedule (next_run_at)',
   'CREATE TABLE IF NOT EXISTS datafridge_quota (source TEXT PRIMARY KEY, ' +
     'window_start INTEGER NOT NULL, used INTEGER NOT NULL, version INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS datafridge_permit (holder TEXT PRIMARY KEY, ' +
+    'source TEXT NOT NULL, expires_at INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS idx_datafridge_permit_source ' +
+    'ON datafridge_permit (source, expires_at)',
+  'CREATE TABLE IF NOT EXISTS datafridge_flight (name TEXT PRIMARY KEY, ' +
+    'generation INTEGER NOT NULL, expires_at INTEGER NOT NULL, running INTEGER NOT NULL, ' +
+    'settled_generation INTEGER, outcome TEXT, keep_until INTEGER NOT NULL DEFAULT 0)',
+  'CREATE INDEX IF NOT EXISTS idx_datafridge_flight_keep_until ' +
+    'ON datafridge_flight (keep_until)',
 ]

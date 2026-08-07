@@ -217,7 +217,7 @@ export default {
 }
 ```
 
-這裡沒有任何東西經過 Durable Object。讀取隨你的 Worker 擴張，而不是在單一 singleton 後面排隊；而因為每一次呼叫仍然是從 dispatcher 出去、對著同一個 D1，source 天花板會把它們和 scheduler 的呼叫算在一起 - 兩邊透過 store 協調，那也是它們唯一相遇的地方。
+這裡沒有任何東西經過 Durable Object。讀取隨你的 Worker 擴張，而不是在單一 singleton 後面排隊；而且 `sources` 的每一部分都仍然有效：`limit` 與 `reserve` 記在 D1 裡、和 scheduler 的呼叫算在一起，`maxConcurrent` 是一張在 D1 取用的 permit，所以五十個併發 invocation 共用一個上限、而不是各拿一份，而跨這些 invocation、對同一組 params 的重疊 `anyParams` 讀取會合流成單一次上游呼叫。Store 是它們唯一相遇的地方，而那就夠了。
 
 改交給 reader 一個 results-only 的 store，它就回到「只給與只等」，那正是另一個服務裡不該打上游的 consumer 該有的形狀。此時含有 `anyParams` base 的 registry 會在建構時就失敗，而不是等到有人來讀。
 
@@ -231,6 +231,7 @@ export default {
 | Zombie 遲到寫回 | Version mismatch 時拒絕 | 保持不變 |
 | Per-source 額度用完 | 保持 due 且更過期，留待後續 tick | 立即回傳目前 envelope；miss 時為 `status: 'throttled'` |
 | 超出這次 invocation 的容量 | Row 原封不動，名字放入 `RunReport.deferred`；alarm 依 tick 回報的 `nextRunAt` 重設 | 不受影響：讀取從不等待 tick |
+| Source 到達併發上限 | 不 claim 直接延後；持有者死掉時 permit 會過期 | 等待中的讀取會在自己的 timeout 內排隊等 permit |
 | 尚未成功 refresh | 繼續 scheduled attempts | 回傳 `null` |
 | Alarm-level error | 在 `finally` 排定下一個 alarm | 既有 D1 envelopes 仍可讀 |
 

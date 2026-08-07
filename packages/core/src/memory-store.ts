@@ -1,4 +1,13 @@
-import type { Envelope, ScheduleRow, Store } from './types.js'
+import type { Envelope, FlightOutcome, ScheduleRow, Store } from './types.js'
+
+interface FlightRecord {
+  generation: number
+  expiresAt: number
+  running: boolean
+  settledGeneration: number | null
+  outcome: FlightOutcome | null
+  keepUntil: number
+}
 
 // JSON round-trips enforce the design rule that envelopes stay purely
 // JSON-serializable, and give callers isolated copies.
@@ -14,6 +23,8 @@ export function memoryStore(): Store {
   const results = new Map<string, Envelope>()
   const rows = new Map<string, ScheduleRow>()
   const quota = new Map<string, { windowStart: number; used: number }>()
+  const permits = new Map<string, { source: string; expiresAt: number }>()
+  const flights = new Map<string, FlightRecord>()
 
   return {
     capabilities: { atomicClaim: true, listDue: true },
@@ -79,6 +90,80 @@ export function memoryStore(): Store {
       // it, so a window that has already rolled keeps its count.
       if (ledger.windowStart !== Math.floor(takenAt / windowMs) * windowMs) return
       quota.set(source, { windowStart: ledger.windowStart, used: ledger.used - 1 })
+    },
+
+    async acquirePermit(source, limit, holder, expiresAt, now) {
+      let live = 0
+      for (const [key, permit] of [...permits]) {
+        if (permit.expiresAt <= now) permits.delete(key)
+        else if (permit.source === source) live += 1
+      }
+      if (live >= limit) return false
+      permits.set(holder, { source, expiresAt })
+      return true
+    },
+
+    async releasePermit(_source, holder) {
+      permits.delete(holder)
+    },
+
+    async joinFlight(key, expiresAt, now) {
+      const record = flights.get(key)
+      if (record !== undefined && record.running && record.expiresAt > now) {
+        return { role: 'follower', generation: record.generation }
+      }
+      const generation = (record?.generation ?? 0) + 1
+      flights.set(key, {
+        generation,
+        expiresAt,
+        running: true,
+        // A settled answer outlives the flight that produced it, so the cohort
+        // still reading it is not cut off by the next caller starting a new one.
+        settledGeneration: record?.settledGeneration ?? null,
+        outcome: record?.outcome ?? null,
+        keepUntil: record?.keepUntil ?? 0,
+      })
+      return { role: 'leader', generation }
+    },
+
+    async readFlight(key, now) {
+      const record = flights.get(key)
+      if (record === undefined) return null
+      return {
+        running: record.running && record.expiresAt > now ? record.generation : null,
+        settled:
+          record.settledGeneration !== null && record.outcome !== null && record.keepUntil > now
+            ? {
+                generation: record.settledGeneration,
+                outcome: JSON.parse(JSON.stringify(record.outcome)) as FlightOutcome,
+              }
+            : null,
+      }
+    },
+
+    async settleFlight(key, generation, outcome, keepUntil) {
+      const record = flights.get(key)
+      if (record === undefined || record.generation !== generation || !record.running) return false
+      flights.set(key, {
+        ...record,
+        running: false,
+        settledGeneration: generation,
+        outcome: JSON.parse(JSON.stringify(outcome)) as FlightOutcome,
+        keepUntil,
+      })
+      return true
+    },
+
+    async sweepFlights(before, limit) {
+      let swept = 0
+      for (const [key, record] of [...flights]) {
+        if (swept >= limit) break
+        if (record.running && record.expiresAt > before) continue
+        if (record.keepUntil > before) continue
+        flights.delete(key)
+        swept += 1
+      }
+      return swept
     },
 
     async listDue(now, limit) {

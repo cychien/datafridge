@@ -23,7 +23,7 @@ describe('planTick', () => {
       { name: 'future', every: '5m', fetch },
     ])
     const rows = lookup([row('future', 2_000), ['new', null]])
-    const plan = planTick(queries.all, rows, 1_000, false)
+    const plan = planTick(queries.all, rows, 1_000)
     expect(plan.map((c) => c.query.name)).toEqual(['new'])
     expect(plan[0]!.row).toEqual({
       name: 'new',
@@ -41,10 +41,7 @@ describe('planTick', () => {
     ])
     const now = 1_000_000
     const rows = lookup([row('hourly', now - 300_000), row('fast', now - 240_000)])
-    expect(planTick(queries.all, rows, now, false).map((c) => c.query.name)).toEqual([
-      'fast',
-      'hourly',
-    ])
+    expect(planTick(queries.all, rows, now).map((c) => c.query.name)).toEqual(['fast', 'hourly'])
   })
 
   it('keeps registration order on ties', () => {
@@ -53,16 +50,13 @@ describe('planTick', () => {
       { name: 'b', every: '5m', fetch },
     ])
     const rows = lookup([row('a', 0), row('b', 0)])
-    expect(planTick(queries.all, rows, 0, false).map((c) => c.query.name)).toEqual(['a', 'b'])
+    expect(planTick(queries.all, rows, 0).map((c) => c.query.name)).toEqual(['a', 'b'])
   })
 
-  it('treats an unread name as never-run only when the tick read every row', () => {
-    const queries = defineQueries([{ name: 'unread', every: '5m', fetch }])
-    const rows = lookup([])
-
-    expect(planTick(queries.all, rows, 1_000, false).map((c) => c.query.name)).toEqual(['unread'])
-    // The page was full, so an unread name is a name whose row sorts after
-    // everything read - claiming it at version 0 would lose to that row.
-    expect(planTick(queries.all, rows, 1_000, true)).toEqual([])
+  it('treats a query with no row as never-run, so a new one starts at once', () => {
+    const queries = defineQueries([{ name: 'fresh', every: '5m', fetch }])
+    expect(
+      planTick(queries.all, lookup([['fresh', null]]), 1_000).map((c) => c.query.name),
+    ).toEqual(['fresh'])
   })
 })

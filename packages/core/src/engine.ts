@@ -38,6 +38,8 @@ import type {
 const SCHEDULE_PAGE = 512
 const RECONCILE_DELETES_PER_TICK = 64
 const DISPATCH_CHUNK = 32
+const FLIGHT_SWEEP_PER_TICK = 128
+const ROW_FILL_CHUNK = 32
 
 export interface FridgeConfig {
   queries: Queries | readonly QueryDefinition[]
@@ -241,8 +243,6 @@ export function createFridge(config: FridgeConfig): Fridge {
 
     for (const query of effective.list) {
       const row = rows.get(query.name)
-      // Outside the page: this tick never read it, and guessing is worse than
-      // waiting for the tick that does.
       if (row === undefined || row === null || row.failCount > 0) continue
       if (row.leaseUntil !== null && row.leaseUntil > now) continue
       // Only an `every` shrink needs fixing here; growth self-heals with one
@@ -255,11 +255,28 @@ export function createFridge(config: FridgeConfig): Fridge {
   }
 
   /**
+   * The page is the bound on scanning a table nobody declared the size of. The
+   * registry is declared, though, so a name the page did not reach is looked up
+   * by name rather than guessed at: without this a registry larger than one page
+   * could never tell "no row yet" from "a row the page did not reach", and would
+   * either re-claim rows that exist or never start queries that do not.
+   * Costs nothing until a registry outgrows a page.
+   */
+  const fillMissingRows = async (list: readonly ResolvedQuery[], rows: Rows): Promise<void> => {
+    const missing = list.filter((query) => rows.get(query.name) === undefined)
+    for (let start = 0; start < missing.length; start += ROW_FILL_CHUNK) {
+      await Promise.all(
+        missing.slice(start, start + ROW_FILL_CHUNK).map((query) => rows.read(query.name)),
+      )
+    }
+  }
+
+  /**
    * What this invocation will still take on. A call is admitted only while its
    * own timeout fits in the wall clock the driver says is left, and only while
-   * its source has not already refused this tick - the ceiling is read from the
-   * ledger's own answer rather than guessed at, and one refusal per source per
-   * tick is enough to learn it. Everything turned away here is untouched, so it
+   * its source has not already refused this tick - both ceilings are read from
+   * the store's own answer rather than guessed at, and one refusal per source
+   * per tick is enough to learn it. Everything turned away here is untouched, so it
    * is still due, and more overdue, the moment the next tick starts.
    */
   const dispatchDue = async (
@@ -282,24 +299,37 @@ export function createFridge(config: FridgeConfig): Fridge {
     await Promise.allSettled(
       [...bySource].map(async ([source, candidates]) => {
         const chunk = chunkFor(sources, source)
-        let windowSpent = false
+        let sourceClosed = false
         for (let start = 0; start < candidates.length; start += chunk) {
           const admitted: Candidate[] = []
           for (const candidate of candidates.slice(start, start + chunk)) {
-            if (windowSpent || !fits(candidate.query)) report.deferred.push(candidate.query.name)
+            if (sourceClosed || !fits(candidate.query)) report.deferred.push(candidate.query.name)
             else admitted.push(candidate)
           }
           if (admitted.length === 0) continue
           await Promise.allSettled(
             admitted.map(async (candidate) => {
               const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
-              if (outcome.status === 'throttled') windowSpent = true
+              // One refusal is the whole answer for this source this tick,
+              // whether the window is spent or its calls are all in flight.
+              if (outcome.status === 'throttled' || outcome.status === 'deferred') {
+                sourceClosed = true
+              }
               onOutcome(candidate, outcome)
             }),
           )
         }
       }),
     )
+  }
+
+  const sweepSettledFlights = async (now: number): Promise<void> => {
+    try {
+      await schedule.sweepFlights(now, FLIGHT_SWEEP_PER_TICK)
+    } catch {
+      // Housekeeping: a sweep that does not land leaves rows that expire on
+      // their own terms and are answered as dead by the next caller.
+    }
   }
 
   const read = createReadPath({
@@ -317,20 +347,28 @@ export function createFridge(config: FridgeConfig): Fridge {
       const page = await listRows()
       const rows = new Rows()
       for (const row of page) rows.remember(row.name, row)
-      // A full page is the tick saying "there was more than I read", which is
-      // the only thing it can honestly say without reading further.
-      const pageWasFull = page.length >= SCHEDULE_PAGE
       const effective = await resolveEffective(nowArg ?? clock.now(), rows)
       // Resolution can legitimately spend a base's whole timeout, so dueness,
       // reconciliation and leases work from a timestamp taken after it. A
       // caller who supplied one owns the tick's clock and is never overridden.
       const now = nowArg ?? clock.now()
+      // A page that filled up while its rows were still due is the tick saying
+      // "there was more due than I read". A page that filled up and ran into
+      // future-dated rows is not: `listDue` orders by `nextRunAt`, so everything
+      // behind that last row is later still. Reading the count alone would make
+      // every registry past one page look permanently behind.
+      const moreDueBehindPage =
+        page.length >= SCHEDULE_PAGE && page[page.length - 1]!.nextRunAt <= now
+      await fillMissingRows(effective.list, rows)
       const { moreToRemove } = await reconcile(now, effective, page, rows)
+      // Flights are transient by construction, but nothing else would ever
+      // collect the settled ones; the tick is the only thing that runs anyway.
+      driver.defer(sweepSettledFlights(now))
 
       const report = emptyReport()
       report.failed.push(...effective.failures)
 
-      const plan = planTick(effective.list, rows, now, pageWasFull)
+      const plan = planTick(effective.list, rows, now)
       const dispatched = new Set<string>()
       let soonest: number | null = null
       const consider = (at: number): void => {
@@ -342,12 +380,13 @@ export function createFridge(config: FridgeConfig): Fridge {
         recordOutcome(report, candidate.query.name, outcome)
         if (outcome.status === 'throttled') consider(outcome.retryAt)
         else if (outcome.status === 'leased') consider(candidate.row.leaseUntil ?? now)
+        else if (outcome.status === 'deferred') consider(now)
         else if (outcome.nextRunAt !== undefined) consider(outcome.nextRunAt)
       })
 
       // Anything held back is due right now, so the next wake is right now; the
       // driver's own floor is what keeps that from becoming a hot loop.
-      if (report.deferred.length > 0 || moreToRemove || pageWasFull) consider(now)
+      if (report.deferred.length > 0 || moreToRemove || moreDueBehindPage) consider(now)
       for (const query of effective.list) {
         if (dispatched.has(query.name)) continue
         const row = rows.get(query.name)
@@ -382,6 +421,7 @@ function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome
   if (outcome.status === 'ran') report.ran.push(name)
   else if (outcome.status === 'leased') report.skippedLeased.push(name)
   else if (outcome.status === 'throttled') report.throttled.push(name)
+  else if (outcome.status === 'deferred') report.deferred.push(name)
   else report.failed.push({ name, message: outcome.message })
 }
 

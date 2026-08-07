@@ -7,11 +7,23 @@ import type { ResolvedSource, ResolvedSources } from './sources.js'
 import type {
   EphemeralQuery,
   Envelope,
+  FlightOutcome,
   ResolvedQuery,
   SchedulePlane,
   ScheduleRow,
   Store,
 } from './types.js'
+
+// How long a settled flight's answer stays readable by the cohort that waited
+// for it, how often a waiter looks, and how far apart those looks may drift.
+const FLIGHT_HANDOFF_MS = 10_000
+const FLIGHT_POLL_MS = 25
+const MAX_FLIGHT_POLL_MS = 500
+// A permit outlives the call it was taken for by this much, so a holder that
+// died stops counting shortly after rather than never.
+const PERMIT_GRACE_MS = 30_000
+const PERMIT_POLL_MS = 25
+const MAX_PERMIT_POLL_MS = 500
 
 export type FetchTask = {
   query: ResolvedQuery
@@ -28,13 +40,12 @@ export type DispatchOutcome =
   | { status: 'ran'; nextRunAt: number }
   | { status: 'leased' }
   | { status: 'throttled'; retryAt: number }
+  /** The source is at its concurrency ceiling; nothing was claimed or called. */
+  | { status: 'deferred' }
   | { status: 'failed'; message: string; nextRunAt?: number }
 
 /** A call with no entry behind it: it either brings data back, or it does not. */
-export type EphemeralOutcome =
-  | { status: 'ran'; data: unknown }
-  | { status: 'throttled'; retryAt: number }
-  | { status: 'failed'; message: string }
+export type EphemeralOutcome = FlightOutcome
 
 export interface DispatcherConfig {
   store: Store
@@ -54,9 +65,15 @@ export interface Dispatcher {
   run(task: FetchTask, now: number): Promise<DispatchOutcome>
   /**
    * A call for params the registry does not name. It draws on the same source
-   * window a reader's miss does and is bounded by the same timeout, but it
-   * claims nothing and stores nothing: there is no entry for it to be the
-   * current value of, so there is nothing to coalesce on and nothing to keep.
+   * window a reader's miss does, takes the same concurrency permit and is
+   * bounded by the same timeout, but it claims no lease and stores nothing:
+   * there is no entry for it to be the current value of.
+   *
+   * Reads that overlap coalesce anyway. The first joins a flight and makes the
+   * call; everyone who arrives while it is running takes its answer, so the
+   * cohort costs one call and one quota slot however many readers it holds.
+   * A read arriving after that flight settles is a new flight and a new call -
+   * an answer belongs to the people who waited for it, not to whoever asks next.
    */
   runEphemeral(query: EphemeralQuery, deadline: number, now: number): Promise<EphemeralOutcome>
 }
@@ -100,6 +117,9 @@ function makeSemaphores(sources: ResolvedSources) {
 export function createDispatcher(config: DispatcherConfig): Dispatcher {
   const { store, schedule, clock, random, sources } = config
   const semaphores = makeSemaphores(sources)
+  let holderSeq = 0
+  const holderPrefix = Math.floor(random() * 0x1_0000_0000).toString(36)
+  const nextHolder = (): string => `${holderPrefix}-${(holderSeq += 1).toString(36)}`
 
   const isOwner = async (name: string, token: number): Promise<boolean> => {
     const current = await schedule.readSchedule(name)
@@ -109,6 +129,11 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
   const sleepUntil = (at: number): Promise<void> =>
     new Promise((resolve) => {
       clock.setTimeout(() => resolve(), Math.max(0, at - clock.now()))
+    })
+
+  const sleepFor = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      clock.setTimeout(() => resolve(), Math.max(0, ms))
     })
 
   /**
@@ -153,6 +178,46 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       await schedule.releaseQuota(source, windowMs, takenAt)
     } catch {
       // Over-counting one call is the safe direction, and the window rolls.
+    }
+  }
+
+  /**
+   * `maxConcurrent` across every executor sharing this store, not just this
+   * one. The local semaphore above still runs first, so same-instance work
+   * hands slots straight over instead of polling; this is what stops two
+   * Workers from being two ceilings. A permit expires on its own, so a holder
+   * that died stops blocking its peers without anyone having to notice.
+   */
+  const takePermit = async (
+    source: string,
+    expiresAt: number,
+    deadline: number | undefined,
+  ): Promise<{ ok: true; release: () => Promise<void> } | { ok: false }> => {
+    const max = sources.get(source)?.maxConcurrent
+    if (max === undefined || !Number.isFinite(max)) {
+      return { ok: true, release: async () => undefined }
+    }
+    const holder = nextHolder()
+    let interval = PERMIT_POLL_MS
+    for (;;) {
+      if (await schedule.acquirePermit(source, max, holder, expiresAt, clock.now())) break
+      // Scheduled work never queues for a permit: staying due and coming back
+      // more overdue is cheaper than holding an invocation open for a peer.
+      const remaining = deadline === undefined ? 0 : deadline - clock.now()
+      if (remaining <= 0) return { ok: false }
+      await sleepFor(Math.min(interval, remaining))
+      interval = Math.min(interval * 2, MAX_PERMIT_POLL_MS)
+    }
+    return {
+      ok: true,
+      release: async () => {
+        try {
+          await schedule.releasePermit(source, holder)
+        } catch {
+          // The permit expires on its own; a failed release costs a little
+          // headroom until then, never correctness.
+        }
+      },
     }
   }
 
@@ -263,46 +328,106 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
       takenAt = taken.takenAt
     }
-    const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
-    if (!claimed) {
-      // Someone else is doing this work; nothing leaves for upstream here, so
-      // the slot this call was counted for goes back to the window.
+    const permit = await takePermit(
+      source,
+      now + query.leaseMs + PERMIT_GRACE_MS,
+      task.priority === 'demand' ? task.deadline : undefined,
+    )
+    if (!permit.ok) {
       if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-      return { status: 'leased' }
+      return { status: 'deferred' }
     }
-    const token = row.version + 1
     try {
-      const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
-        query.fetch({ signal, now, attempt: row.failCount + 1 }),
-      )
-      return await succeed(query, token, data, clock.now())
-    } catch (err) {
-      return await fail(query, row, token, err)
+      const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
+      if (!claimed) {
+        // Someone else is doing this work; nothing leaves for upstream here, so
+        // the slot this call was counted for goes back to the window.
+        if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
+        return { status: 'leased' }
+      }
+      const token = row.version + 1
+      try {
+        const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
+          query.fetch({ signal, now, attempt: row.failCount + 1 }),
+        )
+        return await succeed(query, token, data, clock.now())
+      } catch (err) {
+        return await fail(query, row, token, err)
+      }
+    } finally {
+      await permit.release()
     }
   }
 
-  const dispatchEphemeral = async (
+  /** Takes the answer of the flight this reader joined, and only that one. */
+  const awaitFlight = async (
+    key: string,
+    generation: number,
+    deadline: number,
+  ): Promise<EphemeralOutcome> => {
+    let interval = FLIGHT_POLL_MS
+    for (;;) {
+      const state = await schedule.readFlight(key, clock.now())
+      if (state?.settled?.generation === generation) return state.settled.outcome
+      // Somebody took the flight over, so the call this reader was waiting on
+      // is never going to answer it.
+      if (state === null || (state.running !== null && state.running > generation)) {
+        return { status: 'failed', message: `query '${key}': the call it joined went away` }
+      }
+      const remaining = deadline - clock.now()
+      if (remaining <= 0) {
+        return { status: 'failed', message: `query '${key}': timed out waiting for its call` }
+      }
+      await sleepFor(Math.min(interval, remaining))
+      interval = Math.min(interval * 2, MAX_FLIGHT_POLL_MS)
+    }
+  }
+
+  /** Makes the call the whole cohort is waiting on, and hands them the answer. */
+  const leadFlight = async (
     query: EphemeralQuery,
+    generation: number,
     deadline: number,
     now: number,
     unslotted: Unslotted,
   ): Promise<EphemeralOutcome> => {
     const { name, source } = query
+    const settle = async (outcome: FlightOutcome): Promise<EphemeralOutcome> => {
+      try {
+        await schedule.settleFlight(name, generation, outcome, clock.now() + FLIGHT_HANDOFF_MS)
+      } catch {
+        // The cohort falls back to its own deadline. A handoff that does not
+        // land costs those readers an answer, never the ledger its accuracy:
+        // the call happened, and it stays charged.
+      }
+      return outcome
+    }
+
     const policy = sources.get(source)
-    if (policy !== undefined && policy.windowMs !== Infinity) {
+    const metered = policy !== undefined && policy.windowMs !== Infinity
+    let takenAt = 0
+    if (metered) {
       // A reader is waiting, so this draws on the same ceiling a miss does,
-      // reserve included. Nothing is claimed, so there is nothing to refund.
+      // reserve included - once, for everyone who joined.
       const taken = await takeQuota(policy, source, policy.demandLimit, deadline, unslotted)
-      if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
+      if (!taken.ok) return settle({ status: 'throttled', retryAt: taken.retryAt })
+      takenAt = taken.takenAt
+    }
+    const permit = await takePermit(source, deadline + PERMIT_GRACE_MS, deadline)
+    if (!permit.ok) {
+      if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
+      return settle({ status: 'failed', message: `query '${name}': no permit before the deadline` })
     }
     try {
       const remaining = Math.max(0, Math.min(query.timeoutMs, deadline - clock.now()))
       const data = await withDeadline(clock, remaining, `query '${name}'`, (signal) =>
         query.fetch({ signal, now, attempt: 1 }),
       )
-      return { status: 'ran', data }
+      return await settle({ status: 'ran', data })
     } catch (err) {
-      return { status: 'failed', message: errorMessage(err) }
+      return await settle({ status: 'failed', message: errorMessage(err) })
+    } finally {
+      await permit.release()
     }
   }
 
@@ -335,8 +460,20 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       return inSlot(task.query.source, (unslotted) => dispatch(task, now, unslotted))
     },
 
-    runEphemeral(query: EphemeralQuery, deadline: number, now: number): Promise<EphemeralOutcome> {
-      return inSlot(query.source, (unslotted) => dispatchEphemeral(query, deadline, now, unslotted))
+    async runEphemeral(
+      query: EphemeralQuery,
+      deadline: number,
+      now: number,
+    ): Promise<EphemeralOutcome> {
+      // Joining happens before any slot is taken: a follower makes no call, so
+      // it must not sit on the budget that bounds the ones that do.
+      const ticket = await schedule.joinFlight(query.name, deadline + PERMIT_GRACE_MS, now)
+      if (ticket.role === 'follower') {
+        return awaitFlight(query.name, ticket.generation, deadline)
+      }
+      return inSlot(query.source, (unslotted) =>
+        leadFlight(query, ticket.generation, deadline, now, unslotted),
+      )
     },
   }
 }

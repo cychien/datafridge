@@ -96,9 +96,12 @@ const funnel = defineParameterizedQuery({
 
 **是不是一個 entry，由 registry 決定，永遠不由「剛好有人問了」決定。** Registry 指名的 parameter 組合 - 寫在 `variants`、由 `dimensions` 展開、或由 dynamic 清單回傳的 - 是持久的排程 entry，有自己的 row、lease、backoff 與已儲存的結果。Registry 沒有指名的組合就不是 entry，讀它不會存下任何東西：沒有結果、沒有 schedule row、沒有成員資格。它是一次呼叫，也就照呼叫來回答。
 
-那次呼叫一樣從所有東西共用的那個 dispatcher 出去，所以它會扣 source 的窗口（含等待中的讀者應得的 reserve）、遵守 `maxConcurrent`、受 base 自己的 `timeout` 約束，也認得 `RateLimitError`。它拿不到的是 lease，因為沒有任何 entry 需要它去當「目前的值」- 所以同時讀同一組未指名的 params 就是兩次呼叫，而約束它們的是 source 天花板。
+那次呼叫一樣從所有東西共用的那個 dispatcher 出去，所以它會扣 source 的窗口（含等待中的讀者應得的 reserve）、遵守 `maxConcurrent`、受 base 自己的 `timeout` 約束，也認得 `RateLimitError`。
+
+**重疊的讀取仍然會合流。** 同一個 `queryKey` 的第一個讀者發出呼叫；在它還在跑的時候抵達的每一個讀者都加入那個 flight，並拿走它的答案。一百個同時進來的請求就是一次上游呼叫、一格額度，不管它們落在幾個 Worker 上 - flight 協調在 store 裡，不在某個 process 的記憶體裡。在那個 flight 結束**之後**才抵達的讀取，是一個新的 flight、一次新的呼叫：答案屬於等它的那批讀者，把它交給下一個來問的人就會變成快取，而那正是未指名組合不該有的東西。
 
 - **它永遠不會被排程。** Open base 對 tick 沒有任何貢獻，所以它不宣告 `every`、`lease` 或 `validUntil`。什麼都不存，所以也不吃 `codec`；四者都在建構時被拒絕。
+- **Flight 是暫時的。** 它不存結果、會自己過期，並由下一個 tick 清掉。Leader 死了之後，過了它的期限就由下一個讀者接手；已結束的答案在那批讀者拿到後不久就不再被交出去。
 - **讀取必須帶 params。** 沒有 params 的 open base 什麼組合都沒指名。
 - **Reader 必須有能力發出那次呼叫。** `createReader` 需要完整的 store - 能 claim、能計額度的那種，例如 `d1(env.DB)` - 不能是 results-only。這在建構 reader 時就檢查，不是等到有人來讀。
 - **呼叫失敗回 `null`**，而且不留下 backoff，因為沒有東西可以讓 backoff 掛上去。希望失敗被記住時，請改用宣告過的 variant。
@@ -129,7 +132,7 @@ const value = await fridge.read<Result>('analytics-7d')
 
 Missing 或 malformed driver、缺少任一半的 store、非法 source policy，以及在 non-serialized driver 下無法原子 claim 的 store，都會在建構時被拒絕。
 
-`sources` 宣告每個 source 能承受什麼。`limit` 是硬天花板，記在 store 的 quota ledger 裡、由所有 executor 共用；`reserve` 從每個窗口保留一部分不給排程刷新，讓等待中的讀者仍然過得去；`maxConcurrent` 限制單一 instance 在途的呼叫數。見 [rate limiting](./rate-limiting.md)。
+`sources` 宣告每個 source 能承受什麼。`limit` 是硬天花板，記在 store 的 quota ledger 裡、由所有 executor 共用；`reserve` 從每個窗口保留一部分不給排程刷新，讓等待中的讀者仍然過得去；`maxConcurrent` 限制所有共用這個 store 的 executor 同時在途的呼叫數。見 [rate limiting](./rate-limiting.md)。
 
 `runDue(now?)` 會 reconcile registry、以最過期優先選擇到期工作、對每個 source 的 ledger 計數、claim leases、concurrently 執行 fetchers，並回傳：
 
@@ -144,7 +147,7 @@ interface RunReport {
 }
 ```
 
-`throttled` 是 source 的天花板，`deferred` 是這次 invocation 的容量；兩者都讓 row 維持原樣，所以兩者都只是更過期地回來，不會遺失。`nextRunAt` 是這個 fridge 下一次有工作的時間，由該 tick 手上既有的 row 算出來 - 自己排喚醒的 driver 用它，而不必再問一次 storage；`null` 代表根本沒有任何排程。
+`throttled` 是 source 的窗口，`deferred` 是這次 invocation 承接不了的其他一切 - 剩餘的 wall clock，或該 source 的併發上限。兩者都讓 row 維持原樣，所以兩者都只是更過期地回來，不會遺失。`nextRunAt` 是這個 fridge 下一次有工作的時間，由該 tick 手上既有的 row 算出來 - 自己排喚醒的 driver 用它，而不必再問一次 storage；`null` 代表根本沒有任何排程。
 
 成功 refresh 會從完成時間排定下一次執行。失敗會保留舊 envelope，並以有 jitter 的 exponential backoff 重試，上限為 `every`。
 

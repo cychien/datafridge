@@ -22,3 +22,29 @@ export function stored<T>(result: ReadResult<T> | ThrottledRead | null): ReadRes
   }
   return result
 }
+
+/**
+ * Every table datafridge owns, asked of the database rather than listed here:
+ * a test fixture that has to be updated when the schema grows is a test fixture
+ * that silently stops isolating.
+ */
+async function datafridgeTables(db: D1Database): Promise<string[]> {
+  const { results } = await db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'datafridge_%'")
+    .all<{ name: string }>()
+  return results.map((row) => row.name)
+}
+
+/** Empties datafridge's tables, leaving the schema in place. */
+export async function wipeStore(db: D1Database): Promise<void> {
+  const tables = await datafridgeTables(db)
+  if (tables.length === 0) return
+  await db.batch(tables.map((table) => db.prepare(`DELETE FROM ${table}`)))
+}
+
+/** Takes the schema away entirely, so the next write has to put it back. */
+export async function dropStore(db: D1Database): Promise<void> {
+  const tables = await datafridgeTables(db)
+  if (tables.length === 0) return
+  await db.batch(tables.map((table) => db.prepare(`DROP TABLE ${table}`)))
+}

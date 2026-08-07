@@ -26,6 +26,16 @@ interface Store {
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
+  // maxConcurrent across every executor: take one of `limit` permits, give it
+  // back when the call ends, and let it expire if the holder never does
+  acquirePermit(source, limit, holder, expiresAt, now): Promise<boolean>
+  releasePermit(source: string, holder: string): Promise<void>
+  // transient flights: overlapping reads of the same key make one call, and the
+  // answer is handed only to the generation that waited for it
+  joinFlight(key: string, expiresAt: number, now: number): Promise<FlightTicket>
+  readFlight(key: string, now: number): Promise<FlightState | null>
+  settleFlight(key, generation, outcome, keepUntil): Promise<boolean>
+  sweepFlights(before: number, limit: number): Promise<number>
   // optional capability: SQL backends can fetch a page of the earliest rows in
   // one query; without it, core reads row by row. `limit` is always finite -
   // core never asks a store to enumerate itself
@@ -60,6 +70,10 @@ interface Store {
 `takeQuota` 用的是同一個原語。窗口固定且對齊 epoch - 包含 `now` 的那個從 `floor(now / windowMs) * windowMs` 開始，並從零開起 - 而且窗口永不倒退，所以時鐘落後的 executor 無法重開一個同儕已經關掉的窗。`limit` 每次呼叫都帶進來、從不儲存：對沒有人在等的工作，呼叫端會傳一個比較低的值。每個 source 一列就夠，所以沒有東西需要 GC。把它放進 store，是共用 rate limit 免費的原因：兩個服務指向同一個後端就共用一份 ledger，不需要另外跑一個 limiter。
 
 `releaseQuota` 是它的對應：quota 在 claim lease 之前就先扣，所以搶不到 claim 的 dispatch 要把那一格還回去 - 這是讓上限維持「算呼叫」而不是「算意圖」的關鍵。它是一個有守衛的遞減，不需要 CAS 迴圈：只有在 `window_start` 仍然等於 `takenAt` 所落的那個窗、而且用量大於零時才生效。用量不能跨窗搬移，所以已經翻頁的窗一律不動；那會讓前一個窗多算一次，而多算正是上限該偏的方向。
+
+`acquirePermit` 是把 `maxConcurrent` 落實到跨 executor 的東西。它每個 source 最多發出 `limit` 張有效 permit，而且從不等待 - 等待是呼叫端的事 - 每張 permit 都帶著到期時間，因為死掉的持有者唯一不會做的事就是歸還它。在 SQL 上這是一條有條件的 insert（`INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`），所以計數與取用無法被同儕從中切開。
+
+`joinFlight` 是讓「registry 沒有指名的 parameter 組合」在重疊讀取時只發一次呼叫的機制。第一個呼叫者是 leader；在它執行期間抵達的都是那個 `generation` 的 follower。`settleFlight` 為該 generation 寫下答案，一旦 generation 前進就會被拒絕 - 這正是遲到的答案不會被交給錯誤群組的原因。在 flight 結束後才抵達的呼叫者會開一個新的 generation - 答案屬於等它的那批讀者，重用它就會讓那個組合變成一個快取 entry，而它正好不是。Flight 是暫時的：它們會過期，`sweepFlights` 以有界的批次丟掉已結束的那些。
 
 ## 排程那一半從哪來（建構時就決定）
 

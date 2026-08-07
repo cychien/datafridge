@@ -123,7 +123,7 @@ describe('a dispatch that never reaches upstream', () => {
     expect(await store.takeQuota('posthog', 1, MINUTE, 0)).toBe(true)
   })
 
-  it('keeps the slot spent when the call did happen and only the write-back lost', async () => {
+  it('keeps the slot spent when the call did reach upstream', async () => {
     const calls: Record<string, number> = {}
     const { store, fridge } = makeHarness([counted('q', calls)], {
       sources: { posthog: { limit: { requests: 1, per: '1m' } } },

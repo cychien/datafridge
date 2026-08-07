@@ -182,10 +182,39 @@ export interface StoreCapabilities {
   listDue: boolean
 }
 
+/** What one upstream call for params no entry exists for came back with. */
+export type FlightOutcome =
+  | { status: 'ran'; data: unknown }
+  | { status: 'throttled'; retryAt: number }
+  | { status: 'failed'; message: string }
+
 /**
- * Schedule bookkeeping on its own. Adapter-level: the only implementors are
- * stateful serialized drivers that keep their own (a Durable Object's SQLite,
- * a long-lived process's memory). Applications pass a Store, never this.
+ * A place in a flight. The leader makes the call; followers joined while it was
+ * still running and take its answer. `generation` scopes the handoff: an answer
+ * is only ever handed to the cohort that was waiting on that exact flight.
+ */
+export interface FlightTicket {
+  role: 'leader' | 'follower'
+  generation: number
+}
+
+/**
+ * What a waiter needs to know: whether its own flight is still running, and
+ * whether the answer it is entitled to has landed.
+ */
+export interface FlightState {
+  /** The generation currently running, or `null` when nothing is. */
+  running: number | null
+  /** The last answer still inside its handoff window. */
+  settled: { generation: number; outcome: FlightOutcome } | null
+}
+
+/**
+ * Dispatcher coordination on its own: schedule rows, leases, the quota ledger,
+ * concurrency permits and transient flights. Adapter-level - applications pass
+ * a Store, never this - and it is the one place every executor sharing a
+ * backend meets, which is why all of it lives here rather than in whichever
+ * process happens to be running.
  */
 export interface SchedulePlane {
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -209,6 +238,48 @@ export interface SchedulePlane {
    * usage below zero.
    */
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
+  /**
+   * Takes one of `limit` concurrency permits for `source`, across every
+   * executor sharing this store. `holder` identifies this call so it can give
+   * the permit back; `expiresAt` is when the permit stops counting even if it
+   * never is, which is how a holder that died stops blocking everyone else.
+   * Answers whether the permit was granted; it never waits.
+   */
+  acquirePermit(
+    source: string,
+    limit: number,
+    holder: string,
+    expiresAt: number,
+    now: number,
+  ): Promise<boolean>
+  /** Gives a permit back the moment the call it was taken for is done. */
+  releasePermit(source: string, holder: string): Promise<void>
+  /**
+   * Joins the flight for `key`, creating one when nothing is running. A caller
+   * that finds a live flight becomes a follower of it and takes its answer
+   * rather than making a second call; a caller that arrives once the last
+   * flight has settled starts a new generation, because a settled answer
+   * belongs to the cohort that waited for it and to nobody who came later.
+   * `expiresAt` is the leader's own deadline: past it the flight is dead and
+   * the next caller takes it over.
+   */
+  joinFlight(key: string, expiresAt: number, now: number): Promise<FlightTicket>
+  /** Where a follower's answer arrives. */
+  readFlight(key: string, now: number): Promise<FlightState | null>
+  /**
+   * The leader's answer, handed to whoever is waiting on this generation and
+   * kept readable until `keepUntil`. Answers false when the generation has
+   * moved on, which is how a write from a flight everyone stopped waiting for
+   * is rejected rather than handed to the wrong cohort.
+   */
+  settleFlight(
+    key: string,
+    generation: number,
+    outcome: FlightOutcome,
+    keepUntil: number,
+  ): Promise<boolean>
+  /** Drops settled flights past their handoff window. Bounded by `limit`. */
+  sweepFlights(before: number, limit: number): Promise<number>
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: StoreCapabilities
 }
@@ -239,10 +310,10 @@ export interface RunReport {
   throttled: string[]
   /**
    * Due, but past what this invocation could take on: its remaining wall clock
-   * would not fit the query's own timeout, the source's window was already
-   * known spent, or the tick's bounded page of rows did not reach it. Nothing
-   * upstream was asked and nothing was written, so these come back at the head
-   * of the next tick. Capacity, not rate: `throttled` is the source ceiling.
+   * would not fit the query's own timeout, or the source was already at its
+   * concurrency ceiling. Nothing upstream was asked and nothing was written, so
+   * these come back at the head of the next tick. Capacity, not rate:
+   * `throttled` is the source's window, this is everything else.
    */
   deferred: string[]
   failed: Array<{ name: string; message: string }>

@@ -5,9 +5,10 @@ import { assertTimeoutsFitInvocation, INVOCATION_WALL_CLOCK_LIMIT_MS } from './l
 
 const REGISTRY_META_KEY = 'registry'
 const MIN_ALARM_DELAY_MS = 1_000
-// Nothing in the registry is due and nothing is stored yet: look again on the
-// shortest declared period rather than going quiet.
-const IDLE_ALARM_DELAY_MS = 60_000
+// Recovery only: the tick threw before it could say when there is work again,
+// so the chain looks again shortly rather than going quiet. A healthy tick
+// always reports its own `nextRunAt` and this is never reached.
+const RECOVERY_ALARM_DELAY_MS = 60_000
 
 // The object keeps no dispatch state: schedule rows, leases, quota and results
 // all live in the Store, so two of these - or one of these and a cron trigger -
@@ -120,7 +121,7 @@ export abstract class FridgeDO<Env = unknown> extends DurableObject<Env> {
   async #scheduleNextAlarm(queries: Queries, nextRunAt: number | null): Promise<void> {
     const now = Date.now()
     if (nextRunAt === null && !hasScheduledWork(queries)) return
-    const at = nextRunAt ?? now + IDLE_ALARM_DELAY_MS
+    const at = nextRunAt ?? now + RECOVERY_ALARM_DELAY_MS
     await this.ctx.storage.setAlarm(Math.max(at, now + MIN_ALARM_DELAY_MS))
   }
 

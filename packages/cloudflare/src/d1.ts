@@ -1,4 +1,4 @@
-import type { Envelope, QueryParams, ScheduleRow, Store } from '@datafridge/core'
+import type { Envelope, FlightOutcome, QueryParams, ScheduleRow, Store } from '@datafridge/core'
 import { D1_SCHEMA } from './schema.js'
 
 // D1's documented maximum string/BLOB/row size (developers.cloudflare.com/d1/platform/limits).
@@ -21,6 +21,15 @@ type QuotaRecord = {
   window_start: number
   used: number
   version: number
+}
+
+type FlightRecord = {
+  generation: number
+  expires_at: number
+  running: number
+  settled_generation: number | null
+  outcome: string | null
+  keep_until: number
 }
 
 // Applied once per binding per isolate, before the first write. Applying the
@@ -240,6 +249,107 @@ export function d1(db: D1Database): Store {
           )
           .bind(source, Math.floor(takenAt / windowMs) * windowMs)
           .run()
+      })
+    },
+
+    // One statement decides and takes: the count and the insert cannot be
+    // separated by a peer, so two Workers cannot both read "one slot left".
+    async acquirePermit(source, limit, holder, expiresAt, now) {
+      return withSchema(db, async () => {
+        const taken = await db
+          .prepare(
+            'INSERT INTO datafridge_permit (holder, source, expires_at) SELECT ?, ?, ? ' +
+              'WHERE (SELECT COUNT(*) FROM datafridge_permit ' +
+              'WHERE source = ? AND expires_at > ?) < ?',
+          )
+          .bind(holder, source, expiresAt, source, now, limit)
+          .run()
+        if (taken.meta.changes === 1) return true
+        // Refused: this is the moment worth paying to collect the permits of
+        // holders that died, so the next caller sees the real count.
+        await db.prepare('DELETE FROM datafridge_permit WHERE expires_at <= ?').bind(now).run()
+        return false
+      })
+    },
+
+    async releasePermit(_source, holder) {
+      return withSchema(db, async () => {
+        await db.prepare('DELETE FROM datafridge_permit WHERE holder = ?').bind(holder).run()
+      })
+    },
+
+    async joinFlight(key, expiresAt, now) {
+      return withSchema(db, async () => {
+        // Leading is the conditional write; following is what is left when it
+        // does not apply, so the winner pays one round trip and nobody races.
+        const led = await db
+          .prepare(
+            'INSERT INTO datafridge_flight ' +
+              '(name, generation, expires_at, running, keep_until) VALUES (?, 1, ?, 1, 0) ' +
+              'ON CONFLICT (name) DO UPDATE SET generation = datafridge_flight.generation + 1, ' +
+              'expires_at = excluded.expires_at, running = 1 ' +
+              'WHERE datafridge_flight.running = 0 OR datafridge_flight.expires_at <= ? ' +
+              'RETURNING generation',
+          )
+          .bind(key, expiresAt, now)
+          .first<{ generation: number }>()
+        if (led) return { role: 'leader', generation: led.generation }
+        const record = await db
+          .prepare('SELECT generation FROM datafridge_flight WHERE name = ?')
+          .bind(key)
+          .first<{ generation: number }>()
+        // The row vanished between the two statements, so nothing is running.
+        if (!record) return { role: 'leader', generation: 1 }
+        return { role: 'follower', generation: record.generation }
+      })
+    },
+
+    async readFlight(key, now) {
+      return withSchema(db, async () => {
+        const record = await db
+          .prepare(
+            'SELECT generation, expires_at, running, settled_generation, outcome, keep_until ' +
+              'FROM datafridge_flight WHERE name = ?',
+          )
+          .bind(key)
+          .first<FlightRecord>()
+        if (!record) return null
+        return {
+          running: record.running === 1 && record.expires_at > now ? record.generation : null,
+          settled:
+            record.settled_generation !== null && record.outcome !== null && record.keep_until > now
+              ? {
+                  generation: record.settled_generation,
+                  outcome: JSON.parse(record.outcome) as FlightOutcome,
+                }
+              : null,
+        }
+      })
+    },
+
+    async settleFlight(key, generation, outcome, keepUntil) {
+      return withSchema(db, async () => {
+        const settled = await db
+          .prepare(
+            'UPDATE datafridge_flight SET running = 0, settled_generation = ?, outcome = ?, ' +
+              'keep_until = ? WHERE name = ? AND generation = ? AND running = 1',
+          )
+          .bind(generation, JSON.stringify(outcome), keepUntil, key, generation)
+          .run()
+        return settled.meta.changes === 1
+      })
+    },
+
+    async sweepFlights(before, limit) {
+      return withSchema(db, async () => {
+        const swept = await db
+          .prepare(
+            'DELETE FROM datafridge_flight WHERE name IN (SELECT name FROM datafridge_flight ' +
+              'WHERE keep_until <= ? AND (running = 0 OR expires_at <= ?) LIMIT ?)',
+          )
+          .bind(before, before, limit)
+          .run()
+        return swept.meta.changes
       })
     },
 
