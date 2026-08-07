@@ -1,5 +1,5 @@
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, FridgeDO } from '@datafridge/cloudflare'
 
 export interface Env {
   DB: D1Database
@@ -24,7 +24,7 @@ const queriesFor = (env: Env) =>
     },
   ])
 
-export class Poller extends PollerDO<Env> {
+export class Poller extends FridgeDO<Env> {
   get queries() {
     return queriesFor(this.env)
   }

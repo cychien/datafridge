@@ -21,6 +21,6 @@ An array expands once at construction, exactly as before. A function - `variants
 
 `dimensions` is the cartesian product of its entries, one param field per dimension, so a preset axis no longer has to be flattened into query names by hand.
 
-This changes what a function-valued `variants` means: it used to be expanded once when `defineQueries` ran. Returning a fresh registry from a `PollerDO` `queries` getter to pick up list changes is no longer needed.
+This changes what a function-valued `variants` means: it used to be expanded once when `defineQueries` ran. Returning a fresh registry from a `FridgeDO` `queries` getter to pick up list changes is no longer needed.
 
 `@datafridge/cloudflare`: the Durable Object's next alarm now comes from its schedule rows, which is what lets dynamic variants - rows with no static registry entry - keep the alarm chain alive, including retrying a base whose resolution keeps failing on its own cadence.

@@ -1,9 +1,11 @@
 import type { Clock } from './clock.js'
 import { withDeadline } from './deadline.js'
 import { parseDuration } from './duration.js'
+import type { Duration } from './duration.js'
 import { ConfigError } from './errors.js'
 import { queryKey, snapshotQueryParams, validateQueryName } from './query-key.js'
 import type {
+  EphemeralQuery,
   FetchCtx,
   ParameterizedQueryDef,
   QueryCodec,
@@ -35,11 +37,25 @@ export interface DynamicVariants {
   readonly member: (key: string, signal?: AbortSignal) => Promise<ResolvedQuery | undefined>
 }
 
-// Construction stays free of time: the bound belongs to whoever owns a clock.
-const NEVER_ABORTED = new AbortController().signal
+/**
+ * A parameterized query with no list and no entries. Params the registry does
+ * not name are answered by one fresh call through the dispatcher and nothing is
+ * kept: no row, no lease, no envelope. Being an entry is what the registry
+ * decides, never what somebody happened to ask for.
+ */
+export interface OpenBase {
+  readonly baseName: string
+  readonly timeoutMs: number
+  readonly source: string
+  readonly instantiate: (params: QueryParams) => EphemeralQuery
+}
 
+// Construction stays free of time: the bound belongs to whoever owns a clock.
+// The stand-in signal is built per call, never once at module scope: workerd
+// bans AbortController in global scope and would refuse to start any Worker
+// importing this file.
 function resolveCtx(signal: AbortSignal | undefined): ResolveCtx {
-  return { signal: signal ?? NEVER_ABORTED }
+  return { signal: signal ?? new AbortController().signal }
 }
 
 function resolutionLabel(dynamic: DynamicVariants): string {
@@ -80,14 +96,26 @@ export function resolveMemberBy(
 export class Queries {
   readonly all: readonly ResolvedQuery[]
   readonly dynamic: readonly DynamicVariants[]
+  readonly open: readonly OpenBase[]
   readonly #byName: Map<string, ResolvedQuery>
   readonly #dynamicByBase: Map<string, DynamicVariants>
+  readonly #openByBase: Map<string, OpenBase>
 
-  constructor(all: readonly ResolvedQuery[], dynamic: readonly DynamicVariants[] = []) {
+  constructor(
+    all: readonly ResolvedQuery[],
+    dynamic: readonly DynamicVariants[] = [],
+    open: readonly OpenBase[] = [],
+  ) {
     this.all = all
     this.dynamic = dynamic
+    this.open = open
     this.#byName = new Map(all.map((query) => [query.name, query]))
     this.#dynamicByBase = new Map(dynamic.map((entry) => [entry.baseName, entry]))
+    this.#openByBase = new Map(open.map((entry) => [entry.baseName, entry]))
+  }
+
+  openFor(baseName: string): OpenBase | undefined {
+    return this.#openByBase.get(baseName)
   }
 
   get(name: string, params?: QueryParams): ResolvedQuery | undefined {
@@ -120,6 +148,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
   const keys = new Set<string>()
   const resolved: ResolvedQuery[] = []
   const dynamic: DynamicVariants[] = []
+  const open: OpenBase[] = []
 
   for (const definition of definitions) {
     validateQueryName(definition.name)
@@ -129,6 +158,16 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     baseNames.add(definition.name)
 
     if (isParameterized(definition)) {
+      if (definition.anyParams !== undefined) {
+        if (definition.variants !== undefined || definition.dimensions !== undefined) {
+          throw new ConfigError(
+            `query '${definition.name}': anyParams names no list, so it cannot be combined ` +
+              'with variants or dimensions',
+          )
+        }
+        open.push(makeOpen(definition))
+        continue
+      }
       const source = variantSource(definition)
       if (source.kind === 'dynamic') {
         dynamic.push(makeDynamic(definition, source.resolve))
@@ -151,7 +190,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     resolved.push(query)
   }
 
-  return new Queries(Object.freeze(resolved), Object.freeze(dynamic))
+  return new Queries(Object.freeze(resolved), Object.freeze(dynamic), Object.freeze(open))
 }
 
 type VariantSource =
@@ -233,6 +272,55 @@ function cartesian(
   return combos
 }
 
+/**
+ * Fields an open base cannot mean anything by. The types already exclude them,
+ * but a JS caller has no types, so presence of the property is what is checked -
+ * an explicit `every: undefined` is still somebody declaring a schedule for
+ * something that is never scheduled.
+ */
+const OPEN_BASE_FORBIDDEN: ReadonlyArray<readonly [string, string]> = [
+  ['every', 'anyParams has no entries to schedule, so it cannot declare a period'],
+  ['lease', 'anyParams claims no lease, so it cannot declare one'],
+  ['validUntil', 'anyParams stores no result, so there is nothing for validUntil to expire'],
+  ['codec', 'anyParams stores nothing, so a codec would have nothing to encode'],
+]
+
+function makeOpen(definition: ParameterizedQueryDef): OpenBase {
+  const at = `query '${definition.name}'`
+  if (definition.anyParams !== true) {
+    throw new ConfigError(`${at}: anyParams must be true, or left out entirely`)
+  }
+  if (typeof definition.fetch !== 'function') {
+    throw new ConfigError(`${at}: fetch must be a function`)
+  }
+  for (const [field, why] of OPEN_BASE_FORBIDDEN) {
+    if (Object.hasOwn(definition, field)) {
+      throw new ConfigError(`${at}: ${why}`)
+    }
+  }
+  const timeoutMs =
+    definition.timeout === undefined
+      ? DEFAULT_TIMEOUT_MS
+      : parseDuration(definition.timeout, `${at}: timeout`)
+  const source = definition.source ?? 'default'
+  return Object.freeze({
+    baseName: definition.name,
+    timeoutMs,
+    source,
+    instantiate: (params: QueryParams): EphemeralQuery => {
+      const snapshot = snapshotQueryParams(params)
+      return Object.freeze({
+        name: queryKey(definition.name, snapshot),
+        baseName: definition.name,
+        params: snapshot,
+        timeoutMs,
+        source,
+        fetch: (ctx: FetchCtx) => definition.fetch({ ...ctx, params: snapshot }),
+      })
+    },
+  })
+}
+
 function makeDynamic(
   definition: ParameterizedQueryDef,
   resolve: (signal?: AbortSignal) => Promise<readonly QueryParams[]>,
@@ -292,7 +380,7 @@ function resolveSettings(definition: QueryDefinition) {
   if (typeof definition.fetch !== 'function') {
     throw new ConfigError(`${at}: fetch must be a function`)
   }
-  const everyMs = parseDuration(definition.every, `${at}: every`)
+  const everyMs = parseDuration(definition.every as Duration, `${at}: every`)
   const timeoutMs =
     definition.timeout === undefined
       ? DEFAULT_TIMEOUT_MS
@@ -307,13 +395,7 @@ function resolveSettings(definition: QueryDefinition) {
         'otherwise a live executor could outlive its lease',
     )
   }
-  const codec = definition.codec
-  if (
-    codec !== undefined &&
-    (typeof codec.encode !== 'function' || typeof codec.decode !== 'function')
-  ) {
-    throw new ConfigError(`${at}: codec must provide encode and decode functions`)
-  }
+  const codec = validateCodec((definition as { codec?: unknown }).codec, at)
   if (definition.validUntil !== undefined && typeof definition.validUntil !== 'function') {
     throw new ConfigError(`${at}: validUntil must be a function returning an epoch-ms timestamp`)
   }
@@ -322,10 +404,19 @@ function resolveSettings(definition: QueryDefinition) {
     timeoutMs,
     leaseMs,
     source: definition.source ?? 'default',
-    ...(codec ? { codec: codec as QueryCodec } : {}),
+    ...(codec ? { codec } : {}),
   }
 }
 
+function validateCodec(codec: unknown, at: string): QueryCodec | undefined {
+  if (codec === undefined) return undefined
+  const candidate = codec as Partial<QueryCodec>
+  if (typeof candidate.encode !== 'function' || typeof candidate.decode !== 'function') {
+    throw new ConfigError(`${at}: codec must provide encode and decode functions`)
+  }
+  return codec as QueryCodec
+}
+
 function isParameterized(definition: QueryDefinition): definition is ParameterizedQueryDef {
-  return 'variants' in definition || 'dimensions' in definition
+  return 'variants' in definition || 'dimensions' in definition || 'anyParams' in definition
 }

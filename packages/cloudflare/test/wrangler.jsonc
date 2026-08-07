@@ -3,9 +3,9 @@
   "main": "./worker.ts",
   "compatibility_date": "2026-06-01",
   "durable_objects": {
-    "bindings": [{ "name": "POLLER", "class_name": "TestPoller" }],
+    "bindings": [{ "name": "POLLER", "class_name": "TestFridge" }],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TestPoller"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TestFridge"] }],
   "d1_databases": [
     {
       "binding": "DB",

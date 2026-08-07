@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  createPoller,
+  createFridge,
   createReader,
   defineQueries,
   FakeClock,
@@ -12,34 +12,34 @@ import { deferred, makeDriver, resultsOnly } from './helpers.js'
 
 const queries = defineQueries([{ name: 'q', every: '5m', timeout: '30s', fetch: async () => 'v1' }])
 
-function makePoller(overrides: { store?: ReturnType<typeof memoryStore>; clock?: FakeClock } = {}) {
+function makeFridge(overrides: { store?: ReturnType<typeof memoryStore>; clock?: FakeClock } = {}) {
   const clock = overrides.clock ?? new FakeClock(0)
   const store = overrides.store ?? memoryStore()
-  const poller = createPoller({
+  const fridge = createFridge({
     queries,
     store,
     driver: makeDriver({ serialized: true }),
     clock,
     random: () => 0,
   })
-  return { clock, store, poller }
+  return { clock, store, fridge }
 }
 
-describe('poller.read on a cold query', () => {
+describe('fridge.read on a cold query', () => {
   it('fetches on a miss and returns the fresh result', async () => {
-    const { poller, clock } = makePoller()
-    const read = poller.read<string>('q')
+    const { fridge, clock } = makeFridge()
+    const read = fridge.read<string>('q')
     await clock.advance(0)
     await expect(read).resolves.toMatchObject({ data: 'v1', isStale: false, age: 0 })
   })
 
   it('leaves a hit alone: an existing result never waits, stale or not', async () => {
-    const { poller, clock, store } = makePoller()
-    await poller.runDue()
+    const { fridge, clock, store } = makeFridge()
+    await fridge.runDue()
     await clock.advance(600_000)
 
     // Stale, and the store would answer instantly even if the upstream hung.
-    const hit = await poller.read<string>('q')
+    const hit = await fridge.read<string>('q')
     expect(hit).toMatchObject({ data: 'v1', isStale: true })
     expect((await store.readSchedule('q'))!.failCount).toBe(0)
   })
@@ -60,7 +60,7 @@ describe('poller.read on a cold query', () => {
     ])
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: slow,
       store,
       driver: makeDriver({ serialized: false }),
@@ -68,7 +68,7 @@ describe('poller.read on a cold query', () => {
       random: () => 0,
     })
 
-    const reads = [poller.read<string>('q'), poller.read<string>('q'), poller.read<string>('q')]
+    const reads = [fridge.read<string>('q'), fridge.read<string>('q'), fridge.read<string>('q')]
     await flushMicrotasks()
     expect(calls).toBe(1)
 
@@ -87,7 +87,7 @@ describe('poller.read on a cold query', () => {
     ])
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: slow,
       store,
       driver: makeDriver({ serialized: true }),
@@ -95,7 +95,7 @@ describe('poller.read on a cold query', () => {
       random: () => 0,
     })
 
-    const read = poller.read<string>('q')
+    const read = fridge.read<string>('q')
     await flushMicrotasks() // let the read reach its deadline timer before time moves
     await clock.advance(2_000)
     await expect(read).resolves.toBeNull()
@@ -120,7 +120,7 @@ describe('poller.read on a cold query', () => {
       },
     ])
     const clock = new FakeClock(0)
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: failing,
       store: memoryStore(),
       driver: makeDriver({ serialized: true }),
@@ -128,7 +128,7 @@ describe('poller.read on a cold query', () => {
       random: () => 0,
     })
 
-    await expect(poller.read('q')).resolves.toBeNull()
+    await expect(fridge.read('q')).resolves.toBeNull()
     expect(clock.now()).toBe(0)
   })
 
@@ -145,18 +145,18 @@ describe('poller.read on a cold query', () => {
     ])
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: failing,
       store,
       driver: makeDriver({ serialized: true }),
       clock,
       random: () => 0,
     })
-    await poller.runDue()
+    await fridge.runDue()
     expect((await store.readSchedule('q'))!.nextRunAt).toBeGreaterThan(clock.now())
 
     // Nothing is running and nothing is due: answer now rather than wait it out.
-    await expect(poller.read('q')).resolves.toBeNull()
+    await expect(fridge.read('q')).resolves.toBeNull()
     expect(clock.now()).toBe(0)
   })
 })
@@ -165,17 +165,34 @@ describe('reader.read on a cold query', () => {
   it('waits for a write it cannot make itself', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const { poller } = makePoller({ store, clock })
-    const reader = createReader({ store, queries, clock })
+    const { fridge } = makeFridge({ store, clock })
+    // Results only: this reader can serve and wait, but it cannot claim, so it
+    // has no way to make the call itself.
+    const reader = createReader({ store: resultsOnly(store), queries, clock })
 
     const read = reader.read<string>('q')
     await clock.advance(0)
     expect(await store.readResult('q')).toBeNull()
 
     // Something else - a Durable Object alarm, a cron tick - writes it.
-    await poller.runDue()
+    await fridge.runDue()
     await clock.advance(50)
     await expect(read).resolves.toMatchObject({ data: 'v1' })
+  })
+
+  it('makes the call itself when it holds a store that can claim and meter', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const reader = createReader({ store, queries, clock, random: () => 0 })
+
+    const read = reader.read<string>('q')
+    await clock.advance(0)
+
+    // The same dispatcher a tick uses, so the entry it created is an ordinary
+    // one: a result, and a row scheduled a period out.
+    await expect(read).resolves.toMatchObject({ data: 'v1', isStale: false })
+    expect(await store.readResult('q')).not.toBeNull()
+    expect(await store.readSchedule('q')).toMatchObject({ nextRunAt: 300_000, failCount: 0 })
   })
 
   it('answers a miss immediately without the registry, since nothing says how long to wait', async () => {
@@ -193,8 +210,8 @@ describe('reader.read on a cold query', () => {
   it('still reads without a registry, exactly as before', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const { poller } = makePoller({ store, clock })
-    await poller.runDue()
+    const { fridge } = makeFridge({ store, clock })
+    await fridge.runDue()
 
     const reader = createReader({ store, clock })
     await expect(reader.read<string>('q')).resolves.toMatchObject({ data: 'v1' })
@@ -225,7 +242,7 @@ describe('reader.read on a cold query', () => {
   it('waits exactly as long as the query may take, with nothing to configure', async () => {
     const clock = new FakeClock(0)
     const reader = createReader({
-      store: memoryStore(),
+      store: resultsOnly(memoryStore()),
       queries: defineQueries([{ name: 'q', every: '5m', timeout: '1s', fetch: async () => 'v1' }]),
       clock,
     })
@@ -254,14 +271,14 @@ describe('a reader that can see the schedule stops waiting for a backoff', () =>
   it('answers a backing-off query at once instead of polling out the timeout', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: failing,
       store,
       driver: makeDriver({ serialized: true }),
       clock,
       random: () => 0,
     })
-    await poller.runDue()
+    await fridge.runDue()
     expect((await store.readSchedule('q'))!.nextRunAt).toBeGreaterThan(clock.now())
 
     // The full store gives the reader readSchedule, so it can tell a scheduled
@@ -275,7 +292,7 @@ describe('a reader that can see the schedule stops waiting for a backoff', () =>
     const clock = new FakeClock(0)
     const store = memoryStore()
     const queries = defineQueries([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    const poller = createPoller({
+    const fridge = createFridge({
       queries,
       store,
       driver: makeDriver({ serialized: true }),
@@ -295,20 +312,20 @@ describe('a reader that can see the schedule stops waiting for a backoff', () =>
     })
     await clock.advance(50)
     await expect(waiting).resolves.toMatchObject({ data: 'v1' })
-    void poller
+    void fridge
   })
 
   it('a store without readSchedule keeps the old behaviour', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const poller = createPoller({
+    const fridge = createFridge({
       queries: failing,
       store,
       driver: makeDriver({ serialized: true }),
       clock,
       random: () => 0,
     })
-    await poller.runDue()
+    await fridge.runDue()
 
     const reader = createReader({ store: resultsOnly(store), queries: failing, clock })
     const read = reader.read('q')

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { defineQueries } from '../src/index.js'
 import { planTick } from '../src/planner.js'
+import type { RowLookup } from '../src/planner.js'
 import type { ScheduleRow } from '../src/index.js'
 
 const fetch = async () => 'data'
@@ -10,19 +11,21 @@ function row(name: string, nextRunAt: number): [string, ScheduleRow] {
   return [name, { name, nextRunAt, failCount: 0, leaseUntil: null, version: 1 }]
 }
 
+function lookup(entries: Iterable<readonly [string, ScheduleRow | null]>): RowLookup {
+  const known = new Map(entries)
+  return { get: (name) => known.get(name) }
+}
+
 describe('planTick', () => {
-  it('treats missing rows as immediately due and skips future rows', () => {
+  it('treats a row it knows is absent as immediately due, and skips future rows', () => {
     const queries = defineQueries([
       { name: 'new', every: '5m', fetch },
       { name: 'future', every: '5m', fetch },
     ])
-    const rows = new Map([
-      ['future', row('future', 2_000)[1]],
-      ['new', null],
-    ])
-    const plan = planTick(queries.all, rows, 1_000, undefined)
-    expect(plan.toRun.map((c) => c.query.name)).toEqual(['new'])
-    expect(plan.toRun[0]!.row).toEqual({
+    const rows = lookup([row('future', 2_000), ['new', null]])
+    const plan = planTick(queries.all, rows, 1_000)
+    expect(plan.map((c) => c.query.name)).toEqual(['new'])
+    expect(plan[0]!.row).toEqual({
       name: 'new',
       nextRunAt: 1_000,
       failCount: 0,
@@ -37,9 +40,8 @@ describe('planTick', () => {
       { name: 'fast', every: '5m', fetch },
     ])
     const now = 1_000_000
-    const rows = new Map([row('hourly', now - 300_000), row('fast', now - 240_000)])
-    const plan = planTick(queries.all, rows, now, undefined)
-    expect(plan.toRun.map((c) => c.query.name)).toEqual(['fast', 'hourly'])
+    const rows = lookup([row('hourly', now - 300_000), row('fast', now - 240_000)])
+    expect(planTick(queries.all, rows, now).map((c) => c.query.name)).toEqual(['fast', 'hourly'])
   })
 
   it('keeps registration order on ties', () => {
@@ -47,22 +49,14 @@ describe('planTick', () => {
       { name: 'a', every: '5m', fetch },
       { name: 'b', every: '5m', fetch },
     ])
-    const rows = new Map([row('a', 0), row('b', 0)])
-    const plan = planTick(queries.all, rows, 0, undefined)
-    expect(plan.toRun.map((c) => c.query.name)).toEqual(['a', 'b'])
+    const rows = lookup([row('a', 0), row('b', 0)])
+    expect(planTick(queries.all, rows, 0).map((c) => c.query.name)).toEqual(['a', 'b'])
   })
 
-  it('applies per-source budgets independently', () => {
-    const queries = defineQueries([
-      { name: 'p1', every: '5m', source: 'posthog', fetch },
-      { name: 'p2', every: '5m', source: 'posthog', fetch },
-      { name: 'p3', every: '5m', source: 'posthog', fetch },
-      { name: 's1', every: '5m', source: 'stripe', fetch },
-    ])
-    const now = 300_000
-    const rows = new Map([row('p1', 0), row('p2', 100), row('p3', 200), row('s1', 300)])
-    const plan = planTick(queries.all, rows, now, { posthog: { maxPerTick: 2 } })
-    expect(plan.toRun.map((c) => c.query.name)).toEqual(['p1', 'p2', 's1'])
-    expect(plan.deferredBudget).toEqual(['p3'])
+  it('treats a query with no row as never-run, so a new one starts at once', () => {
+    const queries = defineQueries([{ name: 'fresh', every: '5m', fetch }])
+    expect(
+      planTick(queries.all, lookup([['fresh', null]]), 1_000).map((c) => c.query.name),
+    ).toEqual(['fresh'])
   })
 })

@@ -2,20 +2,42 @@
 
 English | [繁體中文](./zh-TW/concepts.md)
 
-datafridge turns slow or unreliable APIs into local reads that are always instant and always labeled with their age. After the first successful refresh, stale-if-error keeps them populated. This page explains the data model and the semantics behind that promise.
+The whole library is one invariant:
+
+> **When the app wants data, it always has some.** Not necessarily current - but always there, and as current as the upstream will allow.
+
+Everything below is derived from it.
+
+## The solution, and what it owes you
+
+Two mechanisms, and only two:
+
+- **Polling ahead of time.** A scheduler refreshes each query on its own period, so by the time anyone asks, the answer is already local. A read that finds something returns it and touches nothing upstream, however stale it is - refreshing what is already there is the scheduler's job, and a read that could trigger a fetch would put the most load on an upstream exactly when it is least able to take it.
+- **Fetching on a miss.** With nothing stored there is nothing to serve, so that read fetches, bounded by the query's own `timeout`. This is the only upstream call a read can cause.
+
+Choosing to call upstream on your behalf creates four problems, and this library owns all four:
+
+| Problem | Mechanism |
+|---|---|
+| Rate limits | one quota ledger per source, counted in the store, obeyed by every call whatever caused it |
+| Failure | last-known-good kept, jittered exponential backoff, `Retry-After` honoured when a vendor names one |
+| The same call twice | a per-key lease: the first arrival fetches, everyone else waits for the write-back |
+| Too much work for one window | overdue-ratio priority so nothing starves, and a reserve so a reader is not crowded out by the scheduler |
+
+All of them are answered in one place. Scheduled refreshes and read misses are the same work arriving through different doors, and both leave through a single dispatcher: there is no second path along which one of these could fail to apply.
 
 ## The semantic contract
 
 These six guarantees are the product. Every implementation must uphold them:
 
-1. **A read never waits on a result that exists.** Answering touches only the result store, so every read after the first is local and immediate. With nothing stored yet it waits for the first one, bounded by that query's `timeout` - or answers at once where the store offers `readSchedule` and the row says a retry is already scheduled for later.
-2. **Reads always carry time.** Every result includes `fetchedAt`, so callers always know its age.
-3. **Stale-if-error.** An upstream failure keeps the last-known-good result and marks it stale instead of replacing it with an error.
-4. **At-least-once refresh.** If an executor dies mid-run, another executor picks up the work after its lease expires.
-5. **Write-back consistency.** Version checks reject late writes from concurrent or zombie executors.
-6. **Fail at config time.** Invalid durations, duplicate names, unsafe leases, unsupported platform timeouts, and a store that cannot claim safely throw during construction.
+1. **A read that has data never waits and never touches upstream.** Answering an existing result is one local read, fresh, stale or `invalid` alike.
+2. **A read with no data triggers exactly one upstream fetch.** Readers arriving together coalesce into that one call and wait no longer than that query's `timeout` - through a per-key lease for a scheduled entry, and through a transient flight for params the registry does not name. Both live in the store, so the coalescing holds across processes, not just inside one.
+3. **Upstream calls never exceed the rate a source declares, whatever caused them.** Scheduled refreshes and read-triggered fetches spend the same quota ledger.
+4. **Work the rate limit pushed back never starves and never fails for nothing.** A refused refresh stays due and climbs by overdue ratio; a refused read waits for the window inside its own timeout, and says `throttled` rather than pretending there is nothing.
+5. **A failure keeps the last-known-good result and retries with jittered backoff.** A dead executor's work is re-claimed once its lease expires, and a late write-back is rejected on version.
+6. **Invalid configuration throws at construction**, never on a tick.
 
-They are the specification, not a summary of one. The rest of this page explains the lease, version, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
+They are the specification, not a summary of one. The rest of this page explains the lease, version, quota, backoff, and staleness model that implements them, and every store adapter has to pass the contract compatibility suite in `@datafridge/core/contract-tests` before it is considered correct.
 
 ## Architecture in one picture
 
@@ -26,14 +48,14 @@ They are the specification, not a summary of one. The rest of this page explains
 ├──────────────────────────────────────────────┤
 │  Core - pure logic, zero deps, no IO,         │
 │  injected clock: registry, due computation,   │
-│  priority, budget, backoff, lease, staleness  │
+│  priority, quota, backoff, lease, staleness   │
 ├──────────────────────────────────────────────┤
 │  Store - where results and schedule state live│
 │  wave 1: D1                                   │
 └──────────────────────────────────────────────┘
 ```
 
-Three orthogonal axes: the **store** decides where state lives, the **driver** decides who ticks, and **fetchers** run wherever the poller instance runs.
+Three orthogonal axes: the **store** decides where state lives, the **driver** decides who ticks, and **fetchers** run wherever the fridge instance runs.
 
 Core's single entry point is the idempotent `runDue(now)`. Core never owns an event loop, never schedules itself, and holds no memory state across calls - everything is read from the store, computed, and written back. That is why the same core runs in a long-lived Node process, a cold-starting Worker, or a multi-instance concurrent environment.
 
@@ -68,13 +90,14 @@ interface ScheduleRow {
   failCount: number
   leaseUntil: number | null
   version: number              // for CAS; can be relaxed under serialized execution
+  params?: QueryParams         // the variant's own params, beside its hashed name
 }
 ```
 
 This half has exactly two legitimate homes:
 
 1. The store, when it has atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
-2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence). The store's schedule half then goes unused.
+2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (a node timer would use process memory plus any persistence). The store's schedule half then goes unused. Nothing shipped takes this route: `FridgeDO` keeps no dispatch state of its own, so a Durable Object and a cron trigger over the same store coordinate through it rather than through whichever object is the singleton.
 
 The formal rules are in [writing-adapters.md](./writing-adapters.md).
 
@@ -84,7 +107,9 @@ A parameterized query expands a finite runtime list into ordinary scheduled iden
 
 Variant params are canonical JSON. The storage key is `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`, so raw IDs and preset values do not appear in D1 keys or `RunReport`. SHA-256 provides a stable collision-resistant identity across object key ordering. Params are identifiers, not secret storage: credentials and private payloads must remain in bindings or fetcher closures.
 
-Only variants in the finite registry are scheduled and directly readable. Arbitrary on-demand variants are not created on read.
+An `anyParams` base has no list, and no entries either. Being an entry is what the registry decides: params it names are persistent scheduled entries, and params it does not name are not entries at all - reading them is one fresh call through the same dispatcher, metered by the same source window and bounded by the same timeout, storing nothing. Nothing a reader happens to ask for can turn itself into work the scheduler then owns forever.
+
+Overlapping reads of such params still coalesce, through a transient flight rather than a lease: one call, one quota slot, one answer handed to everyone who was waiting for it. The flight expires on its own and holds no result, so a reader arriving after it settles gets a fresh call - the difference between coalescing and caching is exactly who the answer belongs to.
 
 ## Staleness semantics
 
@@ -100,25 +125,30 @@ runDue(now):
 1. Collect candidates   nextRunAt <= now (no record = first run = due now)
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
-                        5m query's period but only 0.07 of a 60m query's)
-3. Apply budget         group by source, take the top maxPerTick per group;
-                        squeezed-out queries stay due and are picked up next tick
+                        5m query's period but only 0.07 of a 60m query's),
+                        then admit while the call's timeout fits the
+                        invocation and its source has not refused yet
+3. Take quota           one call against the source's ledger for the current
+                        window, minus whatever `reserve` holds back for readers;
+                        refused queries stay due and come back more overdue
 4. Claim lease          claim(name, version, now + timeout + margin);
-                        losing the claim means someone else is on it - skip
+                        losing the claim means someone else is on it - skip,
+                        and the quota it took goes back to the window
 5. Execute + write back concurrently (Promise.allSettled), each fetch wrapped
                         in an AbortSignal timeout
                         success: writeResult + nextRunAt = completion time + every,
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, deferredBudget, failed }
+Returns RunReport { ran, skippedLeased, throttled, deferred, failed, nextRunAt }
 ```
 
 Key decisions:
 
 - **Fixed-delay semantics.** The next run is measured from completion time. Slow queries naturally slow themselves down and never queue up behind themselves.
 - **Backoff.** `min(every, 1m * 2^(failCount - 1))` plus jitter, capped at `every` because retrying slower than the normal period is pointless.
-- **Jitter.** First registration offsets `nextRunAt` randomly, so queries with integer-multiple periods never permanently align on the same tick and stampede one source's budget. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
+- **Jitter.** First registration offsets `nextRunAt` randomly, so queries with integer-multiple periods never permanently align on the same tick and stampede one source. The ledger is the fuse; jitter keeps the fuse from blowing in normal operation.
+- **One exit to upstream.** Steps 3 to 5 are the dispatcher, and a read that finds nothing stored enters at exactly the same point. There is no second path, so a rate limit cannot be true of one kind of call and not the other.
 - **Three lines of defense**, one gate each: `nextRunAt` decides "should this run", the lease decides "who is running it", the version decides "whose result counts". Slowness, crashes, and zombies each break through one gate; the next one catches them.
 
 ### A slow query, minute by minute
@@ -146,5 +176,6 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Executor dies mid-run | re-claimed on the next tick after the lease expires (at-least-once) | old data + `isStale` |
 | Zombie writes back late | version mismatch, write rejected | unaffected |
 | First round not finished | - | `null` (callers should handle it) |
-| Squeezed out by budget | stays due, prioritized next tick (overdue ratio grows) | old data, slightly older |
+| Out of source quota | stays due, prioritized next tick (overdue ratio grows) | old data; on a miss, `status: 'throttled'` |
+| Past this invocation's capacity | untouched, named in `deferred`, most overdue next tick | unaffected: a read never waits on a tick |
 | Persistent failures | backoff converges at `every`, last-known-good kept forever | old data + `lastError` visible |

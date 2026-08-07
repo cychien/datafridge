@@ -9,26 +9,26 @@ describe('registry reconcile', () => {
     const store = memoryStore()
     const calls = { q1: 0, q2: 0, q3: 0 }
 
-    const pollerA = makeHarness(
+    const fridgeA = makeHarness(
       [
         { name: 'q1', every: '60m', fetch: async () => `q1:${++calls.q1}` },
         { name: 'q2', every: '5m', fetch: async () => `q2:${++calls.q2}` },
       ],
       { clock, store },
-    ).poller
-    expect((await pollerA.runDue()).ran).toEqual(['q1', 'q2'])
+    ).fridge
+    expect((await fridgeA.runDue()).ran).toEqual(['q1', 'q2'])
     expect(await store.readSchedule('q1')).toMatchObject({ nextRunAt: 3_600_000 })
 
-    const pollerB = makeHarness(
+    const fridgeB = makeHarness(
       [
         { name: 'q1', every: '5m', fetch: async () => `q1:${++calls.q1}` },
         { name: 'q3', every: '5m', fetch: async () => `q3:${++calls.q3}` },
       ],
       { clock, store },
-    ).poller
+    ).fridge
 
     await clock.advance(1_000)
-    const report = await pollerB.runDue()
+    const report = await fridgeB.runDue()
 
     expect(report.ran).toEqual(['q3'])
     expect(await store.readSchedule('q2')).toBeNull()
@@ -42,7 +42,7 @@ describe('registry reconcile', () => {
     expect(calls).toEqual({ q1: 1, q2: 1, q3: 1 })
 
     await clock.advance(299_000)
-    expect((await pollerB.runDue()).ran).toEqual(['q1'])
+    expect((await fridgeB.runDue()).ran).toEqual(['q1'])
     expect(await store.readSchedule('q1')).toMatchObject({ nextRunAt: 600_000, version: 2 })
     expect(calls.q1).toBe(2)
   })
@@ -53,20 +53,20 @@ describe('registry reconcile', () => {
     const failing = async () => {
       throw new Error('down')
     }
-    const pollerA = makeHarness([{ name: 'q', every: '60m', fetch: failing }], {
+    const fridgeA = makeHarness([{ name: 'q', every: '60m', fetch: failing }], {
       clock,
       store,
-    }).poller
-    await pollerA.runDue()
+    }).fridge
+    await fridgeA.runDue()
     const afterFail = await store.readSchedule('q')
     expect(afterFail).toMatchObject({ failCount: 1, nextRunAt: 60_000 })
 
-    const pollerB = makeHarness([{ name: 'q', every: '5m', fetch: failing }], {
+    const fridgeB = makeHarness([{ name: 'q', every: '5m', fetch: failing }], {
       clock,
       store,
-    }).poller
+    }).fridge
     await clock.advance(1_000)
-    const report = await pollerB.runDue()
+    const report = await fridgeB.runDue()
     expect(report.ran).toEqual([])
     expect(await store.readSchedule('q')).toMatchObject({ failCount: 1, nextRunAt: 60_000 })
   })
@@ -74,17 +74,17 @@ describe('registry reconcile', () => {
   it('does not rewrite healthy rows whose first-run jitter is within tolerance', async () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }], {
+    const { fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }], {
       clock,
       store,
       random: () => 0.999,
     })
-    await poller.runDue()
+    await fridge.runDue()
     const seeded = await store.readSchedule('q')
     expect(seeded!.nextRunAt).toBeGreaterThan(300_000)
 
     await clock.advance(1_000)
-    await poller.runDue()
+    await fridge.runDue()
     expect(await store.readSchedule('q')).toEqual(seeded)
   })
 })

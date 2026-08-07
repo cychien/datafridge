@@ -1,45 +1,43 @@
-import type { ResolvedQuery, ScheduleRow, SourceBudget } from './types.js'
+import type { ResolvedQuery, ScheduleRow } from './types.js'
 
 export interface Candidate {
   query: ResolvedQuery
   row: ScheduleRow
 }
 
-export interface TickPlan {
-  toRun: Candidate[]
-  deferredBudget: string[]
+/** What the tick knows about a row: the row itself, or `null` for no row. */
+export interface RowLookup {
+  get(name: string): ScheduleRow | null | undefined
 }
 
 export function virtualRow(name: string, now: number): ScheduleRow {
   return { name, nextRunAt: now, failCount: 0, leaseUntil: null, version: 0 }
 }
 
+/**
+ * The tick's due work, most overdue first. Priority is the overdue *ratio*
+ * `(now - nextRunAt) / every`, so a query squeezed out by a source's quota or
+ * by an invocation running out of wall clock climbs every tick it waits and
+ * cannot starve behind a faster-cycling one.
+ *
+ * A query with no row has never run, so it is due now. The tick establishes
+ * that by name before planning - an unread name is never guessed at, because
+ * guessing either re-claims a row that exists or never starts one that does not.
+ *
+ * How much of this work upstream and the invocation will actually accept is
+ * decided after it, not here.
+ */
 export function planTick(
   queries: readonly ResolvedQuery[],
-  rowsByName: ReadonlyMap<string, ScheduleRow | null>,
+  rows: RowLookup,
   now: number,
-  sources: Readonly<Record<string, SourceBudget>> | undefined,
-): TickPlan {
+): Candidate[] {
   const due: Array<Candidate & { overdueRatio: number }> = []
   for (const query of queries) {
-    const row = rowsByName.get(query.name) ?? virtualRow(query.name, now)
+    const row = rows.get(query.name) ?? virtualRow(query.name, now)
     if (row.nextRunAt > now) continue
     due.push({ query, row, overdueRatio: (now - row.nextRunAt) / query.everyMs })
   }
   due.sort((a, b) => b.overdueRatio - a.overdueRatio)
-
-  const usedPerSource = new Map<string, number>()
-  const toRun: Candidate[] = []
-  const deferredBudget: string[] = []
-  for (const { query, row } of due) {
-    const budget = sources?.[query.source]?.maxPerTick ?? Infinity
-    const used = usedPerSource.get(query.source) ?? 0
-    if (used < budget) {
-      usedPerSource.set(query.source, used + 1)
-      toRun.push({ query, row })
-    } else {
-      deferredBudget.push(query.name)
-    }
-  }
-  return { toRun, deferredBudget }
+  return due.map(({ query, row }) => ({ query, row }))
 }

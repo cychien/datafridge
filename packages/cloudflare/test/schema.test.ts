@@ -2,8 +2,9 @@ import { createScheduledController, createExecutionContext, env } from 'cloudfla
 import { createReader, defineQueries } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { cronPoller } from '../src/cron.js'
+import { cronFridge } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
+import { dropStore, readOnly, stored } from './helpers.js'
 
 interface SchemaEnv {
   DB: D1Database
@@ -13,13 +14,10 @@ interface SchemaEnv {
 // any other file. This file deliberately starts with no schema at all: it is the
 // proof that applying the packaged migration is optional.
 beforeEach(async () => {
-  await env.DB.batch([
-    env.DB.prepare('DROP TABLE IF EXISTS datafridge_results'),
-    env.DB.prepare('DROP TABLE IF EXISTS datafridge_schedule'),
-  ])
+  await dropStore(env.DB)
 })
 
-async function invoke(handler: ReturnType<typeof cronPoller<SchemaEnv>>): Promise<void> {
+async function invoke(handler: ReturnType<typeof cronFridge<SchemaEnv>>): Promise<void> {
   const ctx = createExecutionContext()
   await handler(
     createScheduledController({ scheduledTime: new Date(), cron: '* * * * *' }),
@@ -30,14 +28,14 @@ async function invoke(handler: ReturnType<typeof cronPoller<SchemaEnv>>): Promis
 
 describe('d1 applies its own schema', () => {
   it('a tick works against a database with no datafridge tables', async () => {
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ ok: true }) }],
       store: (e) => d1(e.DB),
     })
 
     await invoke(handler)
 
-    const read = await createReader({ store: d1(env.DB) }).read<{ ok: boolean }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ ok: boolean }>('metrics'))
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ ok: true })
 
@@ -49,7 +47,7 @@ describe('d1 applies its own schema', () => {
 
   it('is idempotent: a second tick against the existing schema still refreshes', async () => {
     let ticks = 0
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '1ms', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
     })
@@ -58,13 +56,13 @@ describe('d1 applies its own schema', () => {
     await invoke(handler)
 
     expect(ticks).toBe(2)
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read!.data).toEqual({ tick: 2 })
   })
 
   it('recovers when the tables disappear under a warm isolate', async () => {
     let ticks = 0
-    const handler = cronPoller<SchemaEnv>({
+    const handler = cronFridge<SchemaEnv>({
       queries: [{ name: 'metrics', every: '1ms', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
     })
@@ -74,14 +72,11 @@ describe('d1 applies its own schema', () => {
 
     // A dropped database or a destructive migration, with the schema already
     // remembered as applied for this binding.
-    await env.DB.batch([
-      env.DB.prepare('DROP TABLE datafridge_results'),
-      env.DB.prepare('DROP TABLE datafridge_schedule'),
-    ])
+    await dropStore(env.DB)
 
     await invoke(handler)
     expect(ticks).toBe(2)
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read!.data).toEqual({ tick: 2 })
   })
 
@@ -92,7 +87,7 @@ describe('d1 applies its own schema', () => {
 
   it('a cold read applies no schema: a read-only consumer creates nothing', async () => {
     const reader = createReader({
-      store: d1(env.DB),
+      store: readOnly(d1(env.DB)),
       queries: defineQueries([
         { name: 'metrics', every: '5m', timeout: '200ms', fetch: async () => ({ ok: true }) },
       ]),
@@ -134,10 +129,10 @@ describe('a cold read over a real D1', () => {
     const reader = createReader({ store: d1(env.DB), queries })
     const waiting = reader.read<{ ok: boolean }>('metrics')
 
-    const handler = cronPoller<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
+    const handler = cronFridge<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
     await invoke(handler)
 
-    const result = await waiting
+    const result = stored(await waiting)
     expect(result).not.toBeNull()
     expect(result!.data).toEqual({ ok: true })
   })
@@ -147,14 +142,26 @@ describe('a cold read over a real D1', () => {
     expect(await bare.read('metrics')).toBeNull()
   })
 
-  it("gives up at the query's own timeout when nothing writes", async () => {
+  it("a reader that cannot fetch gives up at the query's own timeout", async () => {
     const impatient = defineQueries([
       { name: 'metrics', every: '5m', timeout: '300ms', fetch: async () => ({ ok: true }) },
     ])
-    const reader = createReader({ store: d1(env.DB), queries: impatient })
+    const reader = createReader({ store: readOnly(d1(env.DB)), queries: impatient })
     const started = Date.now()
     expect(await reader.read('metrics')).toBeNull()
     expect(Date.now() - started).toBeGreaterThanOrEqual(250)
+  })
+
+  it('a reader holding the whole store fills a cold read itself', async () => {
+    // The same dispatcher a tick uses, so this is one metered, leased call that
+    // leaves an ordinary entry behind - not a second path to upstream.
+    const reader = createReader({ store: d1(env.DB), queries })
+    expect(stored(await reader.read<{ ok: boolean }>('metrics'))!.data).toEqual({ ok: true })
+
+    const row = await env.DB.prepare('SELECT * FROM datafridge_schedule WHERE name = ?')
+      .bind('metrics')
+      .first<{ version: number; fail_count: number }>()
+    expect(row).toMatchObject({ version: 1, fail_count: 0 })
   })
 
   it('refuses a dynamic base whose timeout cannot fit an invocation', () => {
@@ -167,7 +174,7 @@ describe('a cold read over a real D1', () => {
         fetch: async () => ({ ok: true }),
       },
     ])
-    expect(() => cronPoller<SchemaEnv>({ queries: tooSlow, store: (e) => d1(e.DB) })).toThrow(
+    expect(() => cronFridge<SchemaEnv>({ queries: tooSlow, store: (e) => d1(e.DB) })).toThrow(
       /query 'per-course': timeout \(1200000ms\) must be shorter than the 900000ms/,
     )
   })

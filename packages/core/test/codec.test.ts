@@ -8,7 +8,7 @@ import {
   queryKey,
 } from '../src/index.js'
 import type { QueryCodec } from '../src/index.js'
-import { makeHarness, resultsOnly } from './helpers.js'
+import { makeHarness, resultsOnly, stored } from './helpers.js'
 
 const mapCodec: QueryCodec<Map<string, number>> = {
   encode: (value) => ({ rows: [...value] }),
@@ -22,10 +22,10 @@ const byPath = new Map([
 
 describe('codec', () => {
   it('stores the encoded JSON and hands the decoded value back', async () => {
-    const { store, poller } = makeHarness([
+    const { store, fridge } = makeHarness([
       { name: 'views', every: '5m', codec: mapCodec, fetch: async () => new Map(byPath) },
     ])
-    await poller.runDue()
+    await fridge.runDue()
 
     // The row is plain JSON: any language can read it.
     expect((await store.readResult('views'))!.data).toEqual({
@@ -35,7 +35,7 @@ describe('codec', () => {
       ],
     })
 
-    const read = await poller.read<Map<string, number>>('views')
+    const read = stored(await fridge.read<Map<string, number>>('views'))
     expect(read!.data).toBeInstanceOf(Map)
     expect(read!.data.get('/b')).toBe(7)
   })
@@ -44,14 +44,14 @@ describe('codec', () => {
     const queries = defineQueries([
       { name: 'views', every: '5m', codec: mapCodec, fetch: async () => new Map(byPath) },
     ])
-    const { store, poller, clock } = makeHarness(queries)
-    await poller.runDue()
+    const { store, fridge, clock } = makeHarness(queries)
+    await fridge.runDue()
 
     const withRegistry = createReader({ store, queries, clock })
-    expect((await withRegistry.read<Map<string, number>>('views'))!.data).toBeInstanceOf(Map)
+    expect(stored(await withRegistry.read<Map<string, number>>('views'))!.data).toBeInstanceOf(Map)
 
     const bare = createReader({ store: resultsOnly(store), clock })
-    expect((await bare.read('views'))!.data).toEqual({
+    expect(stored(await bare.read('views'))!.data).toEqual({
       rows: [
         ['/a', 3],
         ['/b', 7],
@@ -61,7 +61,7 @@ describe('codec', () => {
 
   it('an encode failure counts as a fetch failure and keeps the old result', async () => {
     let broken = false
-    const { store, poller, clock } = makeHarness([
+    const { store, fridge, clock } = makeHarness([
       {
         name: 'views',
         every: '5m',
@@ -75,13 +75,13 @@ describe('codec', () => {
         fetch: async () => 'v1',
       },
     ])
-    await poller.runDue()
+    await fridge.runDue()
     broken = true
     await clock.advance(300_000)
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.failed).toEqual([{ name: 'views', message: 'not serializable' }])
-    expect((await poller.read<string>('views'))!.data).toBe('v1')
+    expect(stored(await fridge.read<string>('views'))!.data).toBe('v1')
     expect((await store.readSchedule('views'))!.failCount).toBe(1)
   })
 
@@ -95,8 +95,8 @@ describe('codec', () => {
         fetch: async () => new Map(byPath),
       }),
     ])
-    const { store, poller } = makeHarness(queries)
-    await poller.runDue()
+    const { store, fridge } = makeHarness(queries)
+    await fridge.runDue()
 
     const key = queryKey('per-course', { courseId: 'alpha' })
     expect((await store.readResult(key))!.data).toEqual({
@@ -105,7 +105,7 @@ describe('codec', () => {
         ['/b', 7],
       ],
     })
-    const read = await poller.read<Map<string, number>>('per-course', { courseId: 'alpha' })
+    const read = stored(await fridge.read<Map<string, number>>('per-course', { courseId: 'alpha' }))
     expect(read!.data).toBeInstanceOf(Map)
   })
 
@@ -123,9 +123,9 @@ describe('codec', () => {
   })
 
   it('leaves the untouched default exactly as before', async () => {
-    const { store, poller } = makeHarness([{ name: 'plain', every: '5m', fetch: async () => 'v1' }])
-    await poller.runDue()
+    const { store, fridge } = makeHarness([{ name: 'plain', every: '5m', fetch: async () => 'v1' }])
+    await fridge.runDue()
     expect((await store.readResult('plain'))!.data).toBe('v1')
-    expect((await poller.read<string>('plain'))!.data).toBe('v1')
+    expect(stored(await fridge.read<string>('plain'))!.data).toBe('v1')
   })
 })

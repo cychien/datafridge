@@ -3,7 +3,7 @@ import type { QueryDef } from '@datafridge/core'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ensureStarted } from '../src/do.js'
-import type { TestPoller } from './worker.js'
+import type { TestFridge } from './worker.js'
 
 const queries: readonly QueryDef[] = [
   { name: 'posts', every: '1m', fetch: async () => ({ posts: ['hello'] }) },
@@ -15,9 +15,9 @@ describe('read path in a separate Worker context', () => {
     expect(before.status).toBe(200)
     expect(await before.json()).toBeNull()
 
-    const stub = env.POLLER.get(env.POLLER.idFromName('datafridge-poller'))
+    const stub = env.POLLER.get(env.POLLER.idFromName('datafridge'))
     await runInDurableObject(stub, async (instance) => {
-      ;(instance as TestPoller).queries = queries
+      ;(instance as TestFridge).queries = queries
     })
     await ensureStarted(env.POLLER)
 

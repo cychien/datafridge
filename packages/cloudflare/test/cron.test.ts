@@ -8,9 +8,10 @@ import { ConfigError, createReader } from '@datafridge/core'
 import type { QueryDef, RunReport, Store } from '@datafridge/core'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { cronPoller } from '../src/cron.js'
+import { cronFridge } from '../src/cron.js'
 import type { CronScheduledHandler } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
+import { stored } from './helpers.js'
 
 interface CronEnv {
   DB: D1Database
@@ -31,7 +32,7 @@ beforeEach(async () => {
   ])
 })
 
-describe('cronPoller config-time validation', () => {
+describe('cronFridge config-time validation', () => {
   const queries: readonly QueryDef[] = [{ name: 'q', every: '5m', fetch: async () => 1 }]
 
   function configErrorMessage(fn: () => unknown): string {
@@ -45,12 +46,12 @@ describe('cronPoller config-time validation', () => {
   }
 
   it('accepts the cron trigger plus full store shape without touching env', () => {
-    expect(() => cronPoller<CronEnv>({ queries, store: (e) => d1(e.DB) })).not.toThrow()
+    expect(() => cronFridge<CronEnv>({ queries, store: (e) => d1(e.DB) })).not.toThrow()
   })
 
   it('rejects a missing store', () => {
-    expect(configErrorMessage(() => cronPoller<CronEnv>({ queries } as never))).toBe(
-      'cronPoller requires a store: pass store: (env) => d1(env.DB)',
+    expect(configErrorMessage(() => cronFridge<CronEnv>({ queries } as never))).toBe(
+      'cronFridge requires a store: pass store: (env) => d1(env.DB)',
     )
   })
 
@@ -59,14 +60,14 @@ describe('cronPoller config-time validation', () => {
       const store = d1(env.DB)
       return { ...store, capabilities: { ...store.capabilities, atomicClaim: false } }
     }
-    const handler = cronPoller<CronEnv>({ queries, store: withoutAtomicClaim })
+    const handler = cronFridge<CronEnv>({ queries, store: withoutAtomicClaim })
     return expect(invoke(handler)).rejects.toThrow(/lacks atomicClaim/)
   })
 
   it('rejects a timeout that cannot fit a cron invocation', () => {
     expect(
       configErrorMessage(() =>
-        cronPoller<CronEnv>({
+        cronFridge<CronEnv>({
           queries: [{ name: 'slow', every: '1h', timeout: '15m', fetch: async () => 1 }],
           store: (e) => d1(e.DB),
         }),
@@ -79,7 +80,7 @@ describe('cronPoller config-time validation', () => {
 
   it('accepts a timeout that fits', () => {
     expect(() =>
-      cronPoller<CronEnv>({
+      cronFridge<CronEnv>({
         queries: [{ name: 'slow', every: '1h', timeout: '14m', fetch: async () => 1 }],
         store: (e) => d1(e.DB),
       }),
@@ -90,7 +91,7 @@ describe('cronPoller config-time validation', () => {
 describe('cron shell e2e (scheduled handler + d1)', () => {
   it('hands each tick its RunReport through onRunReport', async () => {
     const reports: RunReport[] = []
-    const handler = cronPoller<CronEnv>({
+    const handler = cronFridge<CronEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => 1 }],
       store: (e) => d1(e.DB),
       onRunReport: (report) => {
@@ -110,7 +111,7 @@ describe('cron shell e2e (scheduled handler + d1)', () => {
 
   it('absorbs a throwing onRunReport: the tick itself still counts', async () => {
     let ticks = 0
-    const handler = cronPoller<CronEnv>({
+    const handler = cronFridge<CronEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
       onRunReport: () => {
@@ -125,7 +126,7 @@ describe('cron shell e2e (scheduled handler + d1)', () => {
 
   it('a scheduled invocation fetches due queries into D1 and reschedules them', async () => {
     let ticks = 0
-    const handler = cronPoller<CronEnv>({
+    const handler = cronFridge<CronEnv>({
       queries: [{ name: 'metrics', every: '5m', fetch: async () => ({ tick: ++ticks }) }],
       store: (e) => d1(e.DB),
     })
@@ -133,7 +134,7 @@ describe('cron shell e2e (scheduled handler + d1)', () => {
     await invoke(handler)
     expect(ticks).toBe(1)
 
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ tick: 1 })
     expect(read!.isStale).toBe(false)
@@ -166,7 +167,7 @@ describe('cron shell e2e (scheduled handler + d1)', () => {
         return name
       },
     })
-    const handler = cronPoller<CronEnv>({
+    const handler = cronFridge<CronEnv>({
       queries: [query('a'), query('b'), query('c')],
       store: (e) => d1(e.DB),
     })

@@ -4,7 +4,8 @@ import type { QueryDef, QueryDefinition } from '@datafridge/core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { d1 } from '../src/d1.js'
-import type { TestPoller } from './worker.js'
+import type { TestFridge } from './worker.js'
+import { stored, wipeStore } from './helpers.js'
 
 const fetchCounts = new Map<string, number>()
 
@@ -20,7 +21,7 @@ function counting(name: string, every: QueryDef['every']): QueryDef {
   }
 }
 
-function pollerStub(id: string) {
+function fridgeStub(id: string) {
   return env.POLLER.get(env.POLLER.idFromName(id))
 }
 
@@ -28,24 +29,26 @@ function reader() {
   return createReader({ store: d1(env.DB) })
 }
 
-type Stub = ReturnType<typeof pollerStub>
+type Stub = ReturnType<typeof fridgeStub>
 
 async function configure(stub: Stub, defs: readonly QueryDefinition[]) {
   await runInDurableObject(stub, async (instance) => {
-    ;(instance as TestPoller).queries = defs
+    ;(instance as TestFridge).queries = defs
   })
 }
 
-async function scheduleRows(stub: Stub) {
-  return runInDurableObject(stub, async (_instance, state) =>
-    state.storage.sql
-      .exec<{
-        name: string
-        next_run_at: number
-        fail_count: number
-      }>('SELECT name, next_run_at, fail_count FROM datafridge_schedule ORDER BY name')
-      .toArray(),
-  )
+// The object keeps no dispatch state, so every row this asserts on is D1's.
+async function scheduleRows(_stub?: Stub) {
+  const { results } = await env.DB.prepare(
+    'SELECT name, next_run_at, fail_count, params FROM datafridge_schedule ORDER BY name',
+  ).all<{ name: string; next_run_at: number; fail_count: number; params: string | null }>()
+  return results
+}
+
+async function setNextRunAt(name: string, nextRunAt: number) {
+  await env.DB.prepare('UPDATE datafridge_schedule SET next_run_at = ? WHERE name = ?')
+    .bind(nextRunAt, name)
+    .run()
 }
 
 async function currentAlarm(stub: Stub) {
@@ -71,15 +74,12 @@ beforeEach(async () => {
   fetchCounts.clear()
   // Storage isolation is per test file, so wipe the shared D1 between tests;
   // each test uses its own DO instance for fresh bookkeeping.
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM datafridge_results'),
-    env.DB.prepare('DELETE FROM datafridge_schedule'),
-  ])
+  await wipeStore(env.DB)
 })
 
-describe('PollerDO alarm loop', () => {
+describe('FridgeDO alarm loop', () => {
   it('drives dynamic variants: rows come from the table, and the alarm covers them', async () => {
-    const stub = pollerStub('dynamic')
+    const stub = fridgeStub('dynamic')
     const dynamicDef = defineParameterizedQuery({
       name: 'per-course',
       every: '1m',
@@ -87,7 +87,7 @@ describe('PollerDO alarm loop', () => {
       fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
     })
     await runInDurableObject(stub, async (instance) => {
-      ;(instance as TestPoller).queries = [dynamicDef]
+      ;(instance as TestFridge).queries = [dynamicDef]
     })
     await stub.ensureStarted()
 
@@ -101,7 +101,9 @@ describe('PollerDO alarm loop', () => {
     )
 
     const withRegistry = createReader({ store: d1(env.DB), queries: [dynamicDef] })
-    const read = await withRegistry.read<{ course: string }>('per-course', { courseId: 'alpha' })
+    const read = stored(
+      await withRegistry.read<{ course: string }>('per-course', { courseId: 'alpha' }),
+    )
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ course: 'alpha' })
 
@@ -114,7 +116,7 @@ describe('PollerDO alarm loop', () => {
     'a resolution that hangs past its own backoff still clears the one-second floor',
     { timeout: 20_000 },
     async () => {
-      const stub = pollerStub('resolution-hang')
+      const stub = fridgeStub('resolution-hang')
       // The hang (3s) outlasts the first backoff (2s + jitter), so a tick that
       // stamped the backoff from a `now` taken before resolution would write it
       // into the past and drag the alarm back to MIN_ALARM_DELAY_MS.
@@ -146,7 +148,7 @@ describe('PollerDO alarm loop', () => {
   )
 
   it('a failed resolution backs the base off instead of pinning the alarm to its floor', async () => {
-    const stub = pollerStub('resolution-backoff')
+    const stub = fridgeStub('resolution-backoff')
     let down = false
     const variantKey = queryKey('per-course', { courseId: 'alpha' })
     await configure(stub, [
@@ -166,13 +168,7 @@ describe('PollerDO alarm loop', () => {
     // The variant is overdue and the course database is down: the old alarm
     // came from that past-due row and re-fired at the 1-second floor forever.
     down = true
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        'UPDATE datafridge_schedule SET next_run_at = ? WHERE name = ?',
-        Date.now() - 1_000,
-        variantKey,
-      )
-    })
+    await setNextRunAt(variantKey, Date.now() - 1_000)
     await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
 
     const rows = await scheduleRows(stub)
@@ -187,7 +183,7 @@ describe('PollerDO alarm loop', () => {
   })
 
   it('runs due queries, lands envelopes in D1, and re-sets the alarm to min(nextRunAt)', async () => {
-    const stub = pollerStub('due')
+    const stub = fridgeStub('due')
     await configure(stub, [counting('alpha', '1m'), counting('beta', '5m')])
     await stub.ensureStarted()
     await settled(stub, ['alpha', 'beta'])
@@ -195,22 +191,23 @@ describe('PollerDO alarm loop', () => {
     expect(fetchCounts.get('alpha')).toBe(1)
     expect(fetchCounts.get('beta')).toBe(1)
     const reports = await runInDurableObject(stub, async (instance) =>
-      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+      (instance as TestFridge).reports.map((report) => structuredClone(report)),
     )
-    expect(reports).toEqual([
-      {
-        ran: ['alpha', 'beta'],
-        skippedLeased: [],
-        deferredBudget: [],
-        failed: [],
-      },
-    ])
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      ran: ['alpha', 'beta'],
+      skippedLeased: [],
+      throttled: [],
+      deferred: [],
+      failed: [],
+    })
+    expect(reports[0]!.nextRunAt).toBeGreaterThan(Date.now())
 
-    const alpha = await reader().read<{ name: string; tick: number }>('alpha')
+    const alpha = stored(await reader().read<{ name: string; tick: number }>('alpha'))
     expect(alpha).not.toBeNull()
     expect(alpha!.data).toEqual({ name: 'alpha', tick: 1 })
     expect(alpha!.isStale).toBe(false)
-    expect((await reader().read('beta'))!.data).toEqual({ name: 'beta', tick: 1 })
+    expect(stored(await reader().read('beta'))!.data).toEqual({ name: 'beta', tick: 1 })
 
     const rows = await scheduleRows(stub)
     const alarm = await currentAlarm(stub)
@@ -219,10 +216,10 @@ describe('PollerDO alarm loop', () => {
   })
 
   it('keeps alarm-level error details out of logs while continuing the chain', async () => {
-    const stub = pollerStub('sanitized-alarm-error')
+    const stub = fridgeStub('sanitized-alarm-error')
     await configure(stub, [counting('safe', '1m')])
     await runInDurableObject(stub, async (instance) => {
-      ;(instance as TestPoller).reportError = new Error('private payload must not leak')
+      ;(instance as TestFridge).reportError = new Error('private payload must not leak')
     })
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 
@@ -240,7 +237,7 @@ describe('PollerDO alarm loop', () => {
   })
 
   it('keeps the chain alive when a fetcher throws: no alarm error, failCount recorded', async () => {
-    const stub = pollerStub('resilience')
+    const stub = fridgeStub('resilience')
     await configure(stub, [
       {
         name: 'boom',
@@ -263,13 +260,7 @@ describe('PollerDO alarm loop', () => {
 
     // Second tick, driven manually: the fetcher throws inside the alarm
     // handler and the handler still must not throw and must re-arm the chain.
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        'UPDATE datafridge_schedule SET next_run_at = ? WHERE name = ?',
-        Date.now(),
-        'boom',
-      )
-    })
+    await setNextRunAt('boom', Date.now())
     await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
 
     rows = await scheduleRows(stub)
@@ -282,9 +273,52 @@ describe('PollerDO alarm loop', () => {
     expect(alarm).toBe(Math.min(...rows.map((r) => r.next_run_at)))
   })
 
+  it('re-arms from the tick when a store error fails a dispatch, not from the recovery delay', async () => {
+    const stub = fridgeStub('store-failure')
+    await configure(stub, [counting('alpha', '15m')])
+    await stub.ensureStarted()
+    await settled(stub, ['alpha'])
+
+    // The row is due and D1 refuses the claim. Nothing is written, so the row
+    // stays exactly as due as it was - and the tick still has to say so.
+    const dueAt = Date.now()
+    await setNextRunAt('alpha', dueAt)
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestFridge).breakStore = (store) => ({
+        ...store,
+        claim: async () => {
+          throw new Error('D1_ERROR: network connection lost')
+        },
+      })
+    })
+    await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
+
+    const report = await runInDurableObject(stub, async (instance) => {
+      const seen = (instance as TestFridge).reports
+      return structuredClone(seen[seen.length - 1]!)
+    })
+    expect(report.failed).toEqual([{ name: 'alpha', message: 'D1_ERROR: network connection lost' }])
+    expect(report.ran).toEqual([])
+    // Not `null`: that means "there is nothing scheduled at all", and would put
+    // the object on its 60-second recovery delay instead of its own answer.
+    expect(report.nextRunAt).toBe(dueAt)
+    expect(fetchCounts.get('alpha')).toBe(1)
+
+    const alarm = await currentAlarm(stub)
+    expect(alarm).not.toBeNull()
+    expect(alarm!).toBeLessThan(dueAt + 30_000)
+
+    // Let D1 come back, so this object leaves the floor it was waking on.
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestFridge).breakStore = undefined
+    })
+    await settled(stub, ['alpha'])
+    expect(fetchCounts.get('alpha')).toBe(2)
+  })
+
   it('serves the stale envelope with lastError once a previously good query starts failing', async () => {
     let shouldFail = false
-    const stub = pollerStub('stale')
+    const stub = fridgeStub('stale')
     await configure(stub, [
       {
         name: 'flaky',
@@ -297,27 +331,21 @@ describe('PollerDO alarm loop', () => {
     ])
     await stub.ensureStarted()
     await settled(stub, ['flaky'])
-    const good = await reader().read('flaky')
+    const good = stored(await reader().read('flaky'))
     expect(good!.data).toEqual({ fresh: true })
 
     shouldFail = true
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        'UPDATE datafridge_schedule SET next_run_at = ? WHERE name = ?',
-        Date.now(),
-        'flaky',
-      )
-    })
+    await setNextRunAt('flaky', Date.now())
     await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
 
-    const stale = await reader().read('flaky')
+    const stale = stored(await reader().read('flaky'))
     expect(stale!.data).toEqual({ fresh: true })
     expect(stale!.fetchedAt).toBe(good!.fetchedAt)
     expect(stale!.lastError).toMatchObject({ message: 'now failing', count: 1 })
   })
 
   it('reconciles runtime parameter variants and stores each envelope independently', async () => {
-    const stub = pollerStub('parameterized')
+    const stub = fridgeStub('parameterized')
     const query = (courseIds: readonly string[]) =>
       defineParameterizedQuery({
         name: 'course-summary',
@@ -344,7 +372,7 @@ describe('PollerDO alarm loop', () => {
   })
 
   it('ensureStarted is idempotent: no double chain, no early re-alarm', async () => {
-    const stub = pollerStub('idempotent')
+    const stub = fridgeStub('idempotent')
     await configure(stub, [counting('solo', '1m')])
 
     await stub.ensureStarted()
@@ -360,13 +388,13 @@ describe('PollerDO alarm loop', () => {
   })
 
   it('rejects a registry whose timeout cannot fit the alarm invocation, at ignition', async () => {
-    const stub = pollerStub('timeout-limit')
+    const stub = fridgeStub('timeout-limit')
     await configure(stub, [{ name: 'slow', every: '1h', timeout: '15m', fetch: async () => 0 }])
     // Caught inside the DO so the RPC rejection is not also reported as an
     // unhandled error by workerd.
     const message = await runInDurableObject(stub, async (instance) => {
       try {
-        await (instance as TestPoller).ensureStarted()
+        await (instance as TestFridge).ensureStarted()
         return null
       } catch (err) {
         return (err as Error).message
@@ -378,16 +406,16 @@ describe('PollerDO alarm loop', () => {
     )
   })
 
-  it('rejects an invalid source budget at ignition instead of failing silently each alarm', async () => {
-    const stub = pollerStub('invalid-source-budget')
+  it('rejects an invalid source policy at ignition instead of failing silently each alarm', async () => {
+    const stub = fridgeStub('invalid-source-budget')
     await configure(stub, [counting('budgeted', '1m')])
 
-    for (const maxPerTick of [0, -1, 1.5]) {
+    for (const requests of [0, -1, 1.5]) {
       const result = await runInDurableObject(stub, async (instance) => {
-        const poller = instance as TestPoller
-        poller.sources = { posthog: { maxPerTick } }
+        const fridge = instance as TestFridge
+        fridge.sources = { posthog: { limit: { requests, per: '1m' } } }
         try {
-          await poller.ensureStarted()
+          await fridge.ensureStarted()
           return null
         } catch (err) {
           return { name: (err as Error).name, message: (err as Error).message }
@@ -395,7 +423,7 @@ describe('PollerDO alarm loop', () => {
       })
       expect(result).toEqual({
         name: 'ConfigError',
-        message: "source 'posthog': maxPerTick must be a positive integer",
+        message: "source 'posthog': limit.requests must be a positive integer",
       })
     }
 
@@ -403,14 +431,14 @@ describe('PollerDO alarm loop', () => {
     expect(await scheduleRows(stub)).toEqual([])
   })
 
-  it('accepts a valid source budget and defers the over-budget query to the next tick', async () => {
-    const stub = pollerStub('valid-source-budget')
+  it('accepts a valid source policy and defers the throttled query to the next window', async () => {
+    const stub = fridgeStub('valid-source-budget')
     await configure(stub, [
       { ...counting('first', '5m'), source: 'posthog' },
       { ...counting('second', '5m'), source: 'posthog' },
     ])
     await runInDurableObject(stub, async (instance) => {
-      ;(instance as TestPoller).sources = { posthog: { maxPerTick: 1 } }
+      ;(instance as TestFridge).sources = { posthog: { limit: { requests: 1, per: '1s' } } }
     })
 
     await stub.ensureStarted()
@@ -419,21 +447,161 @@ describe('PollerDO alarm loop', () => {
     expect(fetchCounts.get('first')).toBe(1)
     expect(fetchCounts.get('second')).toBe(1)
     const reports = await runInDurableObject(stub, async (instance) =>
-      (instance as TestPoller).reports.map((report) => structuredClone(report)),
+      (instance as TestFridge).reports.map((report) => structuredClone(report)),
     )
     expect(reports[0]!.ran).toHaveLength(1)
-    expect(reports[0]!.deferredBudget).toHaveLength(1)
+    expect(reports[0]!.throttled).toHaveLength(1)
     expect(reports.flatMap((report) => report.ran).sort()).toEqual(['first', 'second'])
   })
 
+  it("keeps no dispatch state of its own: every row it works on is the store's", async () => {
+    const stub = fridgeStub('stateless')
+    await configure(stub, [counting('solo', '5m')])
+    await stub.ensureStarted()
+    await settled(stub, ['solo'])
+
+    // The object's own SQLite holds the registry signature and nothing else, so
+    // a second scheduler over the same D1 coordinates through D1, not through it.
+    const tables = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'datafridge_%'",
+        )
+        .toArray()
+        .map((row) => row.name),
+    )
+    expect(tables).toEqual(['datafridge_meta'])
+  })
+
+  it('answers anyParams params from a reader, storing neither result nor row', async () => {
+    const stub = fridgeStub('any-params')
+    const funnel = defineParameterizedQuery({
+      name: 'course-funnel',
+      anyParams: true,
+      fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
+    })
+    const params = { courseId: 'alpha' }
+
+    // The registry has a scheduled query too, so the alarm chain is running.
+    await configure(stub, [counting('solo', '5m'), funnel])
+    await stub.ensureStarted()
+    await settled(stub, ['solo'])
+
+    // The read path is a reader over the same D1, never this object.
+    const withRegistry = createReader({
+      store: d1(env.DB),
+      queries: [counting('solo', '5m'), funnel],
+    })
+    expect(stored(await withRegistry.read('course-funnel', params))).toMatchObject({
+      data: { course: 'alpha' },
+    })
+
+    // Not an entry: the tick's table is untouched by it.
+    expect((await scheduleRows()).map((r) => r.name)).toEqual(['solo'])
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS n FROM datafridge_results').first<{
+        n: number
+      }>(),
+    ).toMatchObject({ n: 1 })
+  })
+
+  it('coalesces overlapping anyParams reads from separate readers into one call', async () => {
+    let calls = 0
+    let release: (value: { course: string }) => void = () => undefined
+    const inFlight = new Promise<{ course: string }>((resolve) => {
+      release = resolve
+    })
+    const funnel = defineParameterizedQuery({
+      name: 'course-funnel',
+      anyParams: true,
+      timeout: '20s',
+      fetch: async () => {
+        calls += 1
+        return inFlight
+      },
+    })
+    const params = { courseId: 'alpha' }
+    // Two readers with nothing in common but the database, which is how two
+    // Worker invocations meet.
+    const reader = () => createReader({ store: d1(env.DB), queries: [funnel] })
+
+    const first = reader().read('course-funnel', params)
+    const second = reader().read('course-funnel', params)
+    await vi.waitFor(() => expect(calls).toBe(1), { timeout: 5_000 })
+
+    release({ course: 'alpha' })
+    expect(stored(await first)).toMatchObject({ data: { course: 'alpha' } })
+    expect(stored(await second)).toMatchObject({ data: { course: 'alpha' } })
+    expect(calls).toBe(1)
+
+    // Coalescing is not caching: nothing lasting was created for these params.
+    expect(await scheduleRows()).toEqual([])
+    expect(
+      await env.DB.prepare('SELECT COUNT(*) AS n FROM datafridge_results').first<{ n: number }>(),
+    ).toMatchObject({ n: 0 })
+
+    // A read that arrives after that flight settles is entitled to a fresh call.
+    release({ course: 'alpha' })
+    await reader().read('course-funnel', params)
+    expect(calls).toBe(2)
+  })
+
+  it('re-ignites after a deploy that changed nothing but an open base', async () => {
+    const stub = fridgeStub('any-params-signature')
+    const funnel = (timeout: '30s' | '10s') =>
+      defineParameterizedQuery({
+        name: 'course-funnel',
+        anyParams: true,
+        timeout,
+        fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
+      })
+
+    await configure(stub, [counting('solo', '1h'), funnel('30s')])
+    await stub.ensureStarted()
+    await settled(stub, ['solo'])
+    await runInDurableObject(stub, async (_instance, state) => state.storage.deleteAlarm())
+
+    // The registry changed only in a part the signature used to ignore, so the
+    // chain would never have been re-lit.
+    await configure(stub, [counting('solo', '1h'), funnel('10s')])
+    await stub.ensureStarted()
+    await vi.waitFor(async () => expect(await currentAlarm(stub)).not.toBeNull(), {
+      timeout: 5_000,
+    })
+  })
+
+  it('rejects an open base whose timeout cannot fit the alarm invocation', async () => {
+    const stub = fridgeStub('any-params-timeout')
+    await configure(stub, [
+      defineParameterizedQuery({
+        name: 'course-funnel',
+        anyParams: true,
+        timeout: '20m',
+        fetch: async () => ({ ok: true }),
+      }),
+    ])
+    const message = await runInDurableObject(stub, async (instance) => {
+      try {
+        await (instance as TestFridge).ensureStarted()
+        return null
+      } catch (err) {
+        return (err as Error).message
+      }
+    })
+    expect(message).toBe(
+      "query 'course-funnel': timeout (1200000ms) must be shorter than the 900000ms " +
+        'wall-clock limit of a Cloudflare Durable Object alarm invocation; lower the timeout',
+    )
+  })
+
   it('reconciles a changed registry: adds run, removed rows and envelopes vanish, every changes reschedule', async () => {
-    const stub = pollerStub('reconcile')
+    const stub = fridgeStub('reconcile')
     await configure(stub, [counting('keep', '5m'), counting('drop', '5m')])
     await stub.ensureStarted()
     await settled(stub, ['drop', 'keep'])
     expect(fetchCounts.get('keep')).toBe(1)
     expect(fetchCounts.get('drop')).toBe(1)
-    const keptBefore = await reader().read('keep')
+    const keptBefore = stored(await reader().read('keep'))
 
     await configure(stub, [counting('keep', '1m'), counting('added', '1m')])
     await stub.ensureStarted()

@@ -1,24 +1,24 @@
 import { describe, expect, it } from 'vitest'
 
 import { ConfigError, createReader } from '../src/index.js'
-import { makeHarness, resultsOnly } from './helpers.js'
+import { makeHarness, resultsOnly, stored } from './helpers.js'
 
 describe('read() contract', () => {
   it('serves the first read itself rather than answering null', async () => {
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    expect(await poller.read<string>('q')).toMatchObject({ data: 'v1', isStale: false })
+    const { fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    expect(await fridge.read<string>('q')).toMatchObject({ data: 'v1', isStale: false })
   })
 
   it('throws at once for a query name that is not registered', async () => {
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    await expect(poller.read('typo')).rejects.toThrow(ConfigError)
+    const { fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    await expect(fridge.read('typo')).rejects.toThrow(ConfigError)
   })
 
   it('reports fresh data with age, then flips to stale once freshUntil passes', async () => {
-    const { clock, poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    await poller.runDue()
+    const { clock, fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    await fridge.runDue()
 
-    expect(await poller.read<string>('q')).toEqual({
+    expect(await fridge.read<string>('q')).toEqual({
       data: 'v1',
       fetchedAt: 0,
       isStale: false,
@@ -27,17 +27,17 @@ describe('read() contract', () => {
     })
 
     await clock.advance(100_000)
-    expect(await poller.read<string>('q')).toMatchObject({ isStale: false, age: 100_000 })
+    expect(await fridge.read<string>('q')).toMatchObject({ isStale: false, age: 100_000 })
 
     await clock.advance(200_000)
-    expect(await poller.read<string>('q')).toMatchObject({ isStale: true, age: 300_000 })
+    expect(await fridge.read<string>('q')).toMatchObject({ isStale: true, age: 300_000 })
   })
 
   it('createReader reads the result plane without a registry', async () => {
-    const { clock, store, poller } = makeHarness([
+    const { clock, store, fridge } = makeHarness([
       { name: 'q', every: '5m', fetch: async () => ({ nested: [1, 2, 3] }) },
     ])
-    await poller.runDue()
+    await fridge.runDue()
 
     const reader = createReader({ store: resultsOnly(store), clock })
     expect(await reader.read('q')).toEqual({
@@ -51,18 +51,18 @@ describe('read() contract', () => {
   })
 
   it('createReader defaults to systemClock when no clock is passed', async () => {
-    const { store, poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
-    await poller.runDue()
+    const { store, fridge } = makeHarness([{ name: 'q', every: '5m', fetch: async () => 'v1' }])
+    await fridge.runDue()
 
     const reader = createReader({ store: resultsOnly(store) })
-    const result = await reader.read<string>('q')
+    const result = stored(await reader.read<string>('q'))
     expect(result).toMatchObject({ data: 'v1', fetchedAt: 0 })
     expect(result!.age).toBeGreaterThan(0)
   })
 
   it('exposes lastError from the envelope', async () => {
     let fail = false
-    const { clock, poller } = makeHarness([
+    const { clock, fridge } = makeHarness([
       {
         name: 'q',
         every: '5m',
@@ -72,12 +72,12 @@ describe('read() contract', () => {
         },
       },
     ])
-    await poller.runDue()
+    await fridge.runDue()
     fail = true
     await clock.advance(300_000)
-    await poller.runDue()
+    await fridge.runDue()
 
-    expect((await poller.read('q'))?.lastError).toEqual({
+    expect(stored(await fridge.read('q'))?.lastError).toEqual({
       at: 300_000,
       message: 'upstream 500',
       count: 1,
@@ -85,53 +85,30 @@ describe('read() contract', () => {
   })
 })
 
-describe('read() SWR fallback mode', () => {
-  it('serves the stale result immediately and defers one background refresh', async () => {
+describe('read() on a stored result is a local read', () => {
+  it('serves a stale result without touching upstream, however overdue it is', async () => {
     let calls = 0
-    const { clock, poller } = makeHarness([
+    const { clock, fridge } = makeHarness([
       { name: 'q', every: '5m', fetch: async () => `v${++calls}` },
     ])
-    await poller.runDue()
-    await clock.advance(300_000)
+    await fridge.runDue()
+    await clock.advance(3_600_000)
 
-    const deferredRefreshes: Promise<void>[] = []
-    const stale = await poller.read<string>('q', undefined, {
-      swrRefresh: (p) => deferredRefreshes.push(p),
-    })
-    expect(stale).toMatchObject({ data: 'v1', isStale: true })
-    expect(deferredRefreshes).toHaveLength(1)
-
-    await Promise.all(deferredRefreshes)
-    expect(await poller.read<string>('q')).toMatchObject({ data: 'v2', isStale: false })
-    expect(calls).toBe(2)
-  })
-
-  it('does not trigger a refresh while the result is fresh', async () => {
-    let calls = 0
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => `v${++calls}` }])
-    await poller.runDue()
-
-    const deferredRefreshes: Promise<void>[] = []
-    await poller.read('q', undefined, {
-      swrRefresh: (p: Promise<void>) => deferredRefreshes.push(p),
-    })
-    expect(deferredRefreshes).toHaveLength(0)
+    expect(await fridge.read<string>('q')).toMatchObject({ data: 'v1', isStale: true })
+    expect(await fridge.read<string>('q')).toMatchObject({ data: 'v1', isStale: true })
     expect(calls).toBe(1)
   })
 
-  it('leaves a miss to the read itself instead of handing out a second refresh', async () => {
-    let calls = 0
-    const { poller } = makeHarness([{ name: 'q', every: '5m', fetch: async () => `v${++calls}` }])
+  it('leaves the schedule row untouched, so reads cannot outpace the poll period', async () => {
+    const { clock, fridge, store } = makeHarness([
+      { name: 'q', every: '5m', fetch: async () => 'v1' },
+    ])
+    await fridge.runDue()
+    const scheduled = await store.readSchedule('q')
 
-    const deferredRefreshes: Promise<void>[] = []
-    expect(
-      await poller.read<string>('q', undefined, {
-        swrRefresh: (p: Promise<void>) => deferredRefreshes.push(p),
-      }),
-    ).toMatchObject({ data: 'v1' })
-    expect(deferredRefreshes).toHaveLength(0)
+    await clock.advance(3_600_000)
+    await fridge.read('q')
 
-    await Promise.all(deferredRefreshes)
-    expect(await poller.read('q')).toMatchObject({ data: 'v1' })
+    expect(await store.readSchedule('q')).toEqual(scheduled)
   })
 })

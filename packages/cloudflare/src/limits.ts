@@ -5,12 +5,14 @@ import { ConfigError, Queries } from '@datafridge/core'
 export const INVOCATION_WALL_CLOCK_LIMIT_MS = 900_000
 
 export function assertTimeoutsFitInvocation(queries: Queries, invocation: string): void {
-  // Dynamic bases are checked by name too: their variants only exist as rows, so
-  // queries.all never carries them and an over-long timeout would otherwise be
-  // found by the platform killing the invocation instead of by construction.
+  // Dynamic and open bases are checked by name too: queries.all never carries
+  // them - a dynamic base's entries exist only as rows, an open base has none at
+  // all - and an over-long timeout would otherwise be found by the platform
+  // killing the invocation instead of by construction.
   const named: Array<[string, number]> = [
     ...queries.all.map((query): [string, number] => [query.name, query.timeoutMs]),
     ...queries.dynamic.map((entry): [string, number] => [entry.baseName, entry.timeoutMs]),
+    ...queries.open.map((entry): [string, number] => [entry.baseName, entry.timeoutMs]),
   ]
   for (const [name, timeoutMs] of named) {
     if (timeoutMs >= INVOCATION_WALL_CLOCK_LIMIT_MS) {

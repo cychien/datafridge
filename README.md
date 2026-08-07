@@ -28,6 +28,8 @@ That instability comes as slow responses, data that is sometimes simply not ther
 
 datafridge handles it for you. You register a query once and configure a scheduler, a result store, and metadata such as the refresh interval and rate limits. From then on the scheduler writes the latest third-party data into your own database in the background.
 
+The whole library is one promise: **when your app wants data, it always has some.** Not necessarily current - but always there, and as current as the upstream will allow.
+
 ```
    scheduler tick (Durable Object alarm, or cron)
         │
@@ -81,8 +83,8 @@ const queries = defineQueries([
 
 **scheduler**
 
-- `PollerDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
-- `cronPoller` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
+- `FridgeDO` - a Cloudflare Durable Object as the scheduler, at exact due times.
+- `cronFridge` - a Cloudflare Cron Trigger as the scheduler, one minute at the finest.
 
 **store**
 
@@ -101,11 +103,11 @@ Schedulers: `durable-object`, `cron`. Stores: `d1`. Platform guides: [Cloudflare
 
 ## A complete example
 
-`PollerDO` as the scheduler, `d1` as the store, and one route that reads:
+`FridgeDO` as the scheduler, `d1` as the store, and one route that reads:
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
-import { d1, ensureStarted, PollerDO } from '@datafridge/cloudflare'
+import { d1, ensureStarted, FridgeDO } from '@datafridge/cloudflare'
 
 interface Env {
   DB: D1Database
@@ -124,7 +126,7 @@ const queries = defineQueries([
   },
 ])
 
-export class Poller extends PollerDO<Env> {
+export class Poller extends FridgeDO<Env> {
   queries = queries
 
   store(env: Env) {
@@ -172,7 +174,7 @@ Nothing is thrown away. A failed refresh keeps the previously cached result, att
 | Upstream error or timeout | Count the failure, back off, keep the old result | Old data, `isStale`, `lastError` |
 | Executor died mid-fetch | Another tick re-claims it after the lease expires | Old data, `isStale` |
 | A zombie writes back late | Version mismatch, write rejected | Unaffected |
-| Squeezed out by a source budget | Stays due, rises in priority next tick | Old data, slightly older |
+| Squeezed out by a source's rate limit | Stays due, rises in priority next tick | Old data, slightly older |
 | Failing for hours | Backoff converges at `every`, last-known-good kept forever | Old data, `lastError` |
 | Never fetched successfully | Keeps trying on schedule | `null` |
 
@@ -198,25 +200,50 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 Every variant becomes an ordinary independent registry entry with its own schedule, lease, backoff, failure count, and stored result. Adding or removing a variant reconciles exactly like adding or removing a named query.
 
-Only variants in the finite registry are scheduled and readable. Arbitrary on-demand variants are not created at read time.
+## Parameter spaces too large to list
+
+When the space is open-ended - any custom date range, any course - `anyParams` replaces the list entirely:
+
+```ts
+const funnel = defineParameterizedQuery({
+  name: 'course-funnel',
+  anyParams: true,
+  timeout: '20s',
+  source: 'posthog',
+  fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
+})
+```
+
+Being an entry is what the registry decides, never what somebody happened to ask for. Params the registry names are scheduled entries with a row, a lease and a stored result. Params it does not name are answered by one fresh call - through the same dispatcher, so the same source ceiling, reserve, concurrency and timeout apply - and nothing is stored: no result, no row, no polling you did not ask for.
+
+That is the trade you are making. A declared variant is kept current for you; an open one is fetched when you ask, and costs a call each time. See [open parameter spaces](./docs/api.md#open-parameter-spaces).
 
 ## Rate limiting by source
 
-Tag queries with a `source` and cap how many of that group run per tick:
+Tag queries with a `source` and say what that source tolerates:
 
 ```ts
 export default {
-  scheduled: cronPoller<Env>({
+  scheduled: cronFridge<Env>({
     queries,
     store: (env) => d1(env.DB),
-    sources: { posthog: { maxPerTick: 2 } },
+    sources: {
+      posthog: {
+        limit: { requests: 100, per: '1m', reserve: 10 },
+        maxConcurrent: 4,
+      },
+    },
   }),
 }
 ```
 
-However many queries you register, scheduled refreshes can never exceed `maxPerTick × tick frequency`. A cold read that fetches on a miss is deduplicated per key by the lease but does not yet count against that budget. A query squeezed out by the budget stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+`limit` is a real count, not a heuristic: the store keeps one ledger row per source and every call increments it under the same version-checked CAS that claims a lease, so two Workers and a Durable Object pointing at one database share one budget. Every upstream call goes through it - a scheduled refresh and a read that found nothing stored draw on the same window.
 
-Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The budget is the fuse; jitter keeps the fuse from blowing in normal operation.
+`reserve` holds part of each window back from scheduled refreshes, because a tick landing on the window boundary would otherwise spend the whole minute in its first second and leave nothing for a reader with a person behind it. A query squeezed out stays due and rises in priority every tick it waits, since priority is the overdue *ratio* `(now - nextRunAt) / every` rather than absolute lateness. Nothing starves.
+
+Jitter is the other half: first registration offsets each query's `nextRunAt` randomly, so `5m`, `10m`, and `1h` queries never permanently align on the same tick and stampede one source at once. The ledger is the fuse; jitter keeps the fuse from blowing in normal operation.
+
+See [rate limiting](./docs/rate-limiting.md) for `maxConcurrent`, the `throttled` read status, and passing a vendor's own `Retry-After` back with `RateLimitError`.
 
 ## Documentation
 

@@ -34,8 +34,8 @@ existing configuration is never rewritten. --config defaults to ./wrangler.toml.
 function nextSteps(selection: InitSelection): string {
   const wire =
     selection.scheduler === 'durable-object'
-      ? `export a PollerDO subclass named ${POLLER_CLASS} and call ensureStarted once after deploying`
-      : 'wire cronPoller as your scheduled handler'
+      ? `export a FridgeDO subclass named ${POLLER_CLASS} and call ensureStarted once after deploying`
+      : 'wire cronFridge as your scheduled handler'
   return `
 Next steps:
   1. wrangler d1 create ${D1_DATABASE_NAME}, then paste the database_id into wrangler.toml

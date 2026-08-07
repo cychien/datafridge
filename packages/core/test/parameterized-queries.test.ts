@@ -27,7 +27,7 @@ describe('parameterized queries', () => {
       { courseId: 'alpha', window: '30d' },
     ]
     const seen: Params[] = []
-    const { poller, store } = makeHarness([
+    const { fridge, store } = makeHarness([
       analyticsQuery(
         () => variants,
         async (params) => {
@@ -37,13 +37,15 @@ describe('parameterized queries', () => {
       ),
     ])
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     const keys = variants.map((params) => queryKey('course-analytics', params))
     expect(report).toEqual({
       ran: keys,
       skippedLeased: [],
-      deferredBudget: [],
+      throttled: [],
+      deferred: [],
       failed: [],
+      nextRunAt: 300_000,
     })
     expect(seen).toEqual(variants)
 
@@ -51,7 +53,7 @@ describe('parameterized queries', () => {
     await expect(reader.read('course-analytics', variants[0])).resolves.toMatchObject({
       data: { label: 'alpha:7d' },
     })
-    await expect(poller.read('course-analytics', variants[1]!)).resolves.toMatchObject({
+    await expect(fridge.read('course-analytics', variants[1]!)).resolves.toMatchObject({
       data: { label: 'alpha:30d' },
     })
   })
@@ -61,7 +63,7 @@ describe('parameterized queries', () => {
     const failing: Params = { courseId: 'failing', window: '7d' }
     const leased: Params = { courseId: 'leased', window: '7d' }
     const variants = [healthy, failing, leased]
-    const { poller, store } = makeHarness([
+    const { fridge, store } = makeHarness([
       analyticsQuery(
         () => variants,
         async (params) => {
@@ -79,7 +81,7 @@ describe('parameterized queries', () => {
       version: 1,
     })
 
-    const report = await poller.runDue()
+    const report = await fridge.runDue()
     expect(report.ran).toEqual([queryKey('course-analytics', healthy)])
     expect(report.failed).toEqual([
       { name: queryKey('course-analytics', failing), message: 'controlled failure' },
@@ -112,7 +114,7 @@ describe('parameterized queries', () => {
         async (params) => params.courseId,
       ),
     ])
-    await first.poller.runDue()
+    await first.fridge.runDue()
     const betaBefore = await first.store.readResult(queryKey('course-analytics', beta))
 
     variants = [beta, gamma]
@@ -125,7 +127,7 @@ describe('parameterized queries', () => {
       ],
       { store: first.store, clock: first.clock },
     )
-    const report = await second.poller.runDue()
+    const report = await second.fridge.runDue()
 
     expect(report.ran).toEqual([queryKey('course-analytics', gamma)])
     await expect(first.store.readSchedule(queryKey('course-analytics', alpha))).resolves.toBeNull()
@@ -151,12 +153,12 @@ describe('parameterized queries', () => {
     ])
     params.courseId = 'mutated'
 
-    const { poller } = makeHarness(queries)
-    await poller.runDue()
+    const { fridge } = makeHarness(queries)
+    await fridge.runDue()
     expect(fetched).toEqual({ courseId: 'alpha', window: '7d' })
     expect(Object.isFrozen(fetched)).toBe(true)
     await expect(
-      poller.read('course-analytics', { courseId: 'alpha', window: '7d' }),
+      fridge.read('course-analytics', { courseId: 'alpha', window: '7d' }),
     ).resolves.toMatchObject({ data: 'alpha' })
   })
 
