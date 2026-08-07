@@ -410,56 +410,70 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     // it would have to hand straight back.
     const metered = policy !== undefined && policy.windowMs !== Infinity
     const trips = measureRoundTrips()
-    let takenAt = 0
-    if (metered) {
-      const demand = task.priority === 'demand'
-      const taken = await takeQuota(
-        policy,
-        source,
-        demand ? policy.demandLimit : policy.scheduledLimit,
-        demand ? task.deadline : undefined,
-        unslotted,
-        trips,
-      )
-      if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
-      takenAt = taken.takenAt
-    }
-    const permit = await takePermit(
-      source,
-      (takenAt) => takenAt + query.leaseMs + PERMIT_GRACE_MS,
-      task.priority === 'demand' ? task.deadline : undefined,
-      trips,
-      metered ? 1 : 0,
-    )
-    if (!permit.ok) {
-      if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-      return { status: 'deferred', retryAt: permit.retryAt }
-    }
+    let charged: number | null = null
+    // Coordination that throws is contained here rather than escaping as a
+    // rejection: `run` answers with an outcome or it says why, so a store
+    // failing mid-admission lands in the tick's report instead of being
+    // swallowed by whoever gathered the dispatches.
     try {
-      // Waiting out a quota window and queueing for a permit both spend wall
-      // clock, so the lease is measured from here rather than from when this
-      // dispatch was handed its `now`: a lease that started expiring before the
-      // call began is one a peer can reclaim mid-flight, which is exactly what
-      // `timeout` being shorter than `lease` exists to rule out.
-      const startedAt = clock.now()
-      const claimed = await schedule.claim(name, row.version, startedAt + query.leaseMs, startedAt)
-      if (!claimed) {
-        // Someone else is doing this work; nothing leaves for upstream here, so
-        // the slot this call was counted for goes back to the window.
-        if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
-        return { status: 'leased' }
-      }
-      const token = row.version + 1
-      try {
-        const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
-          query.fetch({ signal, now: startedAt, attempt: row.failCount + 1 }),
+      if (metered) {
+        const demand = task.priority === 'demand'
+        const taken = await takeQuota(
+          policy,
+          source,
+          demand ? policy.demandLimit : policy.scheduledLimit,
+          demand ? task.deadline : undefined,
+          unslotted,
+          trips,
         )
-        return await succeed(query, token, data, clock.now())
-      } catch (err) {
-        return await fail(query, row, token, err)
+        if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
+        charged = taken.takenAt
       }
-    } finally {
-      await permit.release()
+      const permit = await takePermit(
+        source,
+        (takenAt) => takenAt + query.leaseMs + PERMIT_GRACE_MS,
+        task.priority === 'demand' ? task.deadline : undefined,
+        trips,
+        metered ? 1 : 0,
+      )
+      if (!permit.ok) {
+        if (charged !== null) await giveQuotaBack(source, policy!.windowMs, charged)
+        return { status: 'deferred', retryAt: permit.retryAt }
+      }
+      try {
+        // Both bounds are fixed here, before the claim goes out, and the call is
+        // held to the absolute one: waiting out a quota window, queueing for a
+        // permit and the claim round trip itself all come out of the call's own
+        // `timeout`, never out of the `lease - timeout` margin the query
+        // declared. Measuring the fetch from wherever the claim happened to
+        // return is what would let it run past the lease a peer reads.
+        const admittedAt = clock.now()
+        const upstreamBy = admittedAt + query.timeoutMs
+        const leaseUntil = upstreamBy + (query.leaseMs - query.timeoutMs)
+        const claimed = await schedule.claim(name, row.version, leaseUntil, admittedAt)
+        if (!claimed) {
+          // Someone else is doing this work; nothing leaves for upstream here,
+          // so the slot this call was counted for goes back to the window.
+          if (charged !== null) await giveQuotaBack(source, policy!.windowMs, charged)
+          return { status: 'leased' }
+        }
+        charged = null
+        const token = row.version + 1
+        try {
+          const budget = Math.max(0, upstreamBy - clock.now())
+          const data = await withDeadline(clock, budget, `query '${name}'`, (signal) =>
+            query.fetch({ signal, now: admittedAt, attempt: row.failCount + 1 }),
+          )
+          return await succeed(query, token, data, clock.now())
+        } catch (err) {
+          return await fail(query, row, token, err)
+        }
+      } finally {
+        await permit.release()
+      }
+    } catch (err) {
+      if (charged !== null) await giveQuotaBack(source, policy!.windowMs, charged)
+      return { status: 'failed', message: errorMessage(err) }
     }
   }
 

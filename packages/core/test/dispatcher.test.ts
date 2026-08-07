@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { defineQueries, memoryStore } from '../src/index.js'
+import { defineQueries, FakeClock, memoryStore } from '../src/index.js'
 import type { QueryDef, SourcePolicy, Store } from '../src/index.js'
-import { makeHarness } from './helpers.js'
+import { deferred, makeHarness } from './helpers.js'
 
 function tracing(inner: Store, log: string[]): Store {
   const note = <T>(op: string, name: string, run: () => Promise<T>): Promise<T> => {
@@ -124,5 +124,100 @@ describe('the dispatcher is the only exit to upstream', () => {
     expect(await read).toBeNull()
 
     expect(await demand.store.readSchedule('q')).toEqual(await scheduled.store.readSchedule('q'))
+  })
+})
+
+describe('the lease a dispatch writes', () => {
+  it('outlives the call by the whole margin declared, however slow the claim is', async () => {
+    const clock = new FakeClock(0)
+    const inner = memoryStore()
+    const roundTrip = deferred<void>()
+    let leasedUntil = 0
+    const slowClaim: Store = {
+      ...inner,
+      claim: async (name, expectedVersion, leaseUntil, now) => {
+        leasedUntil = leaseUntil
+        await roundTrip.promise
+        return inner.claim(name, expectedVersion, leaseUntil, now)
+      },
+    }
+    let abortedAt = -1
+    const hangs: QueryDef[] = [
+      {
+        name: 'q',
+        every: '5m',
+        timeout: '30s',
+        lease: '35s',
+        fetch: async ({ signal }) => {
+          signal.addEventListener('abort', () => {
+            abortedAt = clock.now()
+          })
+          return new Promise<string>(() => {})
+        },
+      },
+    ]
+    const { fridge } = makeHarness(hangs, { store: slowClaim, clock })
+
+    const run = fridge.runDue()
+    await clock.advance(0)
+    // The claim round trip alone outlasts the five seconds between this query's
+    // timeout and its lease.
+    await clock.advance(10_000)
+    roundTrip.resolve()
+    await clock.advance(0)
+    expect(leasedUntil).toBe(35_000)
+
+    await clock.advance(20_000)
+    // The claim's own latency came out of the call's budget, not out of the
+    // margin: the call is over with the whole declared margin still to run, so
+    // no peer can reclaim this row while it is still talking to upstream.
+    expect(abortedAt).toBe(30_000)
+    expect(leasedUntil - abortedAt).toBe(5_000)
+    expect((await run).failed).toHaveLength(1)
+  })
+})
+
+describe('a store that fails a dispatch before it reaches upstream', () => {
+  const metered = (store: Store, sources: Record<string, SourcePolicy>) =>
+    makeHarness([{ name: 'q', every: '5m', source: 'posthog', fetch: async () => 'v1' }], {
+      store,
+      sources,
+    })
+
+  it('is reported, not lost between the dispatch and the tick', async () => {
+    const inner = memoryStore()
+    const brittle: Store = {
+      ...inner,
+      takeQuota: async () => {
+        throw new Error('D1_ERROR: network connection lost')
+      },
+    }
+    const { fridge } = metered(brittle, { posthog: { limit: { requests: 5, per: '1m' } } })
+
+    const report = await fridge.runDue()
+
+    expect(report.failed).toEqual([{ name: 'q', message: 'D1_ERROR: network connection lost' }])
+    expect(report.ran).toEqual([])
+    // Nothing was claimed, so the row is exactly as due as it was.
+    expect(await inner.readSchedule('q')).toBeNull()
+  })
+
+  it('hands back the quota it took on the way to failing', async () => {
+    const inner = memoryStore()
+    const brittle: Store = {
+      ...inner,
+      acquirePermit: async () => {
+        throw new Error('D1_ERROR: network connection lost')
+      },
+    }
+    const { fridge } = metered(brittle, {
+      posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 },
+    })
+
+    const report = await fridge.runDue()
+
+    expect(report.failed).toEqual([{ name: 'q', message: 'D1_ERROR: network connection lost' }])
+    // Nothing reached upstream, so the window's single call is still there.
+    expect(await inner.takeQuota('posthog', 1, 60_000, 0)).toBe(true)
   })
 })
