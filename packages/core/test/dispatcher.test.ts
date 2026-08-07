@@ -200,6 +200,40 @@ describe('a store that fails a dispatch before it reaches upstream', () => {
     expect(report.ran).toEqual([])
     // Nothing was claimed, so the row is exactly as due as it was.
     expect(await inner.readSchedule('q')).toBeNull()
+    // And a driver re-arms from that, rather than from `null` - which says
+    // there is nothing scheduled at all.
+    expect(report.nextRunAt).toBe(0)
+  })
+
+  it('still says when there is work again after a write-back that never landed', async () => {
+    const inner = memoryStore()
+    const brittle: Store = {
+      ...inner,
+      writeSchedule: async (row) => {
+        if (row.failCount > 0) throw new Error('D1_ERROR: network connection lost')
+        return inner.writeSchedule(row)
+      },
+    }
+    const { clock, fridge } = makeHarness(
+      [
+        {
+          name: 'q',
+          every: '5m',
+          fetch: async () => {
+            throw new Error('upstream down')
+          },
+        },
+      ],
+      { store: brittle },
+    )
+    await clock.advance(120_000)
+
+    const report = await fridge.runDue()
+
+    // The backoff never reached the row, so the row is still due where it was.
+    expect(report.failed).toEqual([{ name: 'q', message: 'upstream down' }])
+    expect(await inner.readSchedule('q')).toMatchObject({ nextRunAt: 120_000, failCount: 0 })
+    expect(report.nextRunAt).toBe(120_000)
   })
 
   it('hands back the quota it took on the way to failing', async () => {
@@ -219,5 +253,6 @@ describe('a store that fails a dispatch before it reaches upstream', () => {
     expect(report.failed).toEqual([{ name: 'q', message: 'D1_ERROR: network connection lost' }])
     // Nothing reached upstream, so the window's single call is still there.
     expect(await inner.takeQuota('posthog', 1, 60_000, 0)).toBe(true)
+    expect(report.nextRunAt).toBe(0)
   })
 })

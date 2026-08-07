@@ -418,7 +418,12 @@ export function createFridge(config: FridgeConfig): Fridge {
           if (outcome.status === 'throttled' || outcome.status === 'deferred') {
             consider(outcome.retryAt)
           } else if (outcome.status === 'leased') consider(candidate.row.leaseUntil ?? now)
-          else if (outcome.nextRunAt !== undefined) consider(outcome.nextRunAt)
+          // A failure that never got as far as writing the row - admission
+          // threw, the claim was lost, the write-back did not land - leaves it
+          // exactly as due as the plan found it, and that is the honest answer
+          // for when there is work again. Reporting nothing would say there is
+          // none, which is the one thing a still-due row is not.
+          else consider(outcome.nextRunAt ?? candidate.row.nextRunAt)
         },
         (name, retryAt) => {
           report.deferred.push(name)

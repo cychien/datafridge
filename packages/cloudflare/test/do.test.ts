@@ -273,6 +273,49 @@ describe('FridgeDO alarm loop', () => {
     expect(alarm).toBe(Math.min(...rows.map((r) => r.next_run_at)))
   })
 
+  it('re-arms from the tick when a store error fails a dispatch, not from the recovery delay', async () => {
+    const stub = fridgeStub('store-failure')
+    await configure(stub, [counting('alpha', '15m')])
+    await stub.ensureStarted()
+    await settled(stub, ['alpha'])
+
+    // The row is due and D1 refuses the claim. Nothing is written, so the row
+    // stays exactly as due as it was - and the tick still has to say so.
+    const dueAt = Date.now()
+    await setNextRunAt('alpha', dueAt)
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestFridge).breakStore = (store) => ({
+        ...store,
+        claim: async () => {
+          throw new Error('D1_ERROR: network connection lost')
+        },
+      })
+    })
+    await expect(runDurableObjectAlarm(stub)).resolves.toBe(true)
+
+    const report = await runInDurableObject(stub, async (instance) => {
+      const seen = (instance as TestFridge).reports
+      return structuredClone(seen[seen.length - 1]!)
+    })
+    expect(report.failed).toEqual([{ name: 'alpha', message: 'D1_ERROR: network connection lost' }])
+    expect(report.ran).toEqual([])
+    // Not `null`: that means "there is nothing scheduled at all", and would put
+    // the object on its 60-second recovery delay instead of its own answer.
+    expect(report.nextRunAt).toBe(dueAt)
+    expect(fetchCounts.get('alpha')).toBe(1)
+
+    const alarm = await currentAlarm(stub)
+    expect(alarm).not.toBeNull()
+    expect(alarm!).toBeLessThan(dueAt + 30_000)
+
+    // Let D1 come back, so this object leaves the floor it was waking on.
+    await runInDurableObject(stub, async (instance) => {
+      ;(instance as TestFridge).breakStore = undefined
+    })
+    await settled(stub, ['alpha'])
+    expect(fetchCounts.get('alpha')).toBe(2)
+  })
+
   it('serves the stale envelope with lastError once a previously good query starts failing', async () => {
     let shouldFail = false
     const stub = fridgeStub('stale')
