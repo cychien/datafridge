@@ -93,6 +93,15 @@ export function memoryStore(): Store {
       return true
     },
 
+    async releaseQuota(source, windowMs, takenAt) {
+      const ledger = quota.get(source)
+      if (ledger === undefined || ledger.used === 0) return
+      // Usage belongs to the window it was taken in and cannot be moved out of
+      // it, so a window that has already rolled keeps its count.
+      if (ledger.windowStart !== Math.floor(takenAt / windowMs) * windowMs) return
+      quota.set(source, { windowStart: ledger.windowStart, used: ledger.used - 1 })
+    },
+
     async listDue(now, limit) {
       return [...rows.values()]
         .filter((row) => row.nextRunAt <= now)

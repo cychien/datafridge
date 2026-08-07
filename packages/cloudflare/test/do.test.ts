@@ -43,13 +43,29 @@ async function scheduleRows(stub: Stub) {
         name: string
         next_run_at: number
         fail_count: number
-      }>('SELECT name, next_run_at, fail_count FROM datafridge_schedule ORDER BY name')
+        params: string | null
+      }>('SELECT name, next_run_at, fail_count, params FROM datafridge_schedule ORDER BY name')
       .toArray(),
   )
 }
 
 async function currentAlarm(stub: Stub) {
   return runInDurableObject(stub, async (_instance, state) => state.storage.getAlarm())
+}
+
+// Nothing declares an on-demand entry, so the row is where it starts existing.
+// A read creates it in production; here the row is planted directly.
+async function plantOnDemandRow(stub: Stub, name: string, params: unknown, nextRunAt: number) {
+  await runInDurableObject(stub, async (_instance, state) => {
+    state.storage.sql.exec(
+      'INSERT INTO datafridge_schedule ' +
+        '(name, next_run_at, fail_count, lease_until, version, params) ' +
+        'VALUES (?, ?, 0, NULL, 1, ?)',
+      name,
+      nextRunAt,
+      JSON.stringify(params),
+    )
+  })
 }
 
 // The ignition alarm set by ensureStarted() fires on its own in workerd, so
@@ -202,6 +218,7 @@ describe('FridgeDO alarm loop', () => {
         ran: ['alpha', 'beta'],
         skippedLeased: [],
         throttled: [],
+        deferred: [],
         failed: [],
       },
     ])
@@ -424,6 +441,96 @@ describe('FridgeDO alarm loop', () => {
     expect(reports[0]!.ran).toHaveLength(1)
     expect(reports[0]!.throttled).toHaveLength(1)
     expect(reports.flatMap((report) => report.ran).sort()).toEqual(['first', 'second'])
+  })
+
+  it('drives on-demand rows: the alarm comes from the table, like a dynamic variant', async () => {
+    const stub = fridgeStub('on-demand')
+    const funnel = (every: QueryDef['every']) =>
+      defineParameterizedQuery({
+        name: 'course-funnel',
+        every,
+        retain: '2h',
+        fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
+      })
+    const params = { courseId: 'alpha' }
+    const variantKey = queryKey('course-funnel', params)
+
+    // A registry of nothing but a retain base: no static query is around to
+    // wake the object, so the row has to do it or the chain stops here.
+    await configure(stub, [funnel('1m')])
+    await plantOnDemandRow(stub, variantKey, params, Date.now())
+    await stub.ensureStarted()
+    await settled(stub, [variantKey])
+
+    const withRegistry = createReader({ store: d1(env.DB), queries: [funnel('1m')] })
+    await expect(withRegistry.read('course-funnel', params)).resolves.toMatchObject({
+      data: { course: 'alpha' },
+    })
+
+    const row = (await scheduleRows(stub))[0]!
+    expect(row.params).toBe(JSON.stringify(params))
+    expect(await currentAlarm(stub)).toBe(row.next_run_at)
+  })
+
+  it('re-ignites after a deploy that changed nothing but an on-demand base', async () => {
+    const stub = fridgeStub('on-demand-signature')
+    const funnel = (every: QueryDef['every']) =>
+      defineParameterizedQuery({
+        name: 'course-funnel',
+        every,
+        retain: '2h',
+        fetch: async ({ params }) => ({ course: (params as { courseId: string }).courseId }),
+      })
+    const params = { courseId: 'alpha' }
+    const variantKey = queryKey('course-funnel', params)
+
+    await configure(stub, [counting('solo', '1h'), funnel('1h')])
+    await stub.ensureStarted()
+    await settled(stub, ['solo'])
+    const before = await currentAlarm(stub)
+
+    // The registry changed, but only in a part the signature used to ignore, so
+    // the chain kept its hour-away alarm and this row was never touched.
+    await plantOnDemandRow(stub, variantKey, params, Date.now())
+    await configure(stub, [counting('solo', '1h'), funnel('1m')])
+    await stub.ensureStarted()
+
+    await vi.waitFor(
+      async () => {
+        const rows = await scheduleRows(stub)
+        const variant = rows.find((r) => r.name === variantKey)
+        expect(variant?.next_run_at).toBeGreaterThan(Date.now())
+      },
+      { timeout: 5_000 },
+    )
+    const alarm = await currentAlarm(stub)
+    expect(alarm).not.toBe(before)
+    expect(alarm).toBe(Math.min(...(await scheduleRows(stub)).map((r) => r.next_run_at)))
+  })
+
+  it('rejects an on-demand base whose timeout cannot fit the alarm invocation', async () => {
+    const stub = fridgeStub('on-demand-timeout')
+    await configure(stub, [
+      defineParameterizedQuery({
+        name: 'course-funnel',
+        every: '15m',
+        retain: '2h',
+        timeout: '20m',
+        fetch: async () => ({ ok: true }),
+      }),
+    ])
+    const message = await runInDurableObject(stub, async (instance) => {
+      try {
+        await (instance as TestFridge).ensureStarted()
+        return null
+      } catch (err) {
+        return (err as Error).message
+      }
+    })
+    expect(message).toBe(
+      "query 'course-funnel': timeout (1200000ms) must be shorter than the 900000ms " +
+        'wall-clock limit of a Cloudflare Durable Object alarm invocation; lower the timeout',
+    )
   })
 
   it('reconciles a changed registry: adds run, removed rows and envelopes vanish, every changes reschedule', async () => {

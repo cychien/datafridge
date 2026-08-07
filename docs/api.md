@@ -121,7 +121,9 @@ const value = await fridge.read<Result>('analytics-7d')
 - `driver`: `{ serialized, defer(promise), schedule? }`
 - `store`: one store holding both result envelopes and schedule rows
 
-Optional fields are `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
+Optional fields are `sources`, `maxPerTick`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
+
+`maxPerTick` is how many entries one tick loads and takes on; it defaults to 500 and must be a positive integer. It is capacity, not rate: a source's `limit` says how hard upstream may be hit, this says how much work one invocation is willing to be, which matters once `retain` makes the entry count open-ended. What does not fit is left exactly as it was, comes back in `RunReport.deferred`, and is the most overdue thing there is next tick - so a bound spreads work out and never starves it.
 
 Construction rejects a missing or malformed driver, a store missing either half, an invalid source policy, or a store that cannot claim atomically under a non-serialized driver.
 
@@ -134,9 +136,12 @@ interface RunReport {
   ran: string[]
   skippedLeased: string[]
   throttled: string[]
+  deferred: string[]
   failed: Array<{ name: string; message: string }>
 }
 ```
+
+`throttled` is the source ceiling and `deferred` is this tick's capacity; both leave the row exactly as it was, so both come back more overdue rather than lost.
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 

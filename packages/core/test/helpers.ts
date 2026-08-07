@@ -47,6 +47,7 @@ export function scheduleOnly(store: Store): SchedulePlane {
     claim: (name, expectedVersion, leaseUntil, now) =>
       store.claim(name, expectedVersion, leaseUntil, now),
     takeQuota: (source, limit, windowMs, now) => store.takeQuota(source, limit, windowMs, now),
+    releaseQuota: (source, windowMs, takenAt) => store.releaseQuota(source, windowMs, takenAt),
     listDue: (now, limit) => store.listDue!(now, limit),
     capabilities: store.capabilities,
   }

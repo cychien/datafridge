@@ -17,9 +17,6 @@ interface Store {
   // `retain`: record that something was read, and drop what has gone cold
   touchResult(name: string, at: number): Promise<void>
   evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
-  // `retain`: record that something was read, and drop what has gone cold
-  touchResult(name: string, at: number): Promise<void>
-  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 
   // schedule plane - 協調用的簿記
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -30,6 +27,8 @@ interface Store {
   // source rate limiting: count one call in the fixed window containing `now`,
   // and answer whether it fit under `limit`
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
+  // hand a counted call back when it never happened, to the window it was taken in
+  releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // optional capability: SQL backends can fetch all due rows in one query;
   // without it, core reads row by row
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
@@ -61,6 +60,8 @@ interface Store {
 沒有條件寫入原語的後端根本無法承擔排程那一半；只有最終一致性的後端則無法正確承擔。這種後端會宣告 `atomicClaim: false`，而建構只在 serialized driver 之下才接受它。
 
 `takeQuota` 用的是同一個原語。窗口固定且對齊 epoch - 包含 `now` 的那個從 `floor(now / windowMs) * windowMs` 開始，並從零開起 - 而且窗口永不倒退，所以時鐘落後的 executor 無法重開一個同儕已經關掉的窗。`limit` 每次呼叫都帶進來、從不儲存：對沒有人在等的工作，呼叫端會傳一個比較低的值。每個 source 一列就夠，所以沒有東西需要 GC。把它放進 store，是共用 rate limit 免費的原因：兩個服務指向同一個後端就共用一份 ledger，不需要另外跑一個 limiter。
+
+`releaseQuota` 是它的對應：quota 在 claim lease 之前就先扣，所以搶不到 claim 的 dispatch 要把那一格還回去 - 這是讓上限維持「算呼叫」而不是「算意圖」的關鍵。它是一個有守衛的遞減，不需要 CAS 迴圈：只有在 `window_start` 仍然等於 `takenAt` 所落的那個窗、而且用量大於零時才生效。用量不能跨窗搬移，所以已經翻頁的窗一律不動；那會讓前一個窗多算一次，而多算正是上限該偏的方向。
 
 ## 排程那一半從哪來（建構時就決定）
 

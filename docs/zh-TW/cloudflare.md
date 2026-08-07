@@ -228,6 +228,7 @@ export default {
 | Executor 死亡 | Lease 過期後 reclaim | 立即回傳目前 envelope |
 | Zombie 遲到寫回 | Version mismatch 時拒絕 | 保持不變 |
 | Per-source 額度用完 | 保持 due 且更過期，留待後續 tick | 立即回傳目前 envelope；miss 時為 `status: 'throttled'` |
+| 超出這個 tick 的容量（`maxPerTick`） | Row 原封不動，名字放入 `RunReport.deferred`；alarm 依仍然到期的 row 重設 | 不受影響：讀取從不等待 tick |
 | 尚未成功 refresh | 繼續 scheduled attempts | 回傳 `null` |
 | Alarm-level error | 在 `finally` 排定下一個 alarm | 既有 D1 envelopes 仍可讀 |
 
@@ -246,7 +247,7 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 
 D1 是 single-region，remote PoP reader 可能產生跨區 latency。Result-plane replica 不在已發布範圍內。
 
-單一 `FridgeDO` instance 負責協調整個 registry。依 source 分片是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限，而數十個 query 的 registry 距離那個門檻還很遠。
+單一 `FridgeDO` instance 負責協調整個 registry。依 source 分片是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限。數十個 query 的宣告式 registry 距離那個門檻還很遠，而 entry 數量天生開放無界的 `retain` base 也到不了，因為一個 tick 最多只載入並承接 [`maxPerTick`](./rate-limiting.md#容量maxpertick) 個 entry，剩下的則用來重設 alarm。
 
 ## Subpath imports
 

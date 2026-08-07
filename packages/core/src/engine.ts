@@ -24,6 +24,15 @@ import type {
   ThrottledRead,
 } from './types.js'
 
+/**
+ * How many entries one tick loads and takes on. Capacity, not rate: a source's
+ * `limit` says how hard upstream may be hit, this says how much work one
+ * invocation is willing to be. Comfortably above any declared registry, and low
+ * enough that an open-ended `retain` base cannot turn one tick into thousands
+ * of store round trips.
+ */
+const DEFAULT_MAX_PER_TICK = 500
+
 export interface FridgeConfig {
   queries: Queries | readonly QueryDefinition[]
   driver: Driver
@@ -31,6 +40,8 @@ export interface FridgeConfig {
   clock?: Clock
   sources?: Record<string, SourcePolicy>
   random?: () => number
+  /** Entries one tick may take on; the rest stay due. Defaults to 500. */
+  maxPerTick?: number
 }
 
 export interface Fridge {
@@ -48,6 +59,7 @@ export function createFridge(config: FridgeConfig): Fridge {
   const sources = resolveSources(config.sources)
   const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
+  const maxPerTick = validateMaxPerTick(config.maxPerTick)
   const dispatcher = createDispatcher({ store, schedule, clock, random, sources })
   requireListDueForOnDemand(queries, schedule)
 
@@ -166,9 +178,17 @@ export function createFridge(config: FridgeConfig): Fridge {
     return { list, byKey, failures, unresolvedBases }
   }
 
-  const listAllRows = async (): Promise<ScheduleRow[]> =>
+  /**
+   * The tick's rows, and the bound on how much storage one tick reads. `listDue`
+   * orders by `nextRunAt`, so this window is the oldest `maxPerTick` rows: every
+   * due row before any future one, and a row nothing refreshes only climbs. What
+   * falls outside is neither run nor reconciled here, which costs a tick, not a
+   * row - `retain` makes the table open-ended, and a full scan of it is not
+   * something an invocation with a wall clock can promise.
+   */
+  const listRows = async (): Promise<ScheduleRow[]> =>
     schedule.capabilities.listDue && schedule.listDue
-      ? schedule.listDue(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+      ? schedule.listDue(Number.MAX_SAFE_INTEGER, maxPerTick)
       : []
 
   /**
@@ -329,7 +349,7 @@ export function createFridge(config: FridgeConfig): Fridge {
 
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
-      const rows = await listAllRows()
+      const rows = await listRows()
       const removed = await sweepOnDemand(nowArg ?? clock.now(), rows)
       const live = removed.size === 0 ? rows : rows.filter((row) => !removed.has(row.name))
       const effective = await resolveEffective(nowArg ?? clock.now(), live)
@@ -343,11 +363,12 @@ export function createFridge(config: FridgeConfig): Fridge {
           effective.list.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
         ),
       )
-      const toRun = planTick(effective.list, rowsByName, now)
+      const plan = planTick(effective.list, rowsByName, now, maxPerTick)
       const report = emptyReport()
       report.failed.push(...effective.failures)
+      report.deferred.push(...plan.deferred)
       await Promise.allSettled(
-        toRun.map(async (candidate) => {
+        plan.toRun.map(async (candidate) => {
           const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
           recordOutcome(report, candidate.query.name, outcome)
         }),
@@ -403,7 +424,15 @@ function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome
 }
 
 function emptyReport(): RunReport {
-  return { ran: [], skippedLeased: [], throttled: [], failed: [] }
+  return { ran: [], skippedLeased: [], throttled: [], deferred: [], failed: [] }
+}
+
+function validateMaxPerTick(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_PER_TICK
+  if (!Number.isInteger(value) || value < 1) {
+    throw new ConfigError('maxPerTick must be a positive integer')
+  }
+  return value
 }
 
 function errorMessage(err: unknown): string {

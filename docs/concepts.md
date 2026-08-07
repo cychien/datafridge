@@ -122,19 +122,21 @@ runDue(now):
 1. Collect candidates   nextRunAt <= now (no record = first run = due now)
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
-                        5m query's period but only 0.07 of a 60m query's)
+                        5m query's period but only 0.07 of a 60m query's),
+                        then keep the first `maxPerTick`; the rest stay due
 3. Take quota           one call against the source's ledger for the current
                         window, minus whatever `reserve` holds back for readers;
                         refused queries stay due and come back more overdue
 4. Claim lease          claim(name, version, now + timeout + margin);
-                        losing the claim means someone else is on it - skip
+                        losing the claim means someone else is on it - skip,
+                        and the quota it took goes back to the window
 5. Execute + write back concurrently (Promise.allSettled), each fetch wrapped
                         in an AbortSignal timeout
                         success: writeResult + nextRunAt = completion time + every,
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, throttled, failed }
+Returns RunReport { ran, skippedLeased, throttled, deferred, failed }
 ```
 
 Key decisions:
@@ -171,4 +173,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Zombie writes back late | version mismatch, write rejected | unaffected |
 | First round not finished | - | `null` (callers should handle it) |
 | Out of source quota | stays due, prioritized next tick (overdue ratio grows) | old data; on a miss, `status: 'throttled'` |
+| Past this tick's capacity | untouched, named in `deferred`, most overdue next tick | unaffected: a read never waits on a tick |
 | Persistent failures | backoff converges at `every`, last-known-good kept forever | old data + `lastError` visible |

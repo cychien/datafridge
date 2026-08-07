@@ -122,19 +122,21 @@ runDue(now):
 1. Collect candidates   nextRunAt <= now (no record = first run = due now)
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
-                        5m query's period but only 0.07 of a 60m query's)
+                        5m query's period but only 0.07 of a 60m query's),
+                        then keep the first `maxPerTick`; the rest stay due
 3. Take quota           one call against the source's ledger for the current
                         window, minus whatever `reserve` holds back for readers;
                         refused queries stay due and come back more overdue
 4. Claim lease          claim(name, version, now + timeout + margin);
-                        losing the claim means someone else is on it - skip
+                        losing the claim means someone else is on it - skip,
+                        and the quota it took goes back to the window
 5. Execute + write back concurrently (Promise.allSettled), each fetch wrapped
                         in an AbortSignal timeout
                         success: writeResult + nextRunAt = completion time + every,
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, throttled, failed }
+Returns RunReport { ran, skippedLeased, throttled, deferred, failed }
 ```
 
 關鍵決策：
@@ -171,4 +173,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Zombie 遲到寫回 | version 不符，寫入被拒 | 不受影響 |
 | 首輪尚未完成 | - | `null`（caller 應處理） |
 | Source 額度用完 | 保持到期，下個 tick 優先（過期比例升高） | 舊資料；miss 時為 `status: 'throttled'` |
+| 超出這個 tick 的容量 | 原封不動，名字放進 `deferred`，下個 tick 最過期 | 不受影響：讀取從不等待 tick |
 | 連續失敗 | backoff 收斂在 `every`，永久保留 last-known-good | 舊資料 + 可見的 `lastError` |

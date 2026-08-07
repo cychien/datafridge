@@ -228,6 +228,7 @@ And the schedule plane has to be able to list its rows, since an entry nothing d
 | Executor death | Reclaim after lease expiry | Return the current envelope immediately |
 | Late zombie write | Reject on version mismatch | Remain unchanged |
 | Per-source quota exhausted | Keep due for a later tick, more overdue | Return the current envelope; on a miss, `status: 'throttled'` |
+| Past this tick's capacity (`maxPerTick`) | Leave the row untouched and name it in `RunReport.deferred`; the alarm re-arms on what is still due | Unaffected: a read never waits on a tick |
 | No successful refresh yet | Continue scheduled attempts | Return `null` |
 | Alarm-level error | Schedule the next alarm in `finally` | Existing D1 envelopes remain readable |
 
@@ -246,7 +247,7 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 
 D1 is single-region, so readers at remote PoPs can incur cross-region latency. Result-plane replicas are outside the shipped scope.
 
-One `FridgeDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which a registry of a few dozen queries is nowhere near.
+One `FridgeDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit. A declared registry of a few dozen queries is nowhere near it, and a `retain` base - whose entry count is open-ended by design - does not get there either, because a tick loads and takes on at most [`maxPerTick`](./rate-limiting.md#the-capacity-maxpertick) entries and re-arms the alarm on what is left over.
 
 ## Subpath imports
 

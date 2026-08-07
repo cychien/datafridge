@@ -108,7 +108,63 @@ describe('a read that runs out of quota', () => {
   })
 })
 
+describe('a dispatch that never reaches upstream', () => {
+  it('hands its quota slot back when it loses the claim', async () => {
+    const calls: Record<string, number> = {}
+    const { store, fridge } = makeHarness([counted('q', calls)], {
+      sources: { posthog: { limit: { requests: 1, per: '1m' } } },
+    })
+    // Somebody else holds the lease, so this tick claims nothing, calls nothing,
+    // and must cost the window nothing.
+    await store.claim('q', 0, 100_000, 0)
+
+    expect((await fridge.runDue()).skippedLeased).toEqual(['q'])
+    expect(calls).toEqual({})
+    expect(await store.takeQuota('posthog', 1, MINUTE, 0)).toBe(true)
+  })
+
+  it('keeps the slot spent when the call did happen and only the write-back lost', async () => {
+    const calls: Record<string, number> = {}
+    const { store, fridge } = makeHarness([counted('q', calls)], {
+      sources: { posthog: { limit: { requests: 1, per: '1m' } } },
+    })
+    const report = await fridge.runDue()
+
+    expect(report.ran).toEqual(['q'])
+    expect(calls).toEqual({ q: 1 })
+    expect(await store.takeQuota('posthog', 1, MINUTE, 0)).toBe(false)
+  })
+})
+
 describe('maxConcurrent', () => {
+  it('does not count a call waiting out a window against the in-flight budget', async () => {
+    const calls: Record<string, number> = {}
+    const cold: QueryDef = { ...counted('cold', calls), timeout: '2m', lease: '5m' }
+    const { clock, fridge } = makeHarness(
+      [counted('spender', calls), cold, counted('other', calls)],
+      { sources: { posthog: { limit: { requests: 1, per: '1m' }, maxConcurrent: 1 } } },
+    )
+    expect((await fridge.runDue()).ran).toEqual(['spender'])
+
+    // This reader outlasts the window, so it sleeps until the window rolls.
+    const read = fridge.read<string>('cold')
+    await flushMicrotasks(200)
+
+    // The sleeper is not a call in flight, so the one slot is free and the tick
+    // gets its answer now instead of in fifty-nine seconds.
+    let settled = false
+    const run = fridge.runDue().then((report) => {
+      settled = true
+      return report
+    })
+    await flushMicrotasks(200)
+    expect(settled).toBe(true)
+    expect((await run).throttled.toSorted()).toEqual(['cold', 'other'])
+
+    await clock.advance(MINUTE)
+    expect(stored(await read)).toMatchObject({ data: 'cold' })
+  })
+
   it('smooths a burst without reducing how much gets done', async () => {
     const gates = { a: deferred<string>(), b: deferred<string>(), c: deferred<string>() }
     let inFlight = 0

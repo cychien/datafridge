@@ -24,6 +24,8 @@ function tracing(inner: Store, log: string[]): Store {
       note('evictIdleResults', prefix, () => inner.evictIdleResults(prefix, before)),
     takeQuota: (source, limit, windowMs, now) =>
       note('takeQuota', source, () => inner.takeQuota(source, limit, windowMs, now)),
+    releaseQuota: (source, windowMs, takenAt) =>
+      note('releaseQuota', source, () => inner.releaseQuota(source, windowMs, takenAt)),
     listDue: (now, limit) => note('listDue', '*', () => inner.listDue!(now, limit)),
   }
 }

@@ -143,6 +143,15 @@ function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
       return true
     },
 
+    async releaseQuota(source, windowMs, takenAt) {
+      sql.exec(
+        'UPDATE datafridge_quota SET used = used - 1 ' +
+          'WHERE source = ? AND window_start = ? AND used > 0',
+        source,
+        Math.floor(takenAt / windowMs) * windowMs,
+      )
+    },
+
     async listDue(now, limit) {
       return sql
         .exec<ScheduleRecord>(
@@ -158,11 +167,12 @@ function sqliteSchedulePlane(sql: SqlStorage): SchedulePlane {
 }
 
 function registrySignature(queries: Queries): string {
-  const names = (entries: Array<[string, number]>) =>
+  const names = (entries: Array<readonly [string, ...number[]]>) =>
     entries.sort((a, b) => a[0].localeCompare(b[0]))
   return JSON.stringify([
-    names(queries.all.map((q) => [q.name, q.everyMs])),
-    names(queries.dynamic.map((d) => [d.baseName, d.everyMs])),
+    names(queries.all.map((q) => [q.name, q.everyMs] as const)),
+    names(queries.dynamic.map((d) => [d.baseName, d.everyMs] as const)),
+    names(queries.onDemand.map((e) => [e.baseName, e.everyMs, e.retainMs] as const)),
   ])
 }
 
@@ -287,6 +297,18 @@ export abstract class FridgeDO<Env = unknown> extends DurableObject<Env> {
         if (!covered.has(entry.baseName) && !byName.has(entry.baseName)) {
           consider(now + entry.everyMs)
         }
+      }
+    }
+
+    if (queries.onDemand.length > 0) {
+      // Nothing declares an on-demand entry, so its row is the only thing that
+      // knows it exists - and the only thing that can wake the object to refresh
+      // it or to evict it once it goes cold. A base with no rows yet is not
+      // work: it starts existing when somebody reads it.
+      const bases = new Set(queries.onDemand.map((entry) => entry.baseName))
+      for (const row of rows) {
+        const base = variantBaseOf(row.name)
+        if (base !== undefined && bases.has(base)) consider(row.next_run_at)
       }
     }
 

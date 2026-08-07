@@ -166,6 +166,15 @@ export interface SchedulePlane {
    * back part of a window from lower-priority work; the ledger keeps usage only.
    */
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
+  /**
+   * Hands back a slot `takeQuota` granted for a call that never happened, so a
+   * ceiling stays exact accounting rather than a count of intentions. `takenAt`
+   * is the `now` that take was made with, and the credit applies only while the
+   * ledger is still on that call's window: a window that has since rolled keeps
+   * its own count, because usage cannot be moved between windows. Never drives
+   * usage below zero.
+   */
+  releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: StoreCapabilities
 }
@@ -200,6 +209,12 @@ export interface RunReport {
   skippedLeased: string[]
   /** Out of source quota this window; still due, and more overdue next tick. */
   throttled: string[]
+  /**
+   * Due, but past what one tick will take on (`maxPerTick`). Nothing upstream
+   * was asked and nothing was written, so these come back at the head of the
+   * next tick. Capacity, not rate: `throttled` is the source ceiling.
+   */
+  deferred: string[]
   failed: Array<{ name: string; message: string }>
 }
 

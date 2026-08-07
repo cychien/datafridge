@@ -121,7 +121,9 @@ const value = await fridge.read<Result>('analytics-7d')
 - `driver`：`{ serialized, defer(promise), schedule? }`
 - `store`：一個同時持有 result envelopes 與 schedule rows 的 store
 
-選用欄位為 `sources`、`clock` 與 `random`。`clock` 和 `random` 供 deterministic adapter 與 test 使用。規則見 [排程那一半從哪來](./writing-adapters.md#排程那一半從哪來建構時就決定)。
+選用欄位為 `sources`、`maxPerTick`、`clock` 與 `random`。`clock` 和 `random` 供 deterministic adapter 與 test 使用。規則見 [排程那一半從哪來](./writing-adapters.md#排程那一半從哪來建構時就決定)。
+
+`maxPerTick` 是單一 tick 會載入並承接多少 entry，預設 500，必須是正整數。它是容量，不是速率：source 的 `limit` 說的是上游能被打多重，這個說的是單次 invocation 願意做多少事 - 一旦 `retain` 讓 entry 數量變得開放無界，這件事就重要了。裝不下的東西會被原封不動留著，出現在 `RunReport.deferred`，並在下一個 tick 成為最過期的那一批 - 所以上限只會把工作攤開，不會餓死它。
 
 Missing 或 malformed driver、缺少任一半的 store、非法 source policy，以及在 non-serialized driver 下無法原子 claim 的 store，都會在建構時被拒絕。
 
@@ -134,9 +136,12 @@ interface RunReport {
   ran: string[]
   skippedLeased: string[]
   throttled: string[]
+  deferred: string[]
   failed: Array<{ name: string; message: string }>
 }
 ```
+
+`throttled` 是 source 的天花板，`deferred` 是這個 tick 的容量；兩者都讓 row 維持原樣，所以兩者都只是更過期地回來，不會遺失。
 
 成功 refresh 會從完成時間排定下一次執行。失敗會保留舊 envelope，並以有 jitter 的 exponential backoff 重試，上限為 `every`。
 

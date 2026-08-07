@@ -22,6 +22,8 @@ createFridge({
 
 `limit` is exact accounting, not a heuristic. The store keeps one ledger row per source - the window it is counting and how many calls that window has taken - and every call increments it under the same version-checked CAS that claims a lease. Two Workers, a cron trigger and a Durable Object all pointing at one D1 share one count.
 
+It counts calls, not intentions. Quota is taken before a lease is claimed, so that a call with nowhere to go never takes a lease it would hand straight back - and a dispatch that then loses the claim to a peer credits its slot back to the window it took it from, because that call never happened.
+
 Windows are **fixed and aligned to the epoch**: with `per: '1m'`, the window containing 12:34:56.789 runs from 12:34:00.000 and opens at zero. A sliding window would be more precise at the boundary, at the cost of storing a timestamp per call; a fixed window plus `reserve` and `maxConcurrent` covers the same ground with one row.
 
 A scheduled refresh that cannot get a call **stays due**. It is refused before it claims a lease, so nothing is written, and the next tick sees it as it was - only more overdue. Because priority is the overdue *ratio* `(now - nextRunAt) / every`, a query squeezed out climbs every tick it waits, and nothing starves. Those names come back in `RunReport.throttled`.
@@ -47,6 +49,14 @@ Before giving up it waits, inside its own `timeout`, for the window to roll - so
 ## The smoothing: `maxConcurrent`
 
 `maxConcurrent` bounds how many calls to a source are in flight from one instance at a time. It bounds concurrency, not volume - a hundred due queries behind `maxConcurrent: 4` still make a hundred calls, four at a time. Use it when a vendor tolerates the rate but not the burst, and keep in mind that a tick then lasts as long as its slowest chain of four (see the [Cloudflare invocation limits](./cloudflare.md#limits-and-ceilings)).
+
+In flight means in flight: a reader waiting out a window hands its slot back for the duration, so a call that is doing nothing cannot hold the budget that exists to bound calls that are.
+
+## The capacity: `maxPerTick`
+
+`maxPerTick` is not a rate limit and does not belong to a source. It is how many entries one `runDue` loads and takes on - a bound on the invocation, not on upstream - and it matters because [`retain`](./api.md#on-demand-entries) makes the entry count open-ended in a way a declared registry never was. It defaults to 500.
+
+What does not fit is not touched: no lease, no store write, nothing asked of upstream. Those names come back in `RunReport.deferred`, and because priority is the overdue ratio they are the most overdue thing the next tick sees. A `FridgeDO` re-arms its alarm from the rows that are still due, so a backlog drains at the one-second alarm floor rather than in one invocation that risks the wall clock.
 
 ## Jitter
 

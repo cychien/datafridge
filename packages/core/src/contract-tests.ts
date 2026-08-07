@@ -29,6 +29,8 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  * - when capabilities.listDue: listDue returns rows with nextRunAt <= now, honoring limit
  * - takeQuota counts per source in fixed epoch-aligned windows and never exceeds the limit
  *   it was passed, which varies per call and is therefore never stored
+ * - releaseQuota credits back a slot taken in the window the ledger is still on, never
+ *   one it has moved past, and never drives usage below zero
  */
 export function storeContractSuite(label: string, makeStore: StoreFactory): void {
   describe(`store contract: ${label}`, () => {
@@ -94,7 +96,7 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         expect(await store.readResult('missing')).toBeNull()
       })
 
-      it('does not preserve last_read_at across a rewrite of the same entry', async () => {
+      it('preserves last_read_at across a rewrite of the same entry', async () => {
         await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 1_000 }))
         await store.touchResult('@df/v1/q/aaa', 9_000)
         // A refresh is not a read: the stamp stays where the reader put it.
@@ -295,6 +297,31 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
           Array.from({ length: 16 }, () => store.takeQuota('posthog', 5, WINDOW, 120_000)),
         )
         expect(outcomes.filter(Boolean)).toHaveLength(5)
+      })
+
+      it('releaseQuota hands a slot back to the window it was taken in', async () => {
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_001)).toBe(false)
+        await store.releaseQuota('posthog', WINDOW, 120_000)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_002)).toBe(true)
+      })
+
+      it('releaseQuota leaves a window that has already rolled alone', async () => {
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 180_000)).toBe(true)
+        // The slot belongs to the window it was taken in; the new one keeps its
+        // own count rather than being credited with someone else's.
+        await store.releaseQuota('posthog', WINDOW, 120_000)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 180_001)).toBe(false)
+      })
+
+      it('releaseQuota never drives usage below zero, and tolerates an unknown source', async () => {
+        await expect(store.releaseQuota('never-used', WINDOW, 120_000)).resolves.not.toThrow()
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+        await store.releaseQuota('posthog', WINDOW, 120_000)
+        await store.releaseQuota('posthog', WINDOW, 120_000)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(true)
+        expect(await store.takeQuota('posthog', 1, WINDOW, 120_000)).toBe(false)
       })
     })
   })

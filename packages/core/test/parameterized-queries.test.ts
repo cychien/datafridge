@@ -43,6 +43,7 @@ describe('parameterized queries', () => {
       ran: keys,
       skippedLeased: [],
       throttled: [],
+      deferred: [],
       failed: [],
     })
     expect(seen).toEqual(variants)

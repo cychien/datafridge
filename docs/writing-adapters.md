@@ -17,9 +17,6 @@ interface Store {
   // `retain`: record that something was read, and drop what has gone cold
   touchResult(name: string, at: number): Promise<void>
   evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
-  // `retain`: record that something was read, and drop what has gone cold
-  touchResult(name: string, at: number): Promise<void>
-  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 
   // schedule plane - coordination bookkeeping
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -30,6 +27,8 @@ interface Store {
   // source rate limiting: count one call in the fixed window containing `now`,
   // and answer whether it fit under `limit`
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
+  // hand a counted call back when it never happened, to the window it was taken in
+  releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
   // optional capability: SQL backends can fetch all due rows in one query;
   // without it, core reads row by row
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
@@ -38,8 +37,6 @@ interface Store {
 ```
 
 A store holds both halves. Applications only ever meet this one interface.
-
-`touchResult` is reached from the read path, so like the two reads it must never apply schema: with nothing stored there is nothing to record. `evictIdleResults` deletes results and names them, and deliberately does not touch schedule rows - the schedule half may live in a different object entirely, so removing those is the caller's job. A fresh `writeResult` counts as read at its `fetchedAt`, or an entry created by a cold read would be evictable before anybody could record reading it; a later `writeResult` leaves the stamp where the reader put it, because a refresh is not a read.
 
 `touchResult` is reached from the read path, so like the two reads it must never apply schema: with nothing stored there is nothing to record. `evictIdleResults` deletes results and names them, and deliberately does not touch schedule rows - the schedule half may live in a different object entirely, so removing those is the caller's job. A fresh `writeResult` counts as read at its `fetchedAt`, or an entry created by a cold read would be evictable before anybody could record reading it; a later `writeResult` leaves the stamp where the reader put it, because a refresh is not a read.
 
@@ -63,6 +60,8 @@ The two halves still have different consistency needs, and one shipped case prov
 A backend with no conditional-write primitive cannot host the schedule half at all, and one that is only eventually consistent cannot host it correctly. Such a backend declares `atomicClaim: false`, which construction accepts only under a serialized driver.
 
 `takeQuota` uses the same primitive. Windows are fixed and aligned to the epoch - the one containing `now` starts at `floor(now / windowMs) * windowMs` and opens with a usage of zero - and a window is never rewound, so an executor whose clock lags cannot reopen one its peers have closed. `limit` arrives per call and is never stored: callers pass a lower one for work nobody is waiting on. One row per source is enough, so there is nothing to garbage-collect. Putting it in the store is what makes a shared rate limit free: two services pointing at one backend share one ledger, with no separate limiter to run.
+
+`releaseQuota` is its counterpart, and it is what keeps a ceiling a count of calls rather than of intentions: quota is taken before a lease is claimed, so a dispatch that loses the claim credits its slot back. It is a guarded decrement, not a CAS loop - only while `window_start` still matches the window `takenAt` fell in, and only while usage is above zero. Usage cannot move between windows, so a window that has already rolled is left alone; that leaves the previous one over-counting by one, which is the safe direction for a ceiling.
 
 ## Where the schedule half comes from (decided at config time)
 

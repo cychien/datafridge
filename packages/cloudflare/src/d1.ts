@@ -140,22 +140,19 @@ export function d1(db: D1Database): Store {
       }
     },
 
+    // One statement, so nothing can be read between deciding an entry is cold
+    // and deleting it, and the round trips do not grow with a `retain` base's
+    // entry count.
     async evictIdleResults(keyPrefix, idleBefore) {
       return withSchema(db, async () => {
         const { results } = await db
           .prepare(
-            "SELECT name FROM datafridge_results WHERE name LIKE ? ESCAPE '\\' AND last_read_at < ?",
+            "DELETE FROM datafridge_results WHERE name LIKE ? ESCAPE '\\' " +
+              'AND last_read_at < ? RETURNING name',
           )
           .bind(`${escapeLike(keyPrefix)}%`, idleBefore)
-          .run<{ name: string }>()
-        if (results.length === 0) return []
-        const names = results.map((record) => record.name)
-        await db.batch(
-          names.map((name) =>
-            db.prepare('DELETE FROM datafridge_results WHERE name = ?').bind(name),
-          ),
-        )
-        return names
+          .all<{ name: string }>()
+        return results.map((record) => record.name)
       })
     },
 
@@ -265,6 +262,21 @@ export function d1(db: D1Database): Store {
           if (taken.meta.changes === 1) return true
         }
         return false
+      })
+    },
+
+    // A relative decrement guarded by the window it belongs to, so it needs no
+    // CAS loop: a peer taking a slot at the same moment cannot make this credit
+    // the wrong one, and a window that has rolled matches nothing.
+    async releaseQuota(source, windowMs, takenAt) {
+      return withSchema(db, async () => {
+        await db
+          .prepare(
+            'UPDATE datafridge_quota SET used = used - 1, version = version + 1 ' +
+              'WHERE source = ? AND window_start = ? AND used > 0',
+          )
+          .bind(source, Math.floor(takenAt / windowMs) * windowMs)
+          .run()
       })
     },
 

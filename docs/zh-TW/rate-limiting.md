@@ -22,6 +22,8 @@ createFridge({
 
 `limit` 是精確記帳，不是啟發式。Store 為每個 source 保留一列 ledger - 它正在計數的窗口，以及那個窗口已經用掉幾次 - 每次呼叫都以與 claim lease 同一套 version-checked CAS 遞增它。兩個 Worker、一個 cron trigger 和一個 Durable Object 只要指向同一個 D1，就共用同一份計數。
 
+它算的是呼叫，不是意圖。額度在 claim lease 之前就先扣，所以一個無處可去的呼叫不會去拿一個馬上要還的 lease - 而之後在 claim 上輸給同儕的 dispatch，會把那一格還回它當初扣的那個窗口，因為那次呼叫根本沒發生。
+
 窗口是**固定的、對齊 epoch**：`per: '1m'` 時，包含 12:34:56.789 的窗口從 12:34:00.000 開始，並從零開起。滑動窗在邊界上更精確，代價是每次呼叫都要存一個時間戳；固定窗加上 `reserve` 與 `maxConcurrent` 用一列就涵蓋同樣的範圍。
 
 拿不到呼叫額度的排程刷新會**維持到期**。它在 claim lease 之前就被擋下，所以什麼都沒寫，下個 tick 看到的還是原來那筆 - 只是更過期。因為優先級是過期**比例** `(now - nextRunAt) / every`，被擠掉的 query 每等一個 tick 就升權，不會有東西餓死。這些名字會出現在 `RunReport.throttled`。
@@ -47,6 +49,14 @@ if (result?.status === 'throttled') {
 ## 平滑：`maxConcurrent`
 
 `maxConcurrent` 限制單一 instance 對某個 source 同時在途的呼叫數。它限制的是併發，不是總量 - 一百個到期的 query 配上 `maxConcurrent: 4` 仍然會打一百次，只是四個四個來。供應商能接受這個速率但不能接受突發時用它，並且要記得這樣一來一個 tick 會拖到它最慢的那條四人鏈那麼久（見 [Cloudflare invocation 上限](./cloudflare.md#上限與天花板)）。
+
+在途就是在途：等窗口輪轉的讀者會在等待期間把自己的名額還回去，所以什麼都沒在做的呼叫，不會佔住那個專門用來限制「真的在做事的呼叫」的預算。
+
+## 容量：`maxPerTick`
+
+`maxPerTick` 不是 rate limit，也不屬於任何 source。它是單一 `runDue` 會載入並承接多少 entry - 限制的是 invocation，不是上游 - 而它之所以重要，是因為 [`retain`](./api.md#on-demand-entries) 讓 entry 數量變成宣告式 registry 從來不會有的開放無界。預設 500。
+
+裝不下的東西不會被碰：沒有 lease、沒有 store 寫入、沒有向上游要任何東西。那些名字會回到 `RunReport.deferred`，而因為優先級是過期比例，它們就是下一個 tick 看到最過期的那一批。`FridgeDO` 會依照仍然到期的 row 重設 alarm，所以積壓會以一秒的 alarm 下限逐步排掉，而不是擠在一次可能撞上 wall clock 的 invocation 裡。
 
 ## Jitter
 

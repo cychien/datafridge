@@ -40,6 +40,9 @@ export interface Dispatcher {
   run(task: FetchTask, now: number): Promise<DispatchOutcome>
 }
 
+/** Runs a wait with this call's concurrency slot handed back for the duration. */
+type Unslotted = <T>(wait: () => Promise<T>) => Promise<T>
+
 /** Instantaneous smoothing inside this instance; it bounds concurrency, not volume. */
 function makeSemaphores(sources: ResolvedSources) {
   const inFlight = new Map<string, number>()
@@ -98,15 +101,36 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     task: FetchTask,
     policy: ResolvedSource,
     source: string,
-  ): Promise<{ ok: true } | { ok: false; retryAt: number }> => {
+    unslotted: Unslotted,
+  ): Promise<{ ok: true; takenAt: number } | { ok: false; retryAt: number }> => {
     const { windowMs } = policy
     const limit = task.priority === 'demand' ? policy.demandLimit : policy.scheduledLimit
     for (;;) {
       const now = clock.now()
-      if (await schedule.takeQuota(source, limit, windowMs, now)) return { ok: true }
+      if (await schedule.takeQuota(source, limit, windowMs, now)) return { ok: true, takenAt: now }
       const retryAt = windowStartOf(now, windowMs) + windowMs
       if (task.priority !== 'demand' || retryAt >= task.deadline) return { ok: false, retryAt }
-      await sleepUntil(retryAt)
+      // Waiting out a window is not a call in flight, so the concurrency slot
+      // goes back for the duration: `maxConcurrent` bounds what upstream is
+      // actually carrying, never what is queued behind a ceiling.
+      await unslotted(() => sleepUntil(retryAt))
+    }
+  }
+
+  /**
+   * A slot taken for a call that never happened. Refusing to credit a window
+   * that has already rolled leaves this one over-counting by one, which is the
+   * safe direction for a ceiling, so a refund that cannot land is not an error.
+   */
+  const giveQuotaBack = async (
+    source: string,
+    windowMs: number,
+    takenAt: number,
+  ): Promise<void> => {
+    try {
+      await schedule.releaseQuota(source, windowMs, takenAt)
+    } catch {
+      // Over-counting one call is the safe direction, and the window rolls.
     }
   }
 
@@ -189,19 +213,31 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     return { status: 'failed', message }
   }
 
-  const dispatch = async (task: FetchTask, now: number): Promise<DispatchOutcome> => {
+  const dispatch = async (
+    task: FetchTask,
+    now: number,
+    unslotted: Unslotted,
+  ): Promise<DispatchOutcome> => {
     const { query, row } = task
     const { name, source } = query
     const policy = sources.get(source)
     // Quota is taken after the concurrency slot so a queued call is not holding
     // one, and before the claim so a call that has no quota never takes a lease
     // it would have to hand straight back.
-    if (policy !== undefined && policy.windowMs !== Infinity) {
-      const taken = await takeQuota(task, policy, source)
+    const metered = policy !== undefined && policy.windowMs !== Infinity
+    let takenAt = 0
+    if (metered) {
+      const taken = await takeQuota(task, policy, source, unslotted)
       if (!taken.ok) return { status: 'throttled', retryAt: taken.retryAt }
+      takenAt = taken.takenAt
     }
     const claimed = await schedule.claim(name, row.version, now + query.leaseMs, now)
-    if (!claimed) return { status: 'leased' }
+    if (!claimed) {
+      // Someone else is doing this work; nothing leaves for upstream here, so
+      // the slot this call was counted for goes back to the window.
+      if (metered) await giveQuotaBack(source, policy.windowMs, takenAt)
+      return { status: 'leased' }
+    }
     const token = row.version + 1
     try {
       const data = await withDeadline(clock, query.timeoutMs, `query '${name}'`, (signal) =>
@@ -217,10 +253,21 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
     async run(task: FetchTask, now: number): Promise<DispatchOutcome> {
       const { source } = task.query
       await semaphores.acquire(source)
-      try {
-        return await dispatch(task, now)
-      } finally {
+      let held = true
+      const unslotted = async <T>(wait: () => Promise<T>): Promise<T> => {
+        held = false
         semaphores.release(source)
+        try {
+          return await wait()
+        } finally {
+          await semaphores.acquire(source)
+          held = true
+        }
+      }
+      try {
+        return await dispatch(task, now, unslotted)
+      } finally {
+        if (held) semaphores.release(source)
       }
     },
   }

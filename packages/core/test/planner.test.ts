@@ -20,9 +20,9 @@ describe('planTick', () => {
       ['future', row('future', 2_000)[1]],
       ['new', null],
     ])
-    const plan = planTick(queries.all, rows, 1_000)
-    expect(plan.map((c) => c.query.name)).toEqual(['new'])
-    expect(plan[0]!.row).toEqual({
+    const plan = planTick(queries.all, rows, 1_000, 10)
+    expect(plan.toRun.map((c) => c.query.name)).toEqual(['new'])
+    expect(plan.toRun[0]!.row).toEqual({
       name: 'new',
       nextRunAt: 1_000,
       failCount: 0,
@@ -38,8 +38,8 @@ describe('planTick', () => {
     ])
     const now = 1_000_000
     const rows = new Map([row('hourly', now - 300_000), row('fast', now - 240_000)])
-    const plan = planTick(queries.all, rows, now)
-    expect(plan.map((c) => c.query.name)).toEqual(['fast', 'hourly'])
+    const plan = planTick(queries.all, rows, now, 10)
+    expect(plan.toRun.map((c) => c.query.name)).toEqual(['fast', 'hourly'])
   })
 
   it('keeps registration order on ties', () => {
@@ -48,7 +48,24 @@ describe('planTick', () => {
       { name: 'b', every: '5m', fetch },
     ])
     const rows = new Map([row('a', 0), row('b', 0)])
-    const plan = planTick(queries.all, rows, 0)
-    expect(plan.map((c) => c.query.name)).toEqual(['a', 'b'])
+    const plan = planTick(queries.all, rows, 0, 10)
+    expect(plan.toRun.map((c) => c.query.name)).toEqual(['a', 'b'])
+  })
+
+  it('takes the most overdue up to the limit and defers the rest untouched', () => {
+    const queries = defineQueries([
+      { name: 'hourly', every: '60m', fetch },
+      { name: 'fast', every: '5m', fetch },
+      { name: 'slow', every: '24h', fetch },
+    ])
+    const now = 1_000_000
+    const rows = new Map([
+      row('hourly', now - 300_000),
+      row('fast', now - 240_000),
+      row('slow', now - 300_000),
+    ])
+    const plan = planTick(queries.all, rows, now, 1)
+    expect(plan.toRun.map((c) => c.query.name)).toEqual(['fast'])
+    expect(plan.deferred).toEqual(['hourly', 'slow'])
   })
 })

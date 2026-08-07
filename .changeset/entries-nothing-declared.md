@@ -21,4 +21,6 @@ What keeps an entry alive is a read, never a refresh; polling cannot vote for it
 
 Two contract changes carry it. `ScheduleRow` gains `params`, because a key is a hash and an entry nothing declared cannot be rebuilt from its name alone; the row is now enough to run the work by itself. `Store` gains `touchResult` and `evictIdleResults`, and `d1()` grows a `last_read_at` column - applied by the store as always, so there is still no migration to run.
 
+On Cloudflare the alarm chain follows suit: `FridgeDO` derives its next alarm from on-demand rows exactly as it does from dynamic variant rows, and its registry signature covers on-demand bases, so a deploy that changes only a `retain` base re-ignites. Their timeouts are checked against the invocation wall clock at construction too.
+
 `createReader` takes `defer` and uses the store's `touchResult` when it has one. This matters: on Cloudflare the read path is a reader, so a reader that cannot record reads is a reader whose on-demand entries all go cold. `retain` must be longer than `every`, and the schedule plane must be able to list its rows; both are checked at construction.
