@@ -1,8 +1,8 @@
-# Cloudflare 設定與營運
+# Cloudflare 設定
 
 [English](../cloudflare.md) | 繁體中文
 
-這份文件是 Cloudflare 各 module 的設定與營運指南：`FridgeDO` 與 `ensureStarted` 負責 alarm 排程、`cronDriver` 與 `cronFridge` 負責 Cron Triggers、`d1` 負責儲存。每個 module 各自填哪個位置，見 [README 的 module 清單](../../README.zh-TW.md#接上-scheduler-與-store)。以下每一種組法都把 result envelope 存在 D1，並遵守[六點語意契約](./concepts.md#語意契約)。
+這份文件是 Cloudflare 各 module 的設定指南：`FridgeDO` 與 `ensureStarted` 負責 alarm 排程、`cronDriver` 與 `cronFridge` 負責 Cron Triggers、`d1` 負責儲存。最短的完整串接方式見 README 的 [Quick start](../../README.zh-TW.md#quick-start)。以下每一種組法都把 result envelope 存在 D1，並遵守 API reference 的[行為保證](./api.md#行為保證)。
 
 ## 安裝與初始化
 
@@ -188,7 +188,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 | 平台元件 | Durable Object + D1 | 只有 D1 |
 | 何時選它 | 你要精確的到期時間與動態 backoff | 你不想多管一個 Durable Object |
 
-這兩組是 Cloudflare 上已完整出貨的組法，不是唯一合法的組法：只要 schedule plane 解析得出來，任何組合都成立。Cron Triggers 單獨搭一個只有 result 的 store 不成立 - 它沒有 schedule plane，建構時會直接拒絕，而不是默默重複 fetch。
+`@datafridge/cloudflare` 提供這兩種 scheduler 與 D1 Store；兩種 scheduler 也能接上其他完整的 Store。Cron Triggers 搭配 results-only store 不成立，因為它沒有 schedule plane；這種組合會在建構時直接被拒絕，而不是默默重複 fetch。
 
 ## 建構時驗證
 
@@ -248,9 +248,9 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 7. 使用已授權且受控的上游條件測試 failure handling。確認舊 envelope 保留，後續 report 顯示失敗與恢復，且 log 不含 payload。
 8. 監控 D1 row size。超過 2,000,000 bytes 的 envelope 會被拒絕，舊 envelope 保留。
 
-D1 是 single-region，remote PoP reader 可能產生跨區 latency。Result-plane replica 不在已發布範圍內。
+`d1()` 使用標準 D1 binding，不使用 Sessions API，因此查詢會送往 primary database，即使 D1 已啟用 read replication 也是如此。Remote PoP 可能因此產生跨區 latency。
 
-單一 `FridgeDO` instance 推動整個 registry 的排程，而讀取從不經過它。依 source 分片 scheduler 是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限 - 而[單次 invocation 願意承接多少](./rate-limiting.md#容量單次-invocation-願意承接多少)就是為了防止這件事：一個 tick 只讀一頁有界的 row、絕不開始一個 timeout 會超出 invocation 的呼叫，並在留下工作時要求立刻被再叫醒一次。
+單一 `FridgeDO` instance 推動整個 registry 的排程，而讀取從不經過它。每個 tick 只讀一頁有界的 rows，不會開始超出 invocation 剩餘時間的 fetch；留下工作時會立即安排下一次 alarm。
 
 ## Subpath imports
 

@@ -1,8 +1,8 @@
-# Cloudflare setup and operations
+# Cloudflare setup
 
 English | [繁體中文](./zh-TW/cloudflare.md)
 
-This page is the setup and operations home for the Cloudflare modules: `FridgeDO` and `ensureStarted` for alarm-driven scheduling, `cronDriver` and `cronFridge` for Cron Triggers, and `d1` for storage. Which position each module fills is in the [README's module list](../README.md#wiring-a-scheduler-and-a-store). Every arrangement below stores result envelopes in D1 and preserves the [six-point semantic contract](./concepts.md#the-semantic-contract).
+This page covers setup for the Cloudflare modules: `FridgeDO` and `ensureStarted` for alarm-driven scheduling, `cronDriver` and `cronFridge` for Cron Triggers, and `d1` for storage. See the README [Quick start](../README.md#quick-start) for the shortest complete integration. Every arrangement below stores result envelopes in D1.
 
 ## Install and initialize
 
@@ -188,7 +188,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 | Platform components | Durable Object + D1 | D1 only |
 | Pick it when | You want exact due times and dynamic backoff | You would rather not run a Durable Object |
 
-Those two are the arrangements that ship complete on Cloudflare, not the only legal ones: any composition works as long as the schedule plane resolves. Cron Triggers with a result-only store does not - it has no schedule plane, and construction rejects the configuration rather than quietly double-fetching.
+`@datafridge/cloudflare` provides these two schedulers and the D1 Store. Either scheduler can also use another full Store. A Cron Trigger cannot use a results-only store because it has no schedule plane; construction rejects that combination instead of silently fetching twice.
 
 ## Construction-time validation
 
@@ -248,9 +248,9 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 7. Test failure handling with an authorized, controlled upstream condition. Verify the old envelope remains and subsequent reports show failure and recovery without logging payloads.
 8. Monitor D1 row size. Envelopes above 2,000,000 bytes are rejected and the previous envelope remains.
 
-D1 is single-region, so readers at remote PoPs can incur cross-region latency. Result-plane replicas are outside the shipped scope.
+`d1()` uses the standard D1 binding without the Sessions API, so queries go to the primary database even when D1 read replication is enabled. Remote PoPs may therefore incur cross-region latency.
 
-One `FridgeDO` instance drives the schedule for the entire registry, and reads never go through it. Sharding the scheduler by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which [what one invocation will take on](./rate-limiting.md#the-capacity-what-one-invocation-will-take-on) is designed to prevent: a tick reads one bounded page, never begins a call whose timeout would outlast the invocation, and asks to be woken again immediately when it left work behind.
+One `FridgeDO` instance drives the schedule for the entire registry, and reads never go through it. Each tick reads one bounded page of rows, does not start a fetch that would exceed the invocation's remaining time, and schedules the next alarm immediately when work remains.
 
 ## Subpath imports
 

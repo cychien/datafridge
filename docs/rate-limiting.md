@@ -97,4 +97,4 @@ Resolving a dynamic variant list is not a call against the source. It is not a s
 
 ## Sharing a limit across services
 
-`takeQuota` is part of the store contract, so a source's ledger lives wherever the store does. Two services that point at the same D1 - or, later, the same Redis - share one count with no further coordination. That is the whole mechanism: there is no separate rate-limiter to run.
+`takeQuota` is part of the store contract, so a source's ledger lives wherever the store does. Two services that point at the same Store backend share one count with no further coordination and no separate rate limiter to run.
