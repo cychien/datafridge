@@ -1,14 +1,16 @@
 import { backoffMs, MAX_JITTER_RATIO } from './backoff.js'
 import type { Clock } from './clock.js'
-import { defineQueries, Queries, resolveMemberBy, resolveVariantsWithin } from './define-queries.js'
+import { defineQueries, Queries, resolveVariantsWithin } from './define-queries.js'
 import type { DynamicVariants } from './define-queries.js'
 import { createDispatcher } from './dispatcher.js'
 import type { DispatchOutcome } from './dispatcher.js'
 import { ConfigError } from './errors.js'
-import { planTick, virtualRow } from './planner.js'
-import { queryKey, variantBaseOf, variantKeyPrefix } from './query-key.js'
-import { decodeRead, shapeRead, waitForEnvelope } from './reader.js'
+import { planTick } from './planner.js'
+import type { Candidate } from './planner.js'
+import { variantBaseOf } from './query-key.js'
+import { createReadPath } from './read-path.js'
 import { resolveSources } from './sources.js'
+import type { ResolvedSources } from './sources.js'
 import { systemClock, systemRandom } from './system-clock.js'
 import type {
   Driver,
@@ -25,13 +27,17 @@ import type {
 } from './types.js'
 
 /**
- * How many entries one tick loads and takes on. Capacity, not rate: a source's
- * `limit` says how hard upstream may be hit, this says how much work one
- * invocation is willing to be. Comfortably above any declared registry, and low
- * enough that an open-ended `retain` base cannot turn one tick into thousands
- * of store round trips.
+ * How many rows one tick reads, how many departed ones it removes, and how many
+ * calls it lets fly between two looks at a source's ceiling. These are
+ * implementation limits, not policy: what a tick actually takes on is decided by
+ * dueness, the source's remaining window and the invocation's remaining wall
+ * clock. They exist so that a single tick's cost has an upper bound no registry
+ * size can raise, and everything they leave behind is still due the moment the
+ * next tick starts.
  */
-const DEFAULT_MAX_PER_TICK = 500
+const SCHEDULE_PAGE = 512
+const RECONCILE_DELETES_PER_TICK = 64
+const DISPATCH_CHUNK = 32
 
 export interface FridgeConfig {
   queries: Queries | readonly QueryDefinition[]
@@ -40,8 +46,6 @@ export interface FridgeConfig {
   clock?: Clock
   sources?: Record<string, SourcePolicy>
   random?: () => number
-  /** Entries one tick may take on; the rest stay due. Defaults to 500. */
-  maxPerTick?: number
 }
 
 export interface Fridge {
@@ -59,9 +63,7 @@ export function createFridge(config: FridgeConfig): Fridge {
   const sources = resolveSources(config.sources)
   const { store, schedule } = resolveStores(config, driver)
   const random = config.random ?? systemRandom
-  const maxPerTick = validateMaxPerTick(config.maxPerTick)
   const dispatcher = createDispatcher({ store, schedule, clock, random, sources })
-  requireListDueForOnDemand(queries, schedule)
 
   interface EffectiveRegistry {
     list: readonly ResolvedQuery[]
@@ -77,6 +79,41 @@ export function createFridge(config: FridgeConfig): Fridge {
   )
 
   /**
+   * Every row this tick has already paid to read, so nothing reads one twice.
+   * Writes go through it too, which is what lets planning and the next-wake
+   * calculation work from what the tick did rather than asking storage again.
+   */
+  class Rows {
+    readonly #known = new Map<string, ScheduleRow | null>()
+
+    remember(name: string, row: ScheduleRow | null): void {
+      this.#known.set(name, row)
+    }
+
+    get(name: string): ScheduleRow | null | undefined {
+      return this.#known.get(name)
+    }
+
+    async read(name: string): Promise<ScheduleRow | null> {
+      const seen = this.#known.get(name)
+      if (seen !== undefined) return seen
+      const row = await schedule.readSchedule(name)
+      this.#known.set(name, row)
+      return row
+    }
+
+    async write(row: ScheduleRow): Promise<void> {
+      await schedule.writeSchedule(row)
+      this.#known.set(row.name, row)
+    }
+
+    async delete(name: string): Promise<void> {
+      await schedule.deleteSchedule(name)
+      this.#known.set(name, null)
+    }
+  }
+
+  /**
    * The tick's working set: every static query plus each dynamic definition's
    * variant list as of right now. A resolution failure removes nothing - the
    * base keeps whatever it already has, the failure lands in the report, and
@@ -88,28 +125,11 @@ export function createFridge(config: FridgeConfig): Fridge {
    * three, but they are expanded in registry order so which base is blamed for
    * a duplicate key does not depend on who answered first.
    */
-  const resolveEffective = async (
-    now: number,
-    rows: readonly ScheduleRow[],
-  ): Promise<EffectiveRegistry> => {
+  const resolveEffective = async (now: number, rows: Rows): Promise<EffectiveRegistry> => {
     const list: ResolvedQuery[] = [...queries.all]
     const byKey = new Map(queries.all.map((query) => [query.name, query]))
     const failures: Array<{ name: string; message: string }> = []
     const unresolvedBases = new Set<string>()
-
-    // On-demand entries are declared by nothing, so the rows are the registry:
-    // each one carries the params its key only hashes.
-    for (const row of rows) {
-      const base = variantBaseOf(row.name)
-      if (base === undefined || row.params === undefined || byKey.has(row.name)) continue
-      const onDemand = queries.onDemandFor(base)
-      if (onDemand === undefined) continue
-      const query = onDemand.instantiate(row.params)
-      // Params that do not hash back to their own key are not this entry's.
-      if (query.name !== row.name) continue
-      byKey.set(query.name, query)
-      list.push(query)
-    }
 
     const failBase = async (attempt: Attempt, message: string): Promise<void> => {
       const { dynamic, row } = attempt
@@ -119,7 +139,7 @@ export function createFridge(config: FridgeConfig): Fridge {
       // Stamped when the row is written, not when the tick began: resolution
       // may have spent the base's whole timeout getting here, and a backoff
       // written into the past is no backoff at all.
-      await schedule.writeSchedule({
+      await rows.write({
         name: dynamic.baseName,
         nextRunAt: clock.now() + backoffMs(failCount, dynamic.everyMs, random),
         failCount,
@@ -130,7 +150,7 @@ export function createFridge(config: FridgeConfig): Fridge {
 
     const attempts = await Promise.all(
       queries.dynamic.map(async (dynamic): Promise<Attempt> => {
-        const row = await schedule.readSchedule(dynamic.baseName)
+        const row = await rows.read(dynamic.baseName)
         if (row && row.nextRunAt > now) return { dynamic, row, kind: 'backoff' }
         try {
           return {
@@ -170,7 +190,7 @@ export function createFridge(config: FridgeConfig): Fridge {
           byKey.set(query.name, query)
           list.push(query)
         }
-        if (row) await schedule.deleteSchedule(dynamic.baseName)
+        if (row) await rows.delete(dynamic.baseName)
       } catch (err) {
         await failBase(attempt, errorMessage(err))
       }
@@ -179,241 +199,183 @@ export function createFridge(config: FridgeConfig): Fridge {
   }
 
   /**
-   * The tick's rows, and the bound on how much storage one tick reads. `listDue`
-   * orders by `nextRunAt`, so this window is the oldest `maxPerTick` rows: every
-   * due row before any future one, and a row nothing refreshes only climbs. What
-   * falls outside is neither run nor reconciled here, which costs a tick, not a
-   * row - `retain` makes the table open-ended, and a full scan of it is not
-   * something an invocation with a wall clock can promise.
+   * The earliest page of rows, which is the whole of what one tick reads.
+   * `listDue` orders by `nextRunAt`, so a page holds every due row before any
+   * future one, and a row nothing refreshes only climbs towards the front. A
+   * full page means there may be more behind it, and the tick says so by asking
+   * to be woken again immediately rather than by reading further.
    */
   const listRows = async (): Promise<ScheduleRow[]> =>
     schedule.capabilities.listDue && schedule.listDue
-      ? schedule.listDue(Number.MAX_SAFE_INTEGER, maxPerTick)
+      ? schedule.listDue(Number.MAX_SAFE_INTEGER, SCHEDULE_PAGE)
       : []
 
   /**
-   * On-demand entries live as long as something keeps reading them. Eviction is
-   * also what stops the refreshing: an entry nothing has read for `retain` loses
-   * its result and its row, and with them its place in the tick.
+   * Rows the registry no longer names lose their row and their result. Bounded
+   * per tick, because a list that dropped ten thousand variants at once is a
+   * deployment, not an emergency: the rest go on the next tick, still departed.
    */
-  const evictIdle = async (now: number, removed: Set<string>): Promise<void> => {
-    for (const base of queries.onDemand) {
-      const evicted = await store.evictIdleResults(
-        variantKeyPrefix(base.baseName),
-        now - base.retainMs,
-      )
-      for (const name of evicted) {
-        await schedule.deleteSchedule(name)
-        removed.add(name)
-      }
-    }
-  }
-
-  /**
-   * A cold read whose very first fetch failed leaves a row with no result. Its
-   * backoff is worth keeping - a reader hammering a broken key must not hammer
-   * upstream with it - but once that has expired, one read is not evidence of
-   * ongoing demand, and the row would otherwise retry forever unread. Only
-   * failing rows are checked, so a healthy registry pays nothing for this.
-   */
-  const dropFailedOnDemand = async (
-    now: number,
-    rows: readonly ScheduleRow[],
-    removed: Set<string>,
-  ): Promise<void> => {
-    for (const row of rows) {
-      const base = variantBaseOf(row.name)
-      if (base === undefined || queries.onDemandFor(base) === undefined) continue
-      if (row.failCount === 0 || row.nextRunAt > now || removed.has(row.name)) continue
-      if (row.leaseUntil !== null && row.leaseUntil > now) continue
-      if ((await store.readResult(row.name)) !== null) continue
-      await schedule.deleteSchedule(row.name)
-      removed.add(row.name)
-    }
-  }
-
-  /** Everything `retain` removed this tick, so the rest of it works from what is left. */
-  const sweepOnDemand = async (now: number, rows: readonly ScheduleRow[]): Promise<Set<string>> => {
-    const removed = new Set<string>()
-    if (queries.onDemand.length === 0) return removed
-    await evictIdle(now, removed)
-    await dropFailedOnDemand(now, rows, removed)
-    return removed
-  }
-
   const reconcile = async (
     now: number,
     effective: EffectiveRegistry,
-    rows: readonly ScheduleRow[],
-  ): Promise<void> => {
-    for (const row of rows) {
+    page: readonly ScheduleRow[],
+    rows: Rows,
+  ): Promise<{ moreToRemove: boolean }> => {
+    let removed = 0
+    let moreToRemove = false
+    for (const row of page) {
       if (effective.byKey.has(row.name)) continue
       // A dynamic base's own row is backoff bookkeeping, not a departed variant.
       if (queries.dynamicFor(row.name)) continue
       const base = variantBaseOf(row.name)
       if (base !== undefined && effective.unresolvedBases.has(base)) continue
-      // An on-demand row mid-claim has no params yet, so it is not in the
-      // registry above; it is not a departed variant either.
-      if (base !== undefined && queries.onDemandFor(base) !== undefined) continue
-      await schedule.deleteSchedule(row.name)
+      if (rows.get(row.name) === null) continue
+      if (removed >= RECONCILE_DELETES_PER_TICK) {
+        moreToRemove = true
+        break
+      }
+      removed += 1
+      await rows.delete(row.name)
       await store.deleteResult(row.name)
     }
+
     for (const query of effective.list) {
-      const row = await schedule.readSchedule(query.name)
-      if (!row || row.failCount > 0) continue
+      const row = rows.get(query.name)
+      // Outside the page: this tick never read it, and guessing is worse than
+      // waiting for the tick that does.
+      if (row === undefined || row === null || row.failCount > 0) continue
       if (row.leaseUntil !== null && row.leaseUntil > now) continue
       // Only an `every` shrink needs fixing here; growth self-heals with one
       // early run that reschedules at the new period.
       if (row.nextRunAt <= now + query.everyMs * (1 + MAX_JITTER_RATIO)) continue
       const env = await store.readResult(query.name)
-      await schedule.writeSchedule({
-        ...row,
-        nextRunAt: (env ? env.fetchedAt : now) + query.everyMs,
-      })
+      await rows.write({ ...row, nextRunAt: (env ? env.fetchedAt : now) + query.everyMs })
     }
+    return { moreToRemove }
   }
 
   /**
-   * Nothing is stored yet and the caller is willing to wait. Fetch it here when
-   * nobody else is on it, otherwise wait for whoever is - the lease keeps that
-   * to one upstream call however many readers arrive at once. The deadline is
-   * the read's, already net of whatever membership resolution spent; a fetch
-   * that outlives it keeps going and lands for the next read.
+   * What this invocation will still take on. A call is admitted only while its
+   * own timeout fits in the wall clock the driver says is left, and only while
+   * its source has not already refused this tick - the ceiling is read from the
+   * ledger's own answer rather than guessed at, and one refusal per source per
+   * tick is enough to learn it. Everything turned away here is untouched, so it
+   * is still due, and more overdue, the moment the next tick starts.
    */
-  const readThrough = async <T>(
-    query: ResolvedQuery,
-    key: string,
-    deadline: number,
-  ): Promise<ReadResult<T> | ThrottledRead | null> => {
-    const start = clock.now()
-    const row = (await schedule.readSchedule(key)) ?? virtualRow(key, start)
-    const leaseHeld = row.leaseUntil !== null && row.leaseUntil > start
+  const dispatchDue = async (
+    plan: readonly Candidate[],
+    now: number,
+    startedAt: number,
+    report: RunReport,
+    onOutcome: (candidate: Candidate, outcome: DispatchOutcome) => void,
+  ): Promise<void> => {
+    const fits = (query: ResolvedQuery): boolean =>
+      driver.budgetMs === undefined || clock.now() + query.timeoutMs <= startedAt + driver.budgetMs
 
-    if (!leaseHeld) {
-      // Backoff after a failed attempt: nothing is running and nothing is due,
-      // so waiting would only spend the budget.
-      if (row.nextRunAt > start) return null
-
-      let outcome: DispatchOutcome | undefined
-      const running = dispatcher
-        .run({ query, row, priority: 'demand', deadline }, start)
-        .then((result) => {
-          outcome = result
-        })
-        .catch(() => {})
-      driver.defer(running)
-      const settled = await within(running, deadline)
-      if (!settled || outcome === undefined || outcome.status === 'failed') return null
-      if (outcome.status === 'ran') {
-        return shapeRead<T>(await store.readResult(key), clock.now())
-      }
-      // The source is spent for this window. The row stays due, so the next
-      // tick picks the work up and the reader after this one finds it there.
-      if (outcome.status === 'throttled') return { status: 'throttled', retryAt: outcome.retryAt }
-      // Lost the claim to an executor that got there first: wait for it.
+    const bySource = new Map<string, Candidate[]>()
+    for (const candidate of plan) {
+      const list = bySource.get(candidate.query.source)
+      if (list) list.push(candidate)
+      else bySource.set(candidate.query.source, [candidate])
     }
 
-    const waited = await waitForEnvelope((k) => store.readResult(k), key, deadline, clock)
-    return shapeRead<T>(waited, clock.now())
+    await Promise.allSettled(
+      [...bySource].map(async ([source, candidates]) => {
+        const chunk = chunkFor(sources, source)
+        let windowSpent = false
+        for (let start = 0; start < candidates.length; start += chunk) {
+          const admitted: Candidate[] = []
+          for (const candidate of candidates.slice(start, start + chunk)) {
+            if (windowSpent || !fits(candidate.query)) report.deferred.push(candidate.query.name)
+            else admitted.push(candidate)
+          }
+          if (admitted.length === 0) continue
+          await Promise.allSettled(
+            admitted.map(async (candidate) => {
+              const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
+              if (outcome.status === 'throttled') windowSpent = true
+              onOutcome(candidate, outcome)
+            }),
+          )
+        }
+      }),
+    )
   }
 
-  const touchQuietly = async (key: string): Promise<void> => {
-    try {
-      await store.touchResult(key, clock.now())
-    } catch {
-      // Callers hand this to ctx.waitUntil; a late keep-warm stamp must never
-      // surface as an invocation error, and the next read will stamp it again.
-    }
-  }
-
-  const within = (promise: Promise<unknown>, deadline: number): Promise<boolean> =>
-    new Promise((resolve) => {
-      let done = false
-      const finish = (settled: boolean): void => {
-        if (done) return
-        done = true
-        resolve(settled)
-      }
-      const handle = clock.setTimeout(() => finish(false), Math.max(0, deadline - clock.now()))
-      promise.then(
-        () => {
-          clock.clearTimeout(handle)
-          finish(true)
-        },
-        () => {
-          clock.clearTimeout(handle)
-          finish(true)
-        },
-      )
-    })
+  const read = createReadPath({
+    store,
+    schedule,
+    dispatcher,
+    queries,
+    clock,
+    defer: (promise) => driver.defer(promise),
+  })
 
   return {
     async runDue(nowArg?: number): Promise<RunReport> {
-      const rows = await listRows()
-      const removed = await sweepOnDemand(nowArg ?? clock.now(), rows)
-      const live = removed.size === 0 ? rows : rows.filter((row) => !removed.has(row.name))
-      const effective = await resolveEffective(nowArg ?? clock.now(), live)
+      const startedAt = clock.now()
+      const page = await listRows()
+      const rows = new Rows()
+      for (const row of page) rows.remember(row.name, row)
+      // A full page is the tick saying "there was more than I read", which is
+      // the only thing it can honestly say without reading further.
+      const pageWasFull = page.length >= SCHEDULE_PAGE
+      const effective = await resolveEffective(nowArg ?? clock.now(), rows)
       // Resolution can legitimately spend a base's whole timeout, so dueness,
       // reconciliation and leases work from a timestamp taken after it. A
       // caller who supplied one owns the tick's clock and is never overridden.
       const now = nowArg ?? clock.now()
-      await reconcile(now, effective, live)
-      const rowsByName = new Map(
-        await Promise.all(
-          effective.list.map(async (q) => [q.name, await schedule.readSchedule(q.name)] as const),
-        ),
-      )
-      const plan = planTick(effective.list, rowsByName, now, maxPerTick)
+      const { moreToRemove } = await reconcile(now, effective, page, rows)
+
       const report = emptyReport()
       report.failed.push(...effective.failures)
-      report.deferred.push(...plan.deferred)
-      await Promise.allSettled(
-        plan.toRun.map(async (candidate) => {
-          const outcome = await dispatcher.run({ ...candidate, priority: 'scheduled' }, now)
-          recordOutcome(report, candidate.query.name, outcome)
-        }),
-      )
+
+      const plan = planTick(effective.list, rows, now, pageWasFull)
+      const dispatched = new Set<string>()
+      let soonest: number | null = null
+      const consider = (at: number): void => {
+        soonest = soonest === null ? at : Math.min(soonest, at)
+      }
+
+      await dispatchDue(plan, now, startedAt, report, (candidate, outcome) => {
+        dispatched.add(candidate.query.name)
+        recordOutcome(report, candidate.query.name, outcome)
+        if (outcome.status === 'throttled') consider(outcome.retryAt)
+        else if (outcome.status === 'leased') consider(candidate.row.leaseUntil ?? now)
+        else if (outcome.nextRunAt !== undefined) consider(outcome.nextRunAt)
+      })
+
+      // Anything held back is due right now, so the next wake is right now; the
+      // driver's own floor is what keeps that from becoming a hot loop.
+      if (report.deferred.length > 0 || moreToRemove || pageWasFull) consider(now)
+      for (const query of effective.list) {
+        if (dispatched.has(query.name)) continue
+        const row = rows.get(query.name)
+        if (row) consider(row.nextRunAt)
+        else if (row === null) consider(now)
+      }
+      for (const entry of queries.dynamic) {
+        const row = rows.get(entry.baseName)
+        // A base with no variants and no backoff row has nothing in the table
+        // to be woken by, so it is woken on its own period.
+        if (row) consider(row.nextRunAt)
+        else if (!effective.list.some((query) => query.baseName === entry.baseName)) {
+          consider(now + entry.everyMs)
+        }
+      }
+      report.nextRunAt = soonest
       return report
     },
 
-    async read<T>(
-      name: string,
-      params?: QueryParams,
-    ): Promise<ReadResult<T> | ThrottledRead | null> {
-      const key = queryKey(name, params)
-      let query = queries.getByKey(key)
-      const dynamic = query ? undefined : queries.dynamicFor(name)
-      const onDemand = query || dynamic ? undefined : queries.onDemandFor(name)
-      if (!query && !dynamic && !onDemand) throw new ConfigError(`unknown query '${name}'`)
-      if (onDemand && params === undefined) {
-        throw new ConfigError(`query '${name}': retain names no list, so a read must pass params`)
-      }
-      const codec = query?.codec ?? dynamic?.codec ?? onDemand?.codec
-      // The read is what keeps an on-demand entry alive, and it must not wait
-      // for the store to say so: `retain` is hours, this stamp is minutes-precise.
-      if (onDemand) driver.defer(touchQuietly(key))
-      const shaped = shapeRead<T>(await store.readResult(key), clock.now())
-      // A hit never waits and never touches upstream, however stale or expired
-      // it is: refreshing that is the scheduler's job. A miss fetches, or waits
-      // for whoever already is, bounded by this query's own timeout - one
-      // budget, shared with resolving membership when the variant is dynamic. A
-      // dynamic hit skips that resolution entirely; reconcile is the enforcer
-      // that removes departed variants.
-      if (shaped !== null) return decodeRead(shaped, codec)
-      const deadline = clock.now() + (query?.timeoutMs ?? dynamic?.timeoutMs ?? onDemand!.timeoutMs)
-      if (!query) {
-        // An on-demand base has no membership to check: these params are an
-        // entry because somebody asked for them.
-        query = onDemand
-          ? onDemand.instantiate(params!)
-          : await resolveMemberBy(dynamic!, key, clock, deadline)
-        if (!query) throw new ConfigError(`unknown query '${name}'`)
-      }
-      const fetched = await readThrough<T>(query, key, deadline)
-      if (fetched !== null && fetched.status === 'throttled') return fetched
-      return decodeRead(fetched, codec)
-    },
+    read,
   }
+}
+
+function chunkFor(sources: ResolvedSources, source: string): number {
+  const maxConcurrent = sources.get(source)?.maxConcurrent
+  return maxConcurrent !== undefined && Number.isFinite(maxConcurrent)
+    ? maxConcurrent
+    : DISPATCH_CHUNK
 }
 
 function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome): void {
@@ -424,15 +386,14 @@ function recordOutcome(report: RunReport, name: string, outcome: DispatchOutcome
 }
 
 function emptyReport(): RunReport {
-  return { ran: [], skippedLeased: [], throttled: [], deferred: [], failed: [] }
-}
-
-function validateMaxPerTick(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_MAX_PER_TICK
-  if (!Number.isInteger(value) || value < 1) {
-    throw new ConfigError('maxPerTick must be a positive integer')
+  return {
+    ran: [],
+    skippedLeased: [],
+    throttled: [],
+    deferred: [],
+    failed: [],
+    nextRunAt: null,
   }
-  return value
 }
 
 function errorMessage(err: unknown): string {
@@ -448,6 +409,12 @@ function validateDriver(driver: Driver): Driver {
   }
   if (typeof driver.defer !== 'function') {
     throw new ConfigError('driver must provide defer(promise)')
+  }
+  if (
+    driver.budgetMs !== undefined &&
+    (!Number.isFinite(driver.budgetMs) || driver.budgetMs <= 0)
+  ) {
+    throw new ConfigError('driver budgetMs must be a positive number of milliseconds')
   }
   return driver
 }
@@ -472,8 +439,8 @@ function resolveStores(
   if (!store || typeof store.readResult !== 'function' || typeof store.claim !== 'function') {
     throw new ConfigError('createFridge requires a store that holds results and schedule rows')
   }
-  // A stateful serialized driver keeps its own bookkeeping (a Durable Object's
-  // SQLite, for example); then the store's schedule half simply goes unused.
+  // A stateful serialized driver keeps its own bookkeeping; then the store's
+  // schedule half simply goes unused.
   const schedule = driver.schedule ?? store
   requireClaimSafety(
     schedule,
@@ -481,20 +448,6 @@ function resolveStores(
     driver.schedule ? "the driver's schedule bookkeeping" : 'the store',
   )
   return { store, schedule }
-}
-
-/**
- * An on-demand entry exists only as a row: nothing declares it, so the only way
- * to find it again - to refresh it, or to evict it once it goes cold - is to
- * enumerate what is stored.
- */
-function requireListDueForOnDemand(queries: Queries, schedule: SchedulePlane): void {
-  if (queries.onDemand.length === 0) return
-  if (schedule.capabilities.listDue && schedule.listDue) return
-  throw new ConfigError(
-    `query '${queries.onDemand[0]!.baseName}': retain needs a schedule plane that can list ` +
-      'rows, and this one declares listDue: false',
-  )
 }
 
 function requireClaimSafety(schedule: SchedulePlane, driver: Driver, which: string): void {

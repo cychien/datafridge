@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { cronFridge } from '../src/cron.js'
 import type { CronScheduledHandler } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
+import { stored } from './helpers.js'
 
 interface CronEnv {
   DB: D1Database
@@ -133,7 +134,7 @@ describe('cron shell e2e (scheduled handler + d1)', () => {
     await invoke(handler)
     expect(ticks).toBe(1)
 
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ tick: 1 })
     expect(read!.isStale).toBe(false)

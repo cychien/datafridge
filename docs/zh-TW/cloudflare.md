@@ -33,7 +33,7 @@ pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 
 ## Durable Object alarms：`FridgeDO`
 
-這條路的 scheduler 就是你匯出的那個 class：`wrangler` 依 `class_name` 實例化它，它的 alarm 迴圈推動每一個 tick。`FridgeDO` 是 serialized driver，而且自帶排程簿記，所以它只需要一個地方放 envelope。需要精確 due timestamp 的 alarm、可動態調整的 backoff，或 serialized schedule coordination 時，用它。
+這條路的 scheduler 就是你匯出的那個 class：`wrangler` 依 `class_name` 實例化它，它的 alarm 迴圈推動每一個 tick。`FridgeDO` 只是一個 scheduler，如此而已 - 它不保管任何自己的 dispatch 狀態，全部工作都對著你交給它的 Store。需要精確 due timestamp 的 alarm 與可動態調整的 backoff 時，用它。
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
@@ -102,7 +102,7 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-Durable Object 只在自己的 SQLite 儲存 schedule rows。Fetcher 在 object 中執行、envelope 寫入 D1，read path 則直接查詢 D1。
+**D1 就是整個協調平面。** Schedule row、lease、version、backoff、quota ledger 與 result envelope 全都住在那裡；object 自己的 SQLite 只有一列，記著它上次是為哪一份 registry 點的火，除此之外什麼都沒有。這正是第二個 scheduler、一個 cron trigger，或任意多個 request path reader 都能對著同一份資料工作、而不必經過這個 object 的原因 - 也是讀取路徑從不經過它的原因。排程刷新的 fetcher 在 object 裡執行；讀取則在請求落地的地方就地服務。
 
 ### Alarm lifecycle
 
@@ -180,7 +180,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 | | `FridgeDO` | `cronFridge` |
 |---|---|---|
 | Driver | Durable Object alarms | Cron Triggers |
-| Schedule plane | Durable Object SQLite | D1 |
+| Schedule plane | D1 | D1 |
 | Claims | Serialized actor | D1 compare-and-swap |
 | Result plane | D1 | D1 |
 | Scheduler 粒度 | 精確的 alarm timestamp，最低 1 秒 | 最低 1 分鐘 |
@@ -192,24 +192,24 @@ ctx.waitUntil(writeSanitizedOperations(report))
 
 ## 建構時驗證
 
-- `defineQueries` 驗證 names、durations、fetchers、duplicate variants、`timeout < lease` 與 `retain > every`。
+- `defineQueries` 驗證 names、durations、fetchers、duplicate variants、`timeout < lease`，以及 `anyParams` base 不得宣告清單、`every`、`lease`、`validUntil` 或 `codec`。
 - `FridgeDO` 在啟動與每次 alarm 前驗證 registry、source policies 與 Cloudflare wall-clock ceiling。
 - `cronFridge` 在建構時驗證 registry、store-factory shape、schedule-plane resolution 與 wall-clock ceiling。
 - Cloudflare query timeout 必須短於 15 分鐘。
 - Source policy 必須宣告 `limit`、`maxConcurrent` 或兩者；`limit.requests`、`limit.per` 與 `maxConcurrent` 必須為正，`limit.reserve` 必須小於 `limit.requests`。
 
-## Cloudflare 上的 on-demand entries
+## 請求路徑
 
-`retain` query 在這裡比宣告過的 query 多需要兩件事。
-
-讀取路徑是 reader，所以記錄讀取的也是 reader - 而沒有人記錄讀取的 entry 就是會被清掉的 entry。給它 `d1(env.DB)`（它有 `touchResult`），並把該次 invocation 的 `waitUntil` 交給它，否則 Worker 可能在時間戳寫完前就被收掉：
+把完整的 `d1(env.DB)` store、registry、source policies，以及 `ctx.waitUntil` 當作 `defer` 交給 reader，它就是一條完整的讀取路徑：它給出已儲存的東西、用 tick 走的同一個 dispatcher 自己補上冷的 entry，並以一次全新呼叫回答 `anyParams` 的 params。
 
 ```ts
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(ensureStarted(env.POLLER))
     const reader = createReader({
       store: d1(env.DB),
       queries,
+      sources,
       defer: (promise) => ctx.waitUntil(promise),
     })
     return Response.json(await reader.read('course-funnel', { courseId: 'course-a' }))
@@ -217,7 +217,9 @@ export default {
 }
 ```
 
-另外，schedule plane 必須能列出自己的 row，因為沒有人宣告過的 entry 只能靠列舉已存的東西找回來。兩個已出貨的 plane 都可以 - `FridgeDO` 的 SQLite 與 `d1` 的排程那一半 - 所以這一條只會咬到自己手寫的實作。
+這裡沒有任何東西經過 Durable Object。讀取隨你的 Worker 擴張，而不是在單一 singleton 後面排隊；而因為每一次呼叫仍然是從 dispatcher 出去、對著同一個 D1，source 天花板會把它們和 scheduler 的呼叫算在一起 - 兩邊透過 store 協調，那也是它們唯一相遇的地方。
+
+改交給 reader 一個 results-only 的 store，它就回到「只給與只等」，那正是另一個服務裡不該打上游的 consumer 該有的形狀。此時含有 `anyParams` base 的 registry 會在建構時就失敗，而不是等到有人來讀。
 
 ## 失敗與復原
 
@@ -228,7 +230,7 @@ export default {
 | Executor 死亡 | Lease 過期後 reclaim | 立即回傳目前 envelope |
 | Zombie 遲到寫回 | Version mismatch 時拒絕 | 保持不變 |
 | Per-source 額度用完 | 保持 due 且更過期，留待後續 tick | 立即回傳目前 envelope；miss 時為 `status: 'throttled'` |
-| 超出這個 tick 的容量（`maxPerTick`） | Row 原封不動，名字放入 `RunReport.deferred`；alarm 依仍然到期的 row 重設 | 不受影響：讀取從不等待 tick |
+| 超出這次 invocation 的容量 | Row 原封不動，名字放入 `RunReport.deferred`；alarm 依 tick 回報的 `nextRunAt` 重設 | 不受影響：讀取從不等待 tick |
 | 尚未成功 refresh | 繼續 scheduled attempts | 回傳 `null` |
 | Alarm-level error | 在 `finally` 排定下一個 alarm | 既有 D1 envelopes 仍可讀 |
 
@@ -247,7 +249,7 @@ Backoff 為 `min(every, 1m * 2^(failCount - 1))` 加 jitter。成功後 failure 
 
 D1 是 single-region，remote PoP reader 可能產生跨區 latency。Result-plane replica 不在已發布範圍內。
 
-單一 `FridgeDO` instance 負責協調整個 registry。依 source 分片是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限。數十個 query 的宣告式 registry 距離那個門檻還很遠，而 entry 數量天生開放無界的 `retain` base 也到不了，因為一個 tick 最多只載入並承接 [`maxPerTick`](./rate-limiting.md#容量maxpertick) 個 entry，剩下的則用來重設 alarm。
+單一 `FridgeDO` instance 推動整個 registry 的排程，而讀取從不經過它。依 source 分片 scheduler 是刻意不做的；重新評估它的觸發條件，是單次 `runDue` 逼近 Durable Object invocation 的 wall-clock 上限 - 而[單次 invocation 願意承接多少](./rate-limiting.md#容量單次-invocation-願意承接多少)就是為了防止這件事：一個 tick 只讀一頁有界的 row、絕不開始一個 timeout 會超出 invocation 的呼叫，並在留下工作時要求立刻被再叫醒一次。
 
 ## Subpath imports
 

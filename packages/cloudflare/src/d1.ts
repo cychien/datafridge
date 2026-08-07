@@ -42,12 +42,6 @@ function isMissingTable(err: unknown): boolean {
   return err instanceof Error && /no such table/i.test(err.message)
 }
 
-// A base name is user-supplied and reaches the key verbatim (percent-encoded),
-// so a '%' in it would otherwise widen the prefix match to other bases.
-function escapeLike(value: string): string {
-  return value.replace(/[\\%_]/g, (char) => `\\${char}`)
-}
-
 /**
  * Runs a statement with the schema in place. Remembering one success is not
  * enough: a database dropped or destructively migrated under a warm isolate
@@ -109,14 +103,12 @@ export function d1(db: D1Database): Store {
               `exceeding D1's ${D1_MAX_ROW_BYTES}-byte row limit; the previous envelope is kept`,
           )
         }
-        // A brand new entry counts as read when it lands, so a cold read that
-        // creates one cannot lose it to eviction before anyone touches it.
         await db
           .prepare(
-            'INSERT INTO datafridge_results (name, envelope, last_read_at) VALUES (?, ?, ?) ' +
+            'INSERT INTO datafridge_results (name, envelope) VALUES (?, ?) ' +
               'ON CONFLICT (name) DO UPDATE SET envelope = excluded.envelope',
           )
-          .bind(name, envelope, env.fetchedAt)
+          .bind(name, envelope)
           .run()
       })
     },
@@ -124,35 +116,6 @@ export function d1(db: D1Database): Store {
     async deleteResult(name) {
       return withSchema(db, async () => {
         await db.prepare('DELETE FROM datafridge_results WHERE name = ?').bind(name).run()
-      })
-    },
-
-    // Reached from the read path, so it applies no schema: nothing stored is
-    // nothing to record, exactly as the reads above treat a missing table.
-    async touchResult(name, at) {
-      try {
-        await db
-          .prepare('UPDATE datafridge_results SET last_read_at = ? WHERE name = ?')
-          .bind(at, name)
-          .run()
-      } catch (err) {
-        if (!isMissingTable(err)) throw err
-      }
-    },
-
-    // One statement, so nothing can be read between deciding an entry is cold
-    // and deleting it, and the round trips do not grow with a `retain` base's
-    // entry count.
-    async evictIdleResults(keyPrefix, idleBefore) {
-      return withSchema(db, async () => {
-        const { results } = await db
-          .prepare(
-            "DELETE FROM datafridge_results WHERE name LIKE ? ESCAPE '\\' " +
-              'AND last_read_at < ? RETURNING name',
-          )
-          .bind(`${escapeLike(keyPrefix)}%`, idleBefore)
-          .all<{ name: string }>()
-        return results.map((record) => record.name)
       })
     },
 

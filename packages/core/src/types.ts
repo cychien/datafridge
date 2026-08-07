@@ -73,6 +73,18 @@ interface ParameterizedBase<P extends QueryParams, T> extends QuerySettings {
 }
 
 /**
+ * A base whose parameter space is not a list. It declares no `every`, `lease`
+ * or `validUntil` because it has no entries to schedule, refresh or expire:
+ * every read is answered by one fresh call.
+ */
+interface OpenParameterizedBase<P extends QueryParams, T> {
+  name: string
+  timeout?: Duration
+  source?: string
+  fetch(ctx: ParameterizedFetchCtx<P>): Promise<T>
+}
+
+/**
  * Arrays are static: expanded once at construction. Functions are dynamic:
  * resolved at every tick, so the list can live in a database, and they may be
  * async. `dimensions` is the cartesian product of its entries, one param field
@@ -82,26 +94,33 @@ export type ParameterizedQueryDef<P extends QueryParams = QueryParams, T = unkno
   | (ParameterizedBase<P, T> & {
       variants: readonly P[] | ((ctx: ResolveCtx) => readonly P[] | Promise<readonly P[]>)
       dimensions?: never
-      retain?: never
+      anyParams?: never
     })
   | (ParameterizedBase<P, T> & {
       dimensions: Readonly<Record<string, DimensionValues>>
       variants?: never
-      retain?: never
+      anyParams?: never
     })
-  | (ParameterizedBase<P, T> & {
+  | (OpenParameterizedBase<P, T> & {
       /**
-       * No list at all: any params become an entry the first time somebody
-       * reads them, and stop being one once nothing has read them for this
-       * long. For sets too large or too open-ended to enumerate.
+       * No list, and no entries either. Any params are accepted, and each read
+       * of params the registry does not name is answered by one fresh upstream
+       * call - metered, bounded and never stored. For parameter spaces too
+       * large or too open-ended to enumerate, where storing every combination
+       * somebody happens to ask for would be a cache nobody asked for.
        */
-      retain: Duration
+      anyParams: true
       variants?: never
       dimensions?: never
+      every?: never
+      lease?: never
+      validUntil?: never
+      codec?: never
     })
 
 export type QueryDefinition = QueryDef | ParameterizedQueryDef
 
+/** A scheduled entry: it has a period, a row, a lease, and a stored result. */
 export interface ResolvedQuery<T = unknown> {
   readonly name: string
   readonly baseName: string
@@ -113,6 +132,21 @@ export interface ResolvedQuery<T = unknown> {
   readonly fetch: (ctx: FetchCtx) => Promise<T>
   readonly codec?: QueryCodec
   readonly validUntil?: (now: number) => number
+}
+
+/**
+ * A call for params no entry exists for. It goes out through the same
+ * dispatcher, so it obeys the same source ceiling, reserve, concurrency and
+ * timeout - but it claims no lease and writes nothing back, because there is no
+ * entry for it to be the current value of.
+ */
+export interface EphemeralQuery<T = unknown> {
+  readonly name: string
+  readonly baseName: string
+  readonly params: QueryParams
+  readonly timeoutMs: number
+  readonly source: string
+  readonly fetch: (ctx: FetchCtx) => Promise<T>
 }
 
 export interface LastError {
@@ -184,24 +218,18 @@ export interface Store extends SchedulePlane {
   readResult(name: string): Promise<Envelope | null>
   writeResult(name: string, env: Envelope): Promise<void>
   deleteResult(name: string): Promise<void>
-  /**
-   * Records that something was read, for `retain`. Called off the read's
-   * critical path and never awaited by it, so precision does not matter; a
-   * result that is not there yet is not an error, it is nothing to record.
-   */
-  touchResult(name: string, at: number): Promise<void>
-  /**
-   * Deletes results under `keyPrefix` that nothing has read since `idleBefore`,
-   * and answers which. Schedule rows are not this plane's to delete: the caller
-   * removes them, because the schedule half may live somewhere else entirely.
-   */
-  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 }
 
 export interface Driver {
   serialized: boolean
   defer(promise: Promise<unknown>): void
   schedule?: SchedulePlane
+  /**
+   * How long this invocation may run, when the platform bounds it. A tick stops
+   * admitting work whose own `timeout` no longer fits in what is left, so the
+   * remainder is deferred to the next tick instead of being killed mid-flight.
+   */
+  budgetMs?: number
 }
 
 export interface RunReport {
@@ -210,12 +238,20 @@ export interface RunReport {
   /** Out of source quota this window; still due, and more overdue next tick. */
   throttled: string[]
   /**
-   * Due, but past what one tick will take on (`maxPerTick`). Nothing upstream
-   * was asked and nothing was written, so these come back at the head of the
-   * next tick. Capacity, not rate: `throttled` is the source ceiling.
+   * Due, but past what this invocation could take on: its remaining wall clock
+   * would not fit the query's own timeout, the source's window was already
+   * known spent, or the tick's bounded page of rows did not reach it. Nothing
+   * upstream was asked and nothing was written, so these come back at the head
+   * of the next tick. Capacity, not rate: `throttled` is the source ceiling.
    */
   deferred: string[]
   failed: Array<{ name: string; message: string }>
+  /**
+   * When this fridge next has work, as the tick that just ran already knows it -
+   * so a driver that schedules its own wake-ups does not have to ask storage
+   * again. `null` means there is nothing scheduled at all.
+   */
+  nextRunAt: number | null
 }
 
 export interface ReadResult<T = unknown> {

@@ -4,7 +4,7 @@
 
 datafridge 的 core 只依賴 contract，不假設任何平台特性。Durable Object、D1、Redis、cron、node timer 全部只是 adapter。某些後端讓 adapter 特別好寫（例如 DO 的單線程執行）- 那是該 adapter 的幸運，永遠不是 core 的假設。
 
-介面刻意極小。Query registry 是 code 裡宣告的有限集合（幾個到幾十個 queries），所以逐筆 `readSchedule` 完全可行，`listDue` 只是優化。這就是「任何後端半天寫完一個 adapter」的保證。
+介面刻意極小。Query registry 是 code 裡宣告的有限集合（幾個到幾十個 queries），所以逐筆 `readSchedule` 完全可行，`listDue` 只是優化。Core 發出的每一次呼叫都有界：`listDue` 一定帶著有限的 limit，沒有任何方法會要求後端把手上的東西全部交出來。這就是「任何後端半天寫完一個 adapter」的保證。
 
 ## Store contract：一個 store，兩個半邊
 
@@ -14,9 +14,6 @@ interface Store {
   readResult(name: string): Promise<Envelope | null>
   writeResult(name: string, env: Envelope): Promise<void>
   deleteResult(name: string): Promise<void>        // used by registry reconcile
-  // `retain`: record that something was read, and drop what has gone cold
-  touchResult(name: string, at: number): Promise<void>
-  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 
   // schedule plane - 協調用的簿記
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -29,8 +26,9 @@ interface Store {
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
-  // optional capability: SQL backends can fetch all due rows in one query;
-  // without it, core reads row by row
+  // optional capability: SQL backends can fetch a page of the earliest rows in
+  // one query; without it, core reads row by row. `limit` is always finite -
+  // core never asks a store to enumerate itself
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: { atomicClaim: boolean; listDue: boolean }
 }
@@ -38,13 +36,13 @@ interface Store {
 
 一個 store 同時持有兩個半邊。應用程式只會遇到這一個 interface。
 
-`touchResult` 會從讀取路徑被呼叫，所以和兩個讀取一樣絕不能套用 schema：什麼都沒存就沒有東西可記錄。`evictIdleResults` 刪掉結果並回報名字，而且刻意不碰 schedule row - 排程那一半可能住在完全不同的物件裡，刪它是呼叫端的事。新的 `writeResult` 以它的 `fetchedAt` 算作一次讀取，否則冷讀取建立的 entry 會在任何人來得及記錄讀取之前就可被清除；之後的 `writeResult` 則保留讀者留下的時間戳，因為刷新不是讀取。
-
 **store 必須自己建立它需要的儲存空間。** 在第一次寫入前，它得自己套用需要的 table、key 或 collection，這樣任何 adapter 都不會丟一個「使用者要記得跑」的 migration 出來。使用者手動套用等價 schema 時必須是 no-op；儲存空間在暖 process 底下消失時，必須重建並重試，而不是一路失敗到那個 process 被回收；而兩個讀取方法 - `readResult` 與 `readSchedule` - 都必須維持單純讀取：還不存在的儲存空間讀起來就是 `null`，和空的完全一樣，因為唯讀 consumer 的讀取路徑兩個都會碰到，絕不能套用 schema。`@datafridge/cloudflare` 的 `test/schema.test.ts` 是可以照抄的參考測試 - 契約套件無法強制這一點，因為準備後端的正是套件的 factory。
 
 這條義務就是 `datafridge init <平台>` 在每個平台上都一樣小的原因。
 
-兩個半邊的一致性需求仍然不同，而且已出貨的程式碼裡就有一個例子證明這點：有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半。`FridgeDO` 正是如此 - 它的簿記放在 Durable Object 自己的 SQLite，envelope 則寫進你交給它的 store。`SchedulePlane` 屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
+兩個半邊的一致性需求仍然不同，而有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半；它屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
+
+**已出貨的東西沒有一個這樣做。** `FridgeDO` 刻意不保管任何自己的 dispatch 狀態：row、lease、quota 與結果全都住在你交給它的 Store 裡，所以一個 Durable Object 和一個 cron trigger 指向同一個 D1 時，是透過那個 store 協調，而不是透過「剛好是 singleton 的那個物件」。一個把協調平面據為己有的 scheduler，是一個你沒辦法再加第二個讀取端的 scheduler。
 
 ## 能力矩陣
 
@@ -54,7 +52,7 @@ interface Store {
 |---|---|
 | Redis | `SET NX PX` / Lua script |
 | D1 / Postgres / SQLite | `UPDATE ... WHERE version = ?`，檢查 changed rows |
-| DO storage | 單線程 actor，天生序列化（claim 免 CAS）；作為 alarm driver 自己的 `SchedulePlane` |
+| DO storage | 單線程 actor，天生序列化（claim 免 CAS） |
 | memoryStore | 單 process 內同步 |
 
 沒有條件寫入原語的後端根本無法承擔排程那一半；只有最終一致性的後端則無法正確承擔。這種後端會宣告 `atomicClaim: false`，而建構只在 serialized driver 之下才接受它。
@@ -83,7 +81,7 @@ createFridge({ store: d1(env.DB), driver: cronDriver(ctx), queries })
 createFridge({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
 ```
 
-`FridgeDO` 會在內部用自己的 SQLite `SchedulePlane` 建構第二種 shape。反例：一個回報 `atomicClaim: false` 的 store 搭配 `cronDriver(ctx)` 會拋錯，因為重疊的 cron invocation 會導致重複 fetch。
+`FridgeDO` 走的是第一種：一個沒有自帶 `schedule` 的 serialized driver，所以被用到的是 store 的那一半。反例：一個回報 `atomicClaim: false` 的 store 搭配 `cronDriver(ctx)` 會拋錯，因為重疊的 cron invocation 會導致重複 fetch。
 
 ## Driver contract
 
@@ -92,7 +90,8 @@ Driver 是 integration shell，它的義務：
 1. 在自己的節奏下呼叫 `fridge.runDue(now?)`。
 2. 提供 `defer(promise)` - Workers 版接到 `ctx.waitUntil`；常駐 process 版是 no-op。
 3. 宣告 `serialized: boolean` - 保證 `runDue` 永遠不會併發執行（單線程的 DO 或單一 node process 成立；Cron Triggers 不成立）。
-4. 可選：自帶 `schedule: SchedulePlane`（有狀態 driver 的內部簿記，如 DO alarms）。
+4. 可選：自帶 `schedule: SchedulePlane`（有狀態 driver 的內部簿記）。
+5. 可選：宣告 `budgetMs` - 這次 invocation 最多能跑多久。Tick 之後只在某次呼叫自己的 `timeout` 還塞得進剩餘時間時才放行，其餘延到下一輪，而不是做到一半被砍。有 wall clock 的平台（Cloudflare 的 15 分鐘）都應該宣告它。
 
 非 serialized 的 driver 搭配沒有 `atomicClaim` 的排程簿記，是建構時錯誤。
 

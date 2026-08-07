@@ -45,6 +45,7 @@ describe('parameterized queries', () => {
       throttled: [],
       deferred: [],
       failed: [],
+      nextRunAt: 300_000,
     })
     expect(seen).toEqual(variants)
 

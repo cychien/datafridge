@@ -1,14 +1,20 @@
 import { ConfigError, createFridge, defineQueries, Queries, resolveSources } from '@datafridge/core'
 import type { Driver, QueryDefinition, RunReport, SourcePolicy, Store } from '@datafridge/core'
-import { assertTimeoutsFitInvocation } from './limits.js'
+import { assertTimeoutsFitInvocation, INVOCATION_WALL_CLOCK_LIMIT_MS } from './limits.js'
 
 /**
  * Cron trigger driver: non-serialized because scheduled invocations can
  * overlap, so the schedule plane must provide atomic claims - which d1's CAS
- * provides.
+ * provides. It carries the platform's wall clock as the tick's budget, so a
+ * tick stops admitting work it could not finish rather than being killed
+ * halfway through it.
  */
 export function cronDriver(ctx: ExecutionContext): Driver {
-  return { serialized: false, defer: (promise) => ctx.waitUntil(promise) }
+  return {
+    serialized: false,
+    defer: (promise) => ctx.waitUntil(promise),
+    budgetMs: INVOCATION_WALL_CLOCK_LIMIT_MS,
+  }
 }
 
 export interface CronFridgeConfig<Env> {

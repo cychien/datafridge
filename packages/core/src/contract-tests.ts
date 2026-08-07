@@ -31,6 +31,7 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
  *   it was passed, which varies per call and is therefore never stored
  * - releaseQuota credits back a slot taken in the window the ledger is still on, never
  *   one it has moved past, and never drives usage below zero
+ * - listDue is the only enumeration core performs, and it is always given a limit
  */
 export function storeContractSuite(label: string, makeStore: StoreFactory): void {
   describe(`store contract: ${label}`, () => {
@@ -78,61 +79,13 @@ export function storeContractSuite(label: string, makeStore: StoreFactory): void
         expect(await store.readResult('q')).toEqual(envelope({ data: { count: 1 } }))
       })
 
-      it('counts a new result as read when it lands, so retain does not start expired', async () => {
-        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 5_000 }))
-        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
-        expect(await store.readResult('@df/v1/q/aaa')).not.toBeNull()
-      })
-
-      it('touchResult moves the entry past an eviction it would otherwise fail', async () => {
-        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 1_000 }))
-        await store.touchResult('@df/v1/q/aaa', 9_000)
-        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
-        expect(await store.readResult('@df/v1/q/aaa')).not.toBeNull()
-      })
-
-      it('touchResult on a result that is not there is not an error', async () => {
-        await expect(store.touchResult('missing', 1_000)).resolves.not.toThrow()
-        expect(await store.readResult('missing')).toBeNull()
-      })
-
-      it('preserves last_read_at across a rewrite of the same entry', async () => {
-        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 1_000 }))
-        await store.touchResult('@df/v1/q/aaa', 9_000)
-        // A refresh is not a read: the stamp stays where the reader put it.
-        await store.writeResult('@df/v1/q/aaa', envelope({ fetchedAt: 2_000 }))
-        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual([])
-      })
-
-      it('evictIdleResults removes only idle entries under the prefix, and names them', async () => {
-        await store.writeResult('@df/v1/q/idle', envelope())
-        await store.touchResult('@df/v1/q/idle', 1_000)
-        await store.writeResult('@df/v1/q/warm', envelope())
-        await store.touchResult('@df/v1/q/warm', 9_000)
-        await store.writeResult('@df/v1/other/idle', envelope())
-        await store.touchResult('@df/v1/other/idle', 1_000)
-        await store.writeResult('plain', envelope())
-        await store.touchResult('plain', 1_000)
-
-        expect(await store.evictIdleResults('@df/v1/q/', 5_000)).toEqual(['@df/v1/q/idle'])
-        expect(await store.readResult('@df/v1/q/idle')).toBeNull()
-        expect(await store.readResult('@df/v1/q/warm')).not.toBeNull()
-        expect(await store.readResult('@df/v1/other/idle')).not.toBeNull()
-        expect(await store.readResult('plain')).not.toBeNull()
-      })
-
-      it('evictIdleResults leaves the schedule row alone: the caller owns that half', async () => {
-        await store.writeResult('@df/v1/q/idle', envelope())
-        await store.touchResult('@df/v1/q/idle', 1_000)
-        await store.writeSchedule({
-          name: '@df/v1/q/idle',
-          nextRunAt: 1_000,
-          failCount: 0,
-          leaseUntil: null,
-          version: 1,
-        })
-        await store.evictIdleResults('@df/v1/q/', 5_000)
-        expect(await store.readSchedule('@df/v1/q/idle')).not.toBeNull()
+      it('keeps variant results apart, so one base cannot read another one', async () => {
+        await store.writeResult('@df/v1/q/aaa', envelope({ data: 'mine' }))
+        await store.writeResult('@df/v1/other/aaa', envelope({ data: 'theirs' }))
+        expect((await store.readResult('@df/v1/q/aaa'))?.data).toBe('mine')
+        await store.deleteResult('@df/v1/q/aaa')
+        expect(await store.readResult('@df/v1/q/aaa')).toBeNull()
+        expect((await store.readResult('@df/v1/other/aaa'))?.data).toBe('theirs')
       })
     })
 

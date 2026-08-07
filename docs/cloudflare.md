@@ -33,7 +33,7 @@ pnpm exec wrangler secret put UPSTREAM_API_TOKEN
 
 ## Durable Object alarms: `FridgeDO`
 
-The scheduler here is the class you export: `wrangler` instantiates it by `class_name` and its alarm loop drives every tick. `FridgeDO` is a serialized driver that carries its own schedule bookkeeping, so it only needs somewhere to put envelopes. Use it when you want alarms scheduled at exact due timestamps, dynamic backoff without fixed cron wakeups, or serialized schedule coordination.
+The scheduler here is the class you export: `wrangler` instantiates it by `class_name` and its alarm loop drives every tick. `FridgeDO` is a scheduler and nothing else - it keeps no dispatch state of its own, and works entirely against the Store you give it. Use it when you want alarms at exact due timestamps and dynamic backoff without fixed cron wakeups.
 
 ```ts
 import { createReader, defineQueries } from '@datafridge/core'
@@ -102,7 +102,7 @@ database_name = "datafridge"
 database_id = "..."
 ```
 
-The Durable Object stores only schedule rows in its own SQLite. Fetchers execute in the object, envelopes go to D1, and the read path goes directly to D1.
+**D1 is the whole coordination plane.** Schedule rows, leases, versions, backoff, the quota ledger and result envelopes all live there; the object's own SQLite holds one row recording which registry it last ignited for, and nothing else. That is what lets a second scheduler, a cron trigger, or any number of request-path readers work against the same data without going through this object - and it is why the read path never does. Fetchers for scheduled refreshes execute in the object; reads are served wherever the request landed.
 
 ### Alarm lifecycle
 
@@ -180,7 +180,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 | | `FridgeDO` | `cronFridge` |
 |---|---|---|
 | Driver | Durable Object alarms | Cron Triggers |
-| Schedule plane | Durable Object SQLite | D1 |
+| Schedule plane | D1 | D1 |
 | Claims | Serialized actor | D1 compare-and-swap |
 | Result plane | D1 | D1 |
 | Scheduler floor | Exact alarm timestamp, 1-second safety floor | 1 minute |
@@ -192,24 +192,24 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 
 ## Construction-time validation
 
-- `defineQueries` validates names, durations, fetchers, duplicate variants, `timeout < lease`, and `retain > every`.
+- `defineQueries` validates names, durations, fetchers, duplicate variants, `timeout < lease`, and that an `anyParams` base declares no list, `every`, `lease`, `validUntil` or `codec`.
 - `FridgeDO` validates its registry, source policies, and the Cloudflare wall-clock ceiling during ignition and before alarms.
 - `cronFridge` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
 - A source policy must declare a `limit`, a `maxConcurrent`, or both; `limit.requests`, `limit.per` and `maxConcurrent` must be positive, and `limit.reserve` must be smaller than `limit.requests`.
 
-## On-demand entries on Cloudflare
+## The request path
 
-A `retain` query needs two things here that a declared one does not.
-
-The read path is a reader, so the reader is what records reads - and an entry nothing records reading is an entry that gets evicted. Give it `d1(env.DB)` (which has `touchResult`) and hand it the invocation's `waitUntil`, or the Worker may be torn down before the stamp lands:
+Give the reader the whole `d1(env.DB)` store, the registry, the source policies, and `ctx.waitUntil` as `defer`, and it is a complete read path: it serves what is stored, fills a cold entry itself through the same dispatcher a tick uses, and answers `anyParams` params with one fresh call.
 
 ```ts
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(ensureStarted(env.POLLER))
     const reader = createReader({
       store: d1(env.DB),
       queries,
+      sources,
       defer: (promise) => ctx.waitUntil(promise),
     })
     return Response.json(await reader.read('course-funnel', { courseId: 'course-a' }))
@@ -217,7 +217,9 @@ export default {
 }
 ```
 
-And the schedule plane has to be able to list its rows, since an entry nothing declared can only be found by enumerating what is stored. Both shipped planes can - `FridgeDO`'s SQLite and `d1`'s schedule half - so this only bites a hand-written one.
+Nothing here goes through the Durable Object. Reads scale with your Worker rather than queueing behind one singleton, and because every call still leaves through the dispatcher against the same D1, the source ceiling counts them alongside the scheduler's - the two coordinate through the store, which is the only place they meet.
+
+Hand the reader a results-only store instead and it goes back to serving and waiting, which is the right shape for a consumer in another service that should never call upstream. A registry with an `anyParams` base then fails at construction rather than at read time.
 
 ## Failure and recovery
 
@@ -228,7 +230,7 @@ And the schedule plane has to be able to list its rows, since an entry nothing d
 | Executor death | Reclaim after lease expiry | Return the current envelope immediately |
 | Late zombie write | Reject on version mismatch | Remain unchanged |
 | Per-source quota exhausted | Keep due for a later tick, more overdue | Return the current envelope; on a miss, `status: 'throttled'` |
-| Past this tick's capacity (`maxPerTick`) | Leave the row untouched and name it in `RunReport.deferred`; the alarm re-arms on what is still due | Unaffected: a read never waits on a tick |
+| Past this invocation's capacity | Leave the row untouched and name it in `RunReport.deferred`; the alarm re-arms on the tick's own `nextRunAt` | Unaffected: a read never waits on a tick |
 | No successful refresh yet | Continue scheduled attempts | Return `null` |
 | Alarm-level error | Schedule the next alarm in `finally` | Existing D1 envelopes remain readable |
 
@@ -247,7 +249,7 @@ Backoff is `min(every, 1m * 2^(failCount - 1))` plus jitter. Success resets the 
 
 D1 is single-region, so readers at remote PoPs can incur cross-region latency. Result-plane replicas are outside the shipped scope.
 
-One `FridgeDO` instance coordinates the entire registry. Sharding it by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit. A declared registry of a few dozen queries is nowhere near it, and a `retain` base - whose entry count is open-ended by design - does not get there either, because a tick loads and takes on at most [`maxPerTick`](./rate-limiting.md#the-capacity-maxpertick) entries and re-arms the alarm on what is left over.
+One `FridgeDO` instance drives the schedule for the entire registry, and reads never go through it. Sharding the scheduler by source is deliberately not implemented; the condition that would justify reconsidering it is a single `runDue` approaching the Durable Object invocation wall-clock limit, which [what one invocation will take on](./rate-limiting.md#the-capacity-what-one-invocation-will-take-on) is designed to prevent: a tick reads one bounded page, never begins a call whose timeout would outlast the invocation, and asks to be woken again immediately when it left work behind.
 
 ## Subpath imports
 

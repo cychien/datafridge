@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import { cronFridge } from '../src/cron.js'
 import { d1 } from '../src/d1.js'
+import { readOnly, stored } from './helpers.js'
 
 interface SchemaEnv {
   DB: D1Database
@@ -38,7 +39,7 @@ describe('d1 applies its own schema', () => {
 
     await invoke(handler)
 
-    const read = await createReader({ store: d1(env.DB) }).read<{ ok: boolean }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ ok: boolean }>('metrics'))
     expect(read).not.toBeNull()
     expect(read!.data).toEqual({ ok: true })
 
@@ -59,7 +60,7 @@ describe('d1 applies its own schema', () => {
     await invoke(handler)
 
     expect(ticks).toBe(2)
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read!.data).toEqual({ tick: 2 })
   })
 
@@ -83,7 +84,7 @@ describe('d1 applies its own schema', () => {
 
     await invoke(handler)
     expect(ticks).toBe(2)
-    const read = await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics')
+    const read = stored(await createReader({ store: d1(env.DB) }).read<{ tick: number }>('metrics'))
     expect(read!.data).toEqual({ tick: 2 })
   })
 
@@ -94,7 +95,7 @@ describe('d1 applies its own schema', () => {
 
   it('a cold read applies no schema: a read-only consumer creates nothing', async () => {
     const reader = createReader({
-      store: d1(env.DB),
+      store: readOnly(d1(env.DB)),
       queries: defineQueries([
         { name: 'metrics', every: '5m', timeout: '200ms', fetch: async () => ({ ok: true }) },
       ]),
@@ -139,7 +140,7 @@ describe('a cold read over a real D1', () => {
     const handler = cronFridge<SchemaEnv>({ queries, store: (e) => d1(e.DB) })
     await invoke(handler)
 
-    const result = await waiting
+    const result = stored(await waiting)
     expect(result).not.toBeNull()
     expect(result!.data).toEqual({ ok: true })
   })
@@ -149,14 +150,26 @@ describe('a cold read over a real D1', () => {
     expect(await bare.read('metrics')).toBeNull()
   })
 
-  it("gives up at the query's own timeout when nothing writes", async () => {
+  it("a reader that cannot fetch gives up at the query's own timeout", async () => {
     const impatient = defineQueries([
       { name: 'metrics', every: '5m', timeout: '300ms', fetch: async () => ({ ok: true }) },
     ])
-    const reader = createReader({ store: d1(env.DB), queries: impatient })
+    const reader = createReader({ store: readOnly(d1(env.DB)), queries: impatient })
     const started = Date.now()
     expect(await reader.read('metrics')).toBeNull()
     expect(Date.now() - started).toBeGreaterThanOrEqual(250)
+  })
+
+  it('a reader holding the whole store fills a cold read itself', async () => {
+    // The same dispatcher a tick uses, so this is one metered, leased call that
+    // leaves an ordinary entry behind - not a second path to upstream.
+    const reader = createReader({ store: d1(env.DB), queries })
+    expect(stored(await reader.read<{ ok: boolean }>('metrics'))!.data).toEqual({ ok: true })
+
+    const row = await env.DB.prepare('SELECT * FROM datafridge_schedule WHERE name = ?')
+      .bind('metrics')
+      .first<{ version: number; fail_count: number }>()
+    expect(row).toMatchObject({ version: 1, fail_count: 0 })
   })
 
   it('refuses a dynamic base whose timeout cannot fit an invocation', () => {

@@ -96,7 +96,7 @@ interface ScheduleRow {
 這一半只有兩個合法的家：
 
 1. store 本身，前提是它具備原子條件寫入（CAS）能力 - 適用任何併發環境（多實例 cron、多機部署）。
-2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（DO alarms 用自己的 SQLite；node timer 會用 process 記憶體加任意持久化）。這時 store 的排程那一半就閒置。
+2. 一個有狀態且 serialized 的 driver 內部 - driver 自己保證單寫者，簿記存哪裡是它的實作細節（node timer 會用 process 記憶體加任意持久化）。這時 store 的排程那一半就閒置。已出貨的東西都不走這條：`FridgeDO` 不保管任何自己的 dispatch 狀態，所以同一個 store 上的 Durable Object 與 cron trigger 是透過它協調，而不是透過「剛好是 singleton 的那個物件」。
 
 正式規則見 [writing-adapters.md](./writing-adapters.md)。
 
@@ -106,7 +106,7 @@ Parameterized query 會把有限的 runtime list 展開成一般 scheduled ident
 
 Variant params 是 canonical JSON。Storage key 為 `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`，所以 raw ID 與 preset value 不會出現在 D1 key 或 `RunReport`。SHA-256 提供跨 object key ordering 的穩定 collision-resistant identity。Params 用來識別，不是 secret storage。Credential 與 private payload 必須留在 binding 或 fetcher closure。
 
-`retain` base 沒有清單：它的 entry 就是最近被讀過的那些。這種 entry 只以 schedule row 的形式存在，所以那一列會帶著它的 key 僅僅雜湊掉的 params - 這正是它能被一個沒有人宣告過它的 tick 執行的原因。結束它的是 eviction：超過 `retain` 沒有人讀，結果與 row 一起消失，刷新也一起消失。
+`anyParams` base 沒有清單，也沒有 entry。是不是 entry 由 registry 決定：它指名的 params 是持久的排程 entry，它沒有指名的 params 根本不是 entry - 讀它就是走同一個 dispatcher 的一次全新呼叫，扣同一個 source 窗口、受同一個 timeout 約束，什麼都不存。讀者剛好問了什麼，不能就此把自己變成 scheduler 從此得永遠負責的工作。
 
 ## Staleness 語意
 
@@ -123,7 +123,8 @@ runDue(now):
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
                         5m query's period but only 0.07 of a 60m query's),
-                        then keep the first `maxPerTick`; the rest stay due
+                        then admit while the call's timeout fits the
+                        invocation and its source has not refused yet
 3. Take quota           one call against the source's ledger for the current
                         window, minus whatever `reserve` holds back for readers;
                         refused queries stay due and come back more overdue
@@ -136,7 +137,7 @@ runDue(now):
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, throttled, deferred, failed }
+Returns RunReport { ran, skippedLeased, throttled, deferred, failed, nextRunAt }
 ```
 
 關鍵決策：
@@ -173,5 +174,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Zombie 遲到寫回 | version 不符，寫入被拒 | 不受影響 |
 | 首輪尚未完成 | - | `null`（caller 應處理） |
 | Source 額度用完 | 保持到期，下個 tick 優先（過期比例升高） | 舊資料；miss 時為 `status: 'throttled'` |
-| 超出這個 tick 的容量 | 原封不動，名字放進 `deferred`，下個 tick 最過期 | 不受影響：讀取從不等待 tick |
+| 超出這次 invocation 的容量 | 原封不動，名字放進 `deferred`，下個 tick 最過期 | 不受影響：讀取從不等待 tick |
 | 連續失敗 | backoff 收斂在 `every`，永久保留 last-known-good | 舊資料 + 可見的 `lastError` |

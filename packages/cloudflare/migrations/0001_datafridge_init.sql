@@ -5,8 +5,7 @@
 
 CREATE TABLE IF NOT EXISTS datafridge_results (
   name TEXT PRIMARY KEY,
-  envelope TEXT NOT NULL,
-  last_read_at INTEGER NOT NULL DEFAULT 0
+  envelope TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS datafridge_schedule (

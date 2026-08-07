@@ -166,7 +166,9 @@ describe('reader.read on a cold query', () => {
     const clock = new FakeClock(0)
     const store = memoryStore()
     const { fridge } = makeFridge({ store, clock })
-    const reader = createReader({ store, queries, clock })
+    // Results only: this reader can serve and wait, but it cannot claim, so it
+    // has no way to make the call itself.
+    const reader = createReader({ store: resultsOnly(store), queries, clock })
 
     const read = reader.read<string>('q')
     await clock.advance(0)
@@ -176,6 +178,21 @@ describe('reader.read on a cold query', () => {
     await fridge.runDue()
     await clock.advance(50)
     await expect(read).resolves.toMatchObject({ data: 'v1' })
+  })
+
+  it('makes the call itself when it holds a store that can claim and meter', async () => {
+    const clock = new FakeClock(0)
+    const store = memoryStore()
+    const reader = createReader({ store, queries, clock, random: () => 0 })
+
+    const read = reader.read<string>('q')
+    await clock.advance(0)
+
+    // The same dispatcher a tick uses, so the entry it created is an ordinary
+    // one: a result, and a row scheduled a period out.
+    await expect(read).resolves.toMatchObject({ data: 'v1', isStale: false })
+    expect(await store.readResult('q')).not.toBeNull()
+    expect(await store.readSchedule('q')).toMatchObject({ nextRunAt: 300_000, failCount: 0 })
   })
 
   it('answers a miss immediately without the registry, since nothing says how long to wait', async () => {
@@ -225,7 +242,7 @@ describe('reader.read on a cold query', () => {
   it('waits exactly as long as the query may take, with nothing to configure', async () => {
     const clock = new FakeClock(0)
     const reader = createReader({
-      store: memoryStore(),
+      store: resultsOnly(memoryStore()),
       queries: defineQueries([{ name: 'q', every: '5m', timeout: '1s', fetch: async () => 'v1' }]),
       clock,
     })

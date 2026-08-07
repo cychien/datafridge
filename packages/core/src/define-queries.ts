@@ -1,9 +1,11 @@
 import type { Clock } from './clock.js'
 import { withDeadline } from './deadline.js'
 import { parseDuration } from './duration.js'
+import type { Duration } from './duration.js'
 import { ConfigError } from './errors.js'
 import { queryKey, snapshotQueryParams, validateQueryName } from './query-key.js'
 import type {
+  EphemeralQuery,
   FetchCtx,
   ParameterizedQueryDef,
   QueryCodec,
@@ -36,18 +38,16 @@ export interface DynamicVariants {
 }
 
 /**
- * A parameterized query with no list: its entries are whatever has been read
- * lately. A read for params nobody declared creates one; `retainMs` of nothing
- * reading it removes it again. Between those two moments it is an ordinary
- * scheduled entry, refreshed on its own period like any other.
+ * A parameterized query with no list and no entries. Params the registry does
+ * not name are answered by one fresh call through the dispatcher and nothing is
+ * kept: no row, no lease, no envelope. Being an entry is what the registry
+ * decides, never what somebody happened to ask for.
  */
-export interface OnDemandBase {
+export interface OpenBase {
   readonly baseName: string
-  readonly everyMs: number
   readonly timeoutMs: number
-  readonly retainMs: number
-  readonly codec?: QueryCodec
-  readonly instantiate: (params: QueryParams) => ResolvedQuery
+  readonly source: string
+  readonly instantiate: (params: QueryParams) => EphemeralQuery
 }
 
 // Construction stays free of time: the bound belongs to whoever owns a clock.
@@ -95,26 +95,26 @@ export function resolveMemberBy(
 export class Queries {
   readonly all: readonly ResolvedQuery[]
   readonly dynamic: readonly DynamicVariants[]
-  readonly onDemand: readonly OnDemandBase[]
+  readonly open: readonly OpenBase[]
   readonly #byName: Map<string, ResolvedQuery>
   readonly #dynamicByBase: Map<string, DynamicVariants>
-  readonly #onDemandByBase: Map<string, OnDemandBase>
+  readonly #openByBase: Map<string, OpenBase>
 
   constructor(
     all: readonly ResolvedQuery[],
     dynamic: readonly DynamicVariants[] = [],
-    onDemand: readonly OnDemandBase[] = [],
+    open: readonly OpenBase[] = [],
   ) {
     this.all = all
     this.dynamic = dynamic
-    this.onDemand = onDemand
+    this.open = open
     this.#byName = new Map(all.map((query) => [query.name, query]))
     this.#dynamicByBase = new Map(dynamic.map((entry) => [entry.baseName, entry]))
-    this.#onDemandByBase = new Map(onDemand.map((entry) => [entry.baseName, entry]))
+    this.#openByBase = new Map(open.map((entry) => [entry.baseName, entry]))
   }
 
-  onDemandFor(baseName: string): OnDemandBase | undefined {
-    return this.#onDemandByBase.get(baseName)
+  openFor(baseName: string): OpenBase | undefined {
+    return this.#openByBase.get(baseName)
   }
 
   get(name: string, params?: QueryParams): ResolvedQuery | undefined {
@@ -147,7 +147,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
   const keys = new Set<string>()
   const resolved: ResolvedQuery[] = []
   const dynamic: DynamicVariants[] = []
-  const onDemand: OnDemandBase[] = []
+  const open: OpenBase[] = []
 
   for (const definition of definitions) {
     validateQueryName(definition.name)
@@ -157,14 +157,14 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     baseNames.add(definition.name)
 
     if (isParameterized(definition)) {
-      if (definition.retain !== undefined) {
+      if (definition.anyParams !== undefined) {
         if (definition.variants !== undefined || definition.dimensions !== undefined) {
           throw new ConfigError(
-            `query '${definition.name}': retain names no list, so it cannot be combined ` +
+            `query '${definition.name}': anyParams names no list, so it cannot be combined ` +
               'with variants or dimensions',
           )
         }
-        onDemand.push(makeOnDemand(definition))
+        open.push(makeOpen(definition))
         continue
       }
       const source = variantSource(definition)
@@ -189,7 +189,7 @@ export function defineQueries(definitions: readonly QueryDefinition[]): Queries 
     resolved.push(query)
   }
 
-  return new Queries(Object.freeze(resolved), Object.freeze(dynamic), Object.freeze(onDemand))
+  return new Queries(Object.freeze(resolved), Object.freeze(dynamic), Object.freeze(open))
 }
 
 type VariantSource =
@@ -271,23 +271,39 @@ function cartesian(
   return combos
 }
 
-function makeOnDemand(definition: ParameterizedQueryDef): OnDemandBase {
+function makeOpen(definition: ParameterizedQueryDef): OpenBase {
   const at = `query '${definition.name}'`
-  const settings = resolveSettings(definition)
-  const retainMs = parseDuration(definition.retain!, `${at}: retain`)
-  if (retainMs <= settings.everyMs) {
+  if (definition.anyParams !== true) {
+    throw new ConfigError(`${at}: anyParams must be true, or left out entirely`)
+  }
+  if (typeof definition.fetch !== 'function') {
+    throw new ConfigError(`${at}: fetch must be a function`)
+  }
+  if ((definition as { codec?: unknown }).codec !== undefined) {
     throw new ConfigError(
-      `${at}: retain (${retainMs}ms) must be longer than every (${settings.everyMs}ms), ` +
-        'otherwise an entry is evicted before it is ever refreshed',
+      `${at}: anyParams stores nothing, so a codec would have nothing to encode`,
     )
   }
+  const timeoutMs =
+    definition.timeout === undefined
+      ? DEFAULT_TIMEOUT_MS
+      : parseDuration(definition.timeout, `${at}: timeout`)
+  const source = definition.source ?? 'default'
   return Object.freeze({
     baseName: definition.name,
-    everyMs: settings.everyMs,
-    timeoutMs: settings.timeoutMs,
-    retainMs,
-    ...(settings.codec ? { codec: settings.codec } : {}),
-    instantiate: (params: QueryParams) => resolveParameterizedQuery(definition, params),
+    timeoutMs,
+    source,
+    instantiate: (params: QueryParams): EphemeralQuery => {
+      const snapshot = snapshotQueryParams(params)
+      return Object.freeze({
+        name: queryKey(definition.name, snapshot),
+        baseName: definition.name,
+        params: snapshot,
+        timeoutMs,
+        source,
+        fetch: (ctx: FetchCtx) => definition.fetch({ ...ctx, params: snapshot }),
+      })
+    },
   })
 }
 
@@ -350,7 +366,7 @@ function resolveSettings(definition: QueryDefinition) {
   if (typeof definition.fetch !== 'function') {
     throw new ConfigError(`${at}: fetch must be a function`)
   }
-  const everyMs = parseDuration(definition.every, `${at}: every`)
+  const everyMs = parseDuration(definition.every as Duration, `${at}: every`)
   const timeoutMs =
     definition.timeout === undefined
       ? DEFAULT_TIMEOUT_MS
@@ -365,13 +381,7 @@ function resolveSettings(definition: QueryDefinition) {
         'otherwise a live executor could outlive its lease',
     )
   }
-  const codec = definition.codec
-  if (
-    codec !== undefined &&
-    (typeof codec.encode !== 'function' || typeof codec.decode !== 'function')
-  ) {
-    throw new ConfigError(`${at}: codec must provide encode and decode functions`)
-  }
+  const codec = validateCodec((definition as { codec?: unknown }).codec, at)
   if (definition.validUntil !== undefined && typeof definition.validUntil !== 'function') {
     throw new ConfigError(`${at}: validUntil must be a function returning an epoch-ms timestamp`)
   }
@@ -380,10 +390,19 @@ function resolveSettings(definition: QueryDefinition) {
     timeoutMs,
     leaseMs,
     source: definition.source ?? 'default',
-    ...(codec ? { codec: codec as QueryCodec } : {}),
+    ...(codec ? { codec } : {}),
   }
 }
 
+function validateCodec(codec: unknown, at: string): QueryCodec | undefined {
+  if (codec === undefined) return undefined
+  const candidate = codec as Partial<QueryCodec>
+  if (typeof candidate.encode !== 'function' || typeof candidate.decode !== 'function') {
+    throw new ConfigError(`${at}: codec must provide encode and decode functions`)
+  }
+  return codec as QueryCodec
+}
+
 function isParameterized(definition: QueryDefinition): definition is ParameterizedQueryDef {
-  return 'variants' in definition || 'dimensions' in definition || 'retain' in definition
+  return 'variants' in definition || 'dimensions' in definition || 'anyParams' in definition
 }

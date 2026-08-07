@@ -3,7 +3,7 @@ export type { Clock } from './clock.js'
 export { parseDuration } from './duration.js'
 export type { Duration, DurationString } from './duration.js'
 export { defineParameterizedQuery, defineQueries, Queries } from './define-queries.js'
-export type { DynamicVariants, OnDemandBase } from './define-queries.js'
+export type { DynamicVariants, OpenBase } from './define-queries.js'
 export { createFridge } from './engine.js'
 export type { Fridge, FridgeConfig } from './engine.js'
 export { ConfigError, RateLimitError, TimeoutError } from './errors.js'
@@ -17,6 +17,7 @@ export { systemClock } from './system-clock.js'
 export type {
   DimensionValues,
   Driver,
+  EphemeralQuery,
   Envelope,
   FetchCtx,
   LastError,

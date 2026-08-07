@@ -52,11 +52,16 @@ Before giving up it waits, inside its own `timeout`, for the window to roll - so
 
 In flight means in flight: a reader waiting out a window hands its slot back for the duration, so a call that is doing nothing cannot hold the budget that exists to bound calls that are.
 
-## The capacity: `maxPerTick`
+## The capacity: what one invocation will take on
 
-`maxPerTick` is not a rate limit and does not belong to a source. It is how many entries one `runDue` loads and takes on - a bound on the invocation, not on upstream - and it matters because [`retain`](./api.md#on-demand-entries) makes the entry count open-ended in a way a declared registry never was. It defaults to 500.
+Capacity is not a rate limit and does not belong to a source, and it is not a number you set. A tick bounds itself from things you already declared:
 
-What does not fit is not touched: no lease, no store write, nothing asked of upstream. Those names come back in `RunReport.deferred`, and because priority is the overdue ratio they are the most overdue thing the next tick sees. A `FridgeDO` re-arms its alarm from the rows that are still due, so a backlog drains at the one-second alarm floor rather than in one invocation that risks the wall clock.
+- It reads **one bounded page** of the earliest rows. Page size is an implementation detail; what matters is that no registry size can make a tick read more storage than that.
+- It admits a call only while that call's own **`timeout`** still fits in the invocation's remaining wall clock, which the driver reports as `budgetMs`. Work that could not have finished is never begun.
+- It stops asking a source that has **already refused this tick**. One `takeQuota` answer is how it learns the window is spent; the rest of that source's work is deferred without paying a round trip to be told the same thing.
+- It removes at most a **bounded number of departed rows** per tick, because a list that dropped ten thousand variants at once is a deployment, not an emergency.
+
+What does not fit is not touched: no lease, no store write, nothing asked of upstream. Those names come back in `RunReport.deferred`, and because priority is the overdue ratio they are the most overdue thing the next tick sees. The tick also reports `nextRunAt`, so a `FridgeDO` re-arms straight away when there is a backlog and drains it at the one-second alarm floor rather than in one invocation that risks the wall clock.
 
 ## Jitter
 

@@ -48,10 +48,10 @@ describe('codec', () => {
     await fridge.runDue()
 
     const withRegistry = createReader({ store, queries, clock })
-    expect((await withRegistry.read<Map<string, number>>('views'))!.data).toBeInstanceOf(Map)
+    expect(stored(await withRegistry.read<Map<string, number>>('views'))!.data).toBeInstanceOf(Map)
 
     const bare = createReader({ store: resultsOnly(store), clock })
-    expect((await bare.read('views'))!.data).toEqual({
+    expect(stored(await bare.read('views'))!.data).toEqual({
       rows: [
         ['/a', 3],
         ['/b', 7],

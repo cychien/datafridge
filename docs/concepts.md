@@ -96,7 +96,7 @@ interface ScheduleRow {
 This half has exactly two legitimate homes:
 
 1. The store, when it has atomic conditional writes (CAS) - works in any concurrent environment (multi-instance cron, multi-machine deployments).
-2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (DO alarms use their own SQLite; a node timer would use process memory plus any persistence). The store's schedule half then goes unused.
+2. Inside a stateful, serialized driver - the driver guarantees a single writer, and where it keeps the bookkeeping is its own implementation detail (a node timer would use process memory plus any persistence). The store's schedule half then goes unused. Nothing shipped takes this route: `FridgeDO` keeps no dispatch state of its own, so a Durable Object and a cron trigger over the same store coordinate through it rather than through whichever object is the singleton.
 
 The formal rules are in [writing-adapters.md](./writing-adapters.md).
 
@@ -106,7 +106,7 @@ A parameterized query expands a finite runtime list into ordinary scheduled iden
 
 Variant params are canonical JSON. The storage key is `@df/v1/<encoded-base-name>/<sha256-of-canonical-params>`, so raw IDs and preset values do not appear in D1 keys or `RunReport`. SHA-256 provides a stable collision-resistant identity across object key ordering. Params are identifiers, not secret storage: credentials and private payloads must remain in bindings or fetcher closures.
 
-A `retain` base has no list: its entries are whatever has been read lately. Such an entry exists only as a schedule row, so the row carries the params its key merely hashes - that is what makes it runnable by a tick that nothing declared it to. Eviction is what ends it: nothing reading it for `retain` removes the result and the row together, and with them the refreshing.
+An `anyParams` base has no list, and no entries either. Being an entry is what the registry decides: params it names are persistent scheduled entries, and params it does not name are not entries at all - reading them is one fresh call through the same dispatcher, metered by the same source window and bounded by the same timeout, storing nothing. Nothing a reader happens to ask for can turn itself into work the scheduler then owns forever.
 
 ## Staleness semantics
 
@@ -123,7 +123,8 @@ runDue(now):
 2. Prioritize           by overdue ratio (now - nextRunAt) / every, descending
                         (ratio, not absolute lateness: 4 minutes late is 0.8 of a
                         5m query's period but only 0.07 of a 60m query's),
-                        then keep the first `maxPerTick`; the rest stay due
+                        then admit while the call's timeout fits the
+                        invocation and its source has not refused yet
 3. Take quota           one call against the source's ledger for the current
                         window, minus whatever `reserve` holds back for readers;
                         refused queries stay due and come back more overdue
@@ -136,7 +137,7 @@ runDue(now):
                                  failCount = 0
                         failure: keep old envelope, failCount++,
                                  nextRunAt = now + backoff(failCount)
-Returns RunReport { ran, skippedLeased, throttled, deferred, failed }
+Returns RunReport { ran, skippedLeased, throttled, deferred, failed, nextRunAt }
 ```
 
 Key decisions:
@@ -173,5 +174,5 @@ Zombie write  version has moved on, write rejected; one upstream call wasted,
 | Zombie writes back late | version mismatch, write rejected | unaffected |
 | First round not finished | - | `null` (callers should handle it) |
 | Out of source quota | stays due, prioritized next tick (overdue ratio grows) | old data; on a miss, `status: 'throttled'` |
-| Past this tick's capacity | untouched, named in `deferred`, most overdue next tick | unaffected: a read never waits on a tick |
+| Past this invocation's capacity | untouched, named in `deferred`, most overdue next tick | unaffected: a read never waits on a tick |
 | Persistent failures | backoff converges at `every`, last-known-good kept forever | old data + `lastError` visible |

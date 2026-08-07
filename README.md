@@ -200,23 +200,23 @@ const result = await reader.read('course-analytics', { courseId: 'course-a', win
 
 Every variant becomes an ordinary independent registry entry with its own schedule, lease, backoff, failure count, and stored result. Adding or removing a variant reconciles exactly like adding or removing a named query.
 
-## Sets too large to list
+## Parameter spaces too large to list
 
-When the set is open-ended - one entry per custom date range, a funnel per course - `retain` replaces the list entirely:
+When the space is open-ended - any custom date range, any course - `anyParams` replaces the list entirely:
 
 ```ts
 const funnel = defineParameterizedQuery({
   name: 'course-funnel',
-  every: '15m',
-  retain: '2h',
+  anyParams: true,
+  timeout: '20s',
   source: 'posthog',
   fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
 })
 ```
 
-Any params become an entry the first time somebody reads them, and stay one - refreshed on `every`, metered by `source`, backed off on failure, exactly like a declared variant - until nothing has read them for `retain`. Then the entry goes, and with it the polling. What keeps an entry warm is a read, never a refresh, so nothing you have stopped looking at keeps costing you calls.
+Being an entry is what the registry decides, never what somebody happened to ask for. Params the registry names are scheduled entries with a row, a lease and a stored result. Params it does not name are answered by one fresh call - through the same dispatcher, so the same source ceiling, reserve, concurrency and timeout apply - and nothing is stored: no result, no row, no polling you did not ask for.
 
-That read has to be recorded, which on Cloudflare means the reader: give `createReader` a store with `touchResult` and hand it `ctx.waitUntil` as `defer`. See [on-demand entries](./docs/api.md#on-demand-entries).
+That is the trade you are making. A declared variant is kept current for you; an open one is fetched when you ask, and costs a call each time. See [open parameter spaces](./docs/api.md#open-parameter-spaces).
 
 ## Rate limiting by source
 

@@ -55,7 +55,7 @@ describe('read() contract', () => {
     await fridge.runDue()
 
     const reader = createReader({ store: resultsOnly(store) })
-    const result = await reader.read<string>('q')
+    const result = stored(await reader.read<string>('q'))
     expect(result).toMatchObject({ data: 'v1', fetchedAt: 0 })
     expect(result!.age).toBeGreaterThan(0)
   })

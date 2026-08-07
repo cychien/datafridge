@@ -4,7 +4,7 @@ English | [繁體中文](./zh-TW/writing-adapters.md)
 
 datafridge's core only depends on contracts; it assumes nothing about any platform. Durable Objects, D1, Redis, cron, and node timers are all just adapters. Some backends make an adapter unusually easy to implement (a DO's single-threaded execution, for example) - that is the adapter's luck, never a core assumption.
 
-The interfaces are deliberately tiny. The query registry is a finite set declared in code (a handful to a few dozen queries), so per-name `readSchedule` calls are entirely viable and `listDue` is only an optimization. This is the guarantee behind "any backend gets an adapter in half a day".
+The interfaces are deliberately tiny. The query registry is a finite set declared in code (a handful to a few dozen queries), so per-name `readSchedule` calls are entirely viable and `listDue` is only an optimization. Every call core makes is bounded: `listDue` always carries a finite limit, and no method asks a backend to hand over everything it holds. This is the guarantee behind "any backend gets an adapter in half a day".
 
 ## Store contract: one store, both halves
 
@@ -14,9 +14,6 @@ interface Store {
   readResult(name: string): Promise<Envelope | null>
   writeResult(name: string, env: Envelope): Promise<void>
   deleteResult(name: string): Promise<void>        // used by registry reconcile
-  // `retain`: record that something was read, and drop what has gone cold
-  touchResult(name: string, at: number): Promise<void>
-  evictIdleResults(keyPrefix: string, idleBefore: number): Promise<string[]>
 
   // schedule plane - coordination bookkeeping
   readSchedule(name: string): Promise<ScheduleRow | null>
@@ -29,8 +26,9 @@ interface Store {
   takeQuota(source: string, limit: number, windowMs: number, now: number): Promise<boolean>
   // hand a counted call back when it never happened, to the window it was taken in
   releaseQuota(source: string, windowMs: number, takenAt: number): Promise<void>
-  // optional capability: SQL backends can fetch all due rows in one query;
-  // without it, core reads row by row
+  // optional capability: SQL backends can fetch a page of the earliest rows in
+  // one query; without it, core reads row by row. `limit` is always finite -
+  // core never asks a store to enumerate itself
   listDue?(now: number, limit: number): Promise<ScheduleRow[]>
   capabilities: { atomicClaim: boolean; listDue: boolean }
 }
@@ -38,13 +36,13 @@ interface Store {
 
 A store holds both halves. Applications only ever meet this one interface.
 
-`touchResult` is reached from the read path, so like the two reads it must never apply schema: with nothing stored there is nothing to record. `evictIdleResults` deletes results and names them, and deliberately does not touch schedule rows - the schedule half may live in a different object entirely, so removing those is the caller's job. A fresh `writeResult` counts as read at its `fetchedAt`, or an entry created by a cold read would be evictable before anybody could record reading it; a later `writeResult` leaves the stamp where the reader put it, because a refresh is not a read.
-
 **A store creates the storage it needs.** Before its first write it must apply its own tables, keys, or collections, so no adapter ever ships a migration the user has to remember. Applying an equivalent schema by hand must stay a no-op, a backend whose storage disappears under a warm process must be repaired and retried rather than failing until that process recycles, and both reads - `readResult` and `readSchedule` - must stay plain reads: storage that does not exist yet reads as `null`, exactly like an empty one, because a read-only consumer's read path reaches both and must never apply schema. `@datafridge/cloudflare`'s `test/schema.test.ts` is the reference test to copy - the contract suite cannot enforce this, because the suite's factory is what prepares the backend.
 
 This is what keeps `datafridge init <target>` the same size on every platform.
 
-The two halves still have different consistency needs, and one shipped case proves it: a stateful serialized driver can keep the schedule bookkeeping itself, and then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone. `FridgeDO` is exactly that - its bookkeeping lives in the Durable Object's own SQLite while envelopes go to the store you hand it. `SchedulePlane` is adapter-level: implement it only if you are writing that kind of driver.
+The two halves still have different consistency needs, and a stateful serialized driver may keep the schedule bookkeeping itself; then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone, and it is adapter-level: implement it only if you are writing that kind of driver.
+
+**Nothing shipped does.** `FridgeDO` deliberately keeps no dispatch state of its own: rows, leases, quota and results all live in the Store it is given, so a Durable Object and a cron trigger over the same D1 coordinate through that store rather than through whichever object happens to be the singleton. A scheduler that owns the coordination plane is a scheduler you cannot add a second reader to.
 
 ## Capability matrix
 
@@ -54,7 +52,7 @@ The two halves still have different consistency needs, and one shipped case prov
 |---|---|
 | Redis | `SET NX PX` / Lua script |
 | D1 / Postgres / SQLite | `UPDATE ... WHERE version = ?`, check changed rows |
-| DO storage | single-threaded actor, inherently serialized (claim needs no CAS); used as the alarm driver's own `SchedulePlane` |
+| DO storage | single-threaded actor, inherently serialized (claim needs no CAS) |
 | memoryStore | synchronous within one process |
 
 A backend with no conditional-write primitive cannot host the schedule half at all, and one that is only eventually consistent cannot host it correctly. Such a backend declares `atomicClaim: false`, which construction accepts only under a serialized driver.
@@ -83,7 +81,7 @@ createFridge({ store: d1(env.DB), driver: cronDriver(ctx), queries })
 createFridge({ store: d1(env.DB), driver: { serialized: true, defer, schedule }, queries })
 ```
 
-`FridgeDO` constructs the second shape internally with its SQLite `SchedulePlane`. Counter-example: a store that reports `atomicClaim: false` under `cronDriver(ctx)` throws, because overlapping cron invocations could then double-fetch.
+`FridgeDO` takes the first shape: a serialized driver with no `schedule` of its own, so the store's half is the one that is used. Counter-example: a store that reports `atomicClaim: false` under `cronDriver(ctx)` throws, because overlapping cron invocations could then double-fetch.
 
 ## Driver contract
 
@@ -92,7 +90,8 @@ A driver is the integration shell. Its obligations:
 1. Call `fridge.runDue(now?)` on its own cadence.
 2. Provide `defer(promise)` - the Workers version wires it to `ctx.waitUntil`; long-lived processes make it a no-op.
 3. Declare `serialized: boolean` - a guarantee that `runDue` never executes concurrently (true for a single-threaded DO or a single node process; false for Cron Triggers).
-4. Optionally carry its own `schedule: SchedulePlane` (internal bookkeeping of a stateful driver, like DO alarms).
+4. Optionally carry its own `schedule: SchedulePlane` (internal bookkeeping of a stateful driver).
+5. Optionally declare `budgetMs` - how long this invocation may run. A tick then admits a call only while that call's own `timeout` still fits in what is left, and defers the rest rather than being killed halfway through them. Platforms with a wall clock (Cloudflare's 15 minutes) should always declare it.
 
 A non-serialized driver combined with schedule bookkeeping lacking `atomicClaim` is a construction-time error.
 

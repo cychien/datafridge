@@ -78,28 +78,30 @@ Params must be JSON values containing finite numbers, strings, booleans, nulls, 
 
 `queryKey(name, params?)` is the stable storage identity function. Fixed names remain unchanged. Variant identities use the reserved `@df/v1/` namespace, the encoded public base name, and SHA-256 of canonical params. Raw params are absent from schedule rows, D1 keys, and `RunReport`. Do not put credentials, tokens, or private payloads in params: bindings and fetcher closures are the correct homes for secrets.
 
-### On-demand entries
+### Open parameter spaces
 
-Some sets are too large or too open-ended to enumerate. `retain` names no list at all: any params become an entry the first time somebody reads them, and stop being one once nothing has read them for that long.
+Some parameter spaces are too large or too open-ended to enumerate. `anyParams` names no list at all: any params are accepted, and reading them is answered by one fresh call.
 
 ```ts
 const funnel = defineParameterizedQuery({
   name: 'course-funnel',
-  every: '15m',
-  retain: '2h',
+  anyParams: true,
+  timeout: '20s',
   source: 'posthog',
   fetch: ({ params, signal }) => fetchFunnel(params, { signal }),
 })
 ```
 
-Pass exactly one of `variants`, `dimensions`, or `retain`. Between creation and eviction an on-demand entry is an ordinary entry: its own schedule row, lease, backoff, and result, refreshed on `every` like anything else, and metered by its `source` like anything else - the read that creates it goes through the same dispatcher a tick does.
+Pass exactly one of `variants`, `dimensions`, or `anyParams`.
 
-- **What keeps it alive is a read**, not a refresh. Polling cannot keep an entry warm; only something asking for it can. The stamp is written off the critical path, so a read never waits for it.
-- **Eviction is what stops the refreshing.** An entry idle for longer than `retain` loses its result and its row, and with them its place in the tick. There is no second switch.
-- **`createReader` must be able to record reads.** On Cloudflare the read path is a reader, so pass it a store with `touchResult` - `d1(env.DB)` has it - and a `defer` (`ctx.waitUntil`) to hold the invocation open for the stamp. A reader that cannot record reads is a reader whose on-demand entries all go cold.
-- `retain` must be longer than `every`, and the schedule plane must be able to list its rows: an entry nothing declared can only be found by enumerating what is stored. Both are checked at construction.
+**Being an entry is what the registry decides, never what somebody happened to ask for.** A parameter combination the registry names - declared in `variants`, produced by `dimensions`, or returned by a dynamic list - is a persistent scheduled entry with its own row, lease, backoff and stored result. A combination the registry does not name is not an entry, and reading it stores nothing: no result, no schedule row, no membership. It is a call, and it is answered as one.
 
-A cold read whose very first fetch fails leaves a backoff row and no result, so a reader hammering a broken key cannot hammer upstream with it. Once that backoff expires the row is dropped: one read is not evidence of ongoing demand.
+That call still leaves through the same dispatcher everything else does, so it draws on the source's window (with the reserve a waiting reader is entitled to), obeys `maxConcurrent`, is bounded by the base's own `timeout`, and honours `RateLimitError`. What it does not get is a lease, because there is no entry for it to be the current value of - so two simultaneous reads of the same unnamed params are two calls, and the source ceiling is what bounds them.
+
+- **It is never scheduled.** An open base contributes nothing to a tick, so it declares no `every`, no `lease` and no `validUntil`. Nothing is stored, so it takes no `codec` either; all four are rejected at construction.
+- **A read must pass params.** An open base with no params names no combination at all.
+- **The reader has to be able to make the call.** `createReader` needs the whole store - one that can claim and meter, like `d1(env.DB)` - not a results-only one. That is checked when the reader is constructed, not when somebody reads.
+- **A failed call answers `null`**, and leaves no backoff behind, because there is nothing for a backoff to be attached to. Reach for a declared variant when you want failure to be remembered.
 
 ### Fridge
 
@@ -118,12 +120,12 @@ const value = await fridge.read<Result>('analytics-7d')
 `createFridge(config)` requires:
 
 - `queries`: a `Queries` registry or raw query definitions
-- `driver`: `{ serialized, defer(promise), schedule? }`
+- `driver`: `{ serialized, defer(promise), schedule?, budgetMs? }`
 - `store`: one store holding both result envelopes and schedule rows
 
-Optional fields are `sources`, `maxPerTick`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
+Optional fields are `sources`, `clock`, and `random`. `clock` and `random` exist for deterministic adapters and tests. See [where the schedule half comes from](./writing-adapters.md#where-the-schedule-half-comes-from-decided-at-config-time).
 
-`maxPerTick` is how many entries one tick loads and takes on; it defaults to 500 and must be a positive integer. It is capacity, not rate: a source's `limit` says how hard upstream may be hit, this says how much work one invocation is willing to be, which matters once `retain` makes the entry count open-ended. What does not fit is left exactly as it was, comes back in `RunReport.deferred`, and is the most overdue thing there is next tick - so a bound spreads work out and never starves it.
+There is no knob for how much work one tick does. A tick reads one bounded page of rows, takes the most overdue of them first, admits a call only while its own `timeout` still fits the invocation's `budgetMs` and while its source has not already refused this tick, and leaves the rest exactly as it found them. Page sizes are an implementation detail and deliberately not configurable; what bounds a tick is the things you already declared - `every`, `timeout`, `limit`, `reserve`, `maxConcurrent` - plus the wall clock the driver reports.
 
 Construction rejects a missing or malformed driver, a store missing either half, an invalid source policy, or a store that cannot claim atomically under a non-serialized driver.
 
@@ -138,10 +140,11 @@ interface RunReport {
   throttled: string[]
   deferred: string[]
   failed: Array<{ name: string; message: string }>
+  nextRunAt: number | null
 }
 ```
 
-`throttled` is the source ceiling and `deferred` is this tick's capacity; both leave the row exactly as it was, so both come back more overdue rather than lost.
+`throttled` is the source ceiling and `deferred` is this invocation's capacity; both leave the row exactly as it was, so both come back more overdue rather than lost. `nextRunAt` is when this fridge next has work, computed from the rows the tick already held - a driver that schedules its own wake-ups uses it instead of asking storage again, and `null` means there is nothing scheduled at all.
 
 A successful refresh schedules the next run from completion time. A failure preserves the prior envelope and retries with jittered exponential backoff capped at `every`.
 
@@ -165,14 +168,12 @@ const result = await fridge.read<Result>('analytics-7d')
 if (result?.status === 'throttled') return retryAfter(result.retryAt)
 ```
 
-`createReader` never produces it: a reader has no fetchers, so nothing it does can be rate limited.
+A reader over the whole store answers this the same way, because it is the same read path.
 
 ### Reader
 
-A reader has no fetchers: `readResult` is all it needs to answer, and where the store offers `readSchedule` a miss reads the schedule row once, to tell a fetch that is about to land from a retry already scheduled for later:
-
 ```ts
-const reader = createReader({ store, queries })
+const reader = createReader({ store, queries, sources, defer })
 const fixed = await reader.read<Result>('analytics-7d')
 const variant = await reader.read<Result>('course-analytics', {
   courseId: 'course-a',
@@ -180,7 +181,13 @@ const variant = await reader.read<Result>('course-analytics', {
 })
 ```
 
-`queries` is optional, and it decides two things. A name outside the registry throws instead of reading as `null`, and a miss waits for whichever executor is fetching - a reader cannot fetch, but it can wait, for as long as that query's `timeout` allows. Without the registry a reader needs nothing but a store, which is what lets it live in another Worker, another service, or another language; a miss then answers `null` at once, because nothing tells it how long a first result may take.
+`store` decides what a reader is allowed to do, and there are two kinds.
+
+**A results-only store** - anything with `readResult`, plus `readSchedule` if it has one - makes a reader that serves and waits. A hit is answered at once; a miss waits for whichever executor is fetching, and where `readSchedule` exists it tells a fetch about to land from a retry already scheduled for later, so it does not wait out a backoff. This is the reader that lives in another Worker, another service, or another language.
+
+**The whole store** - one that can claim and meter, like `d1(env.DB)` - makes a reader that can also fetch, through the same dispatcher a tick uses. A miss coalesces behind the same lease, spends the same source window, and leaves the same ordinary entry behind; `anyParams` reads are answered by one fresh call. This is what makes a request path complete on its own, with no scheduler in the loop and no singleton to queue behind. Because it can now be rate limited, its reads can answer `status: 'throttled'` too.
+
+`queries` is optional, and it decides two things: a name outside the registry throws instead of reading as `null`, and a miss knows how long it may take. Without it a reader needs nothing but a store, and a miss answers `null` at once because nothing tells it how long a first result may take. `sources` declares the ceilings for calls this reader makes itself, and `defer` (`ctx.waitUntil` on Workers) is where a fetch that outlives the answer goes to finish.
 
 The result is:
 

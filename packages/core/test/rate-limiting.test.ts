@@ -159,7 +159,10 @@ describe('maxConcurrent', () => {
     })
     await flushMicrotasks(200)
     expect(settled).toBe(true)
-    expect((await run).throttled.toSorted()).toEqual(['cold', 'other'])
+    // One of them learns the window is spent; the other is not made to ask.
+    const report = await run
+    expect([...report.throttled, ...report.deferred].toSorted()).toEqual(['cold', 'other'])
+    expect(report.throttled).toHaveLength(1)
 
     await clock.advance(MINUTE)
     expect(stored(await read)).toMatchObject({ data: 'cold' })

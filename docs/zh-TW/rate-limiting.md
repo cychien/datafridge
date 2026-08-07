@@ -52,11 +52,16 @@ if (result?.status === 'throttled') {
 
 在途就是在途：等窗口輪轉的讀者會在等待期間把自己的名額還回去，所以什麼都沒在做的呼叫，不會佔住那個專門用來限制「真的在做事的呼叫」的預算。
 
-## 容量：`maxPerTick`
+## 容量：單次 invocation 願意承接多少
 
-`maxPerTick` 不是 rate limit，也不屬於任何 source。它是單一 `runDue` 會載入並承接多少 entry - 限制的是 invocation，不是上游 - 而它之所以重要，是因為 [`retain`](./api.md#on-demand-entries) 讓 entry 數量變成宣告式 registry 從來不會有的開放無界。預設 500。
+容量不是 rate limit，不屬於任何 source，也不是一個你去設定的數字。一個 tick 用你早就宣告過的東西自我約束：
 
-裝不下的東西不會被碰：沒有 lease、沒有 store 寫入、沒有向上游要任何東西。那些名字會回到 `RunReport.deferred`，而因為優先級是過期比例，它們就是下一個 tick 看到最過期的那一批。`FridgeDO` 會依照仍然到期的 row 重設 alarm，所以積壓會以一秒的 alarm 下限逐步排掉，而不是擠在一次可能撞上 wall clock 的 invocation 裡。
+- 它讀**一頁有界**、最早到期的 row。分頁大小是實作細節；重點是無論 registry 多大，一個 tick 讀的儲存量都不會超過那一頁。
+- 它只在某次呼叫自己的 **`timeout`** 還塞得進這次 invocation 剩餘的 wall clock 時才放行，而那個剩餘量由 driver 以 `budgetMs` 回報。不可能做完的工作，一開始就不會開始。
+- 它不再去問**這個 tick 已經拒絕過**的 source。一次 `takeQuota` 的答覆就是它學到窗口已空的方式；該 source 其餘的工作直接延後，不必再花一趟往返聽同一句話。
+- 它每個 tick 最多移除**有限筆**已離開的 row，因為一次掉了一萬個 variant 的清單是一次部署，不是一場事故。
+
+裝不下的東西不會被碰：沒有 lease、沒有 store 寫入、沒有向上游要任何東西。那些名字會回到 `RunReport.deferred`，而因為優先級是過期比例，它們就是下一個 tick 看到最過期的那一批。Tick 同時回報 `nextRunAt`，所以有積壓時 `FridgeDO` 會立刻重設 alarm，以一秒的下限逐步排掉，而不是擠在一次可能撞上 wall clock 的 invocation 裡。
 
 ## Jitter
 
