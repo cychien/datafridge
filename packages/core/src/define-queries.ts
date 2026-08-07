@@ -51,10 +51,11 @@ export interface OpenBase {
 }
 
 // Construction stays free of time: the bound belongs to whoever owns a clock.
-const NEVER_ABORTED = new AbortController().signal
-
+// The stand-in signal is built per call, never once at module scope: workerd
+// bans AbortController in global scope and would refuse to start any Worker
+// importing this file.
 function resolveCtx(signal: AbortSignal | undefined): ResolveCtx {
-  return { signal: signal ?? NEVER_ABORTED }
+  return { signal: signal ?? new AbortController().signal }
 }
 
 function resolutionLabel(dynamic: DynamicVariants): string {

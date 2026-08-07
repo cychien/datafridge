@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "migrate": "wrangler d1 migrations apply DB --local",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@datafridge/cloudflare": "workspace:*",
@@ -14,7 +14,9 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260804.1",
+    "@types/node": "^24.0.0",
     "typescript": "^5.9.2",
+    "vitest": "^4.1.10",
     "wrangler": "^4.119.0"
   }
 }
