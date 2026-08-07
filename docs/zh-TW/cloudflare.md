@@ -192,7 +192,7 @@ ctx.waitUntil(writeSanitizedOperations(report))
 
 ## 建構時驗證
 
-- `defineQueries` 驗證 names、durations、fetchers、duplicate variants、`timeout < lease`，以及 `anyParams` base 不得宣告清單或 `codec`（`every`、`lease`、`validUntil` 由型別擋下）。
+- `defineQueries` 驗證 names、durations、fetchers、duplicate variants、`timeout < lease`，以及 `anyParams` base 不得宣告清單、`every`、`lease`、`validUntil` 或 `codec`。
 - `FridgeDO` 在啟動與每次 alarm 前驗證 registry、source policies 與 Cloudflare wall-clock ceiling。
 - `cronFridge` 在建構時驗證 registry、store-factory shape、schedule-plane resolution 與 wall-clock ceiling。
 - Cloudflare query timeout 必須短於 15 分鐘。

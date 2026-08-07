@@ -100,7 +100,7 @@ const funnel = defineParameterizedQuery({
 
 **重疊的讀取仍然會合流。** 同一個 `queryKey` 的第一個讀者發出呼叫；在它還在跑的時候抵達的每一個讀者都加入那個 flight，並拿走它的答案。一百個同時進來的請求就是一次上游呼叫、一格額度，不管它們落在幾個 Worker 上 - flight 協調在 store 裡，不在某個 process 的記憶體裡。在那個 flight 結束**之後**才抵達的讀取，是一個新的 flight、一次新的呼叫：答案屬於等它的那批讀者，把它交給下一個來問的人就會變成快取，而那正是未指名組合不該有的東西。
 
-- **它永遠不會被排程。** Open base 對 tick 沒有任何貢獻，所以它不宣告 `every`、`lease` 或 `validUntil`，這三者由型別擋下。什麼都不存，所以也不吃 `codec` - `codec`、與 `anyParams` 並列的清單，以及不是 `true` 的 `anyParams`，都在建構時被拒絕。
+- **它永遠不會被排程。** Open base 對 tick 沒有任何貢獻，所以它不宣告 `every`、`lease` 或 `validUntil`；什麼都不存，所以也不吃 `codec`。這四個只要屬性存在就在建構時被拒絕 - 包含明確寫成 `undefined` 的情況 - 與 `anyParams` 並列的清單，以及不是 `true` 的 `anyParams`，同樣如此。
 - **Flight 是暫時的。** 它不存結果、會自己過期，並由下一個 tick 清掉。Leader 死了之後，過了它的期限就由下一個讀者接手；已結束的答案在那批讀者拿到後不久就不再被交出去。
 - **讀取必須帶 params。** 沒有 params 的 open base 什麼組合都沒指名。
 - **Reader 必須有能力發出那次呼叫。** `createReader` 需要完整的 store - 能 claim、能計額度的那種，例如 `d1(env.DB)` - 不能是 results-only。這在建構 reader 時就檢查，不是等到有人來讀。

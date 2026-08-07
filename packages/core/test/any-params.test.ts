@@ -158,24 +158,47 @@ describe('anyParams at construction', () => {
     ).toThrow(/cannot be combined/)
   })
 
-  it('rejects a codec, because nothing is ever encoded', () => {
-    expect(
-      build({
-        name: 'course-funnel',
-        anyParams: true,
-        codec: { encode: (v: unknown) => v, decode: (v: unknown) => v },
-        fetch: async () => 'v',
-      }),
-    ).toThrow(/nothing to encode/)
-  })
-
   it('rejects anyParams that is not true', () => {
     expect(build({ name: 'course-funnel', anyParams: 'yes', fetch: async () => 'v' })).toThrow(
       /anyParams must be true/,
     )
   })
 
-  it('needs no every, because it is never scheduled', () => {
-    expect(build({ name: 'course-funnel', anyParams: true, fetch: async () => 'v' })).not.toThrow()
+  const forbidden: ReadonlyArray<readonly [string, unknown, RegExp]> = [
+    ['every', '1m', /no entries to schedule/],
+    ['lease', '2m', /claims no lease/],
+    ['validUntil', () => 0, /nothing for validUntil to expire/],
+    ['codec', { encode: (v: unknown) => v, decode: (v: unknown) => v }, /nothing to encode/],
+  ]
+
+  for (const [field, value, message] of forbidden) {
+    it(`rejects ${field}, which an open base could not mean anything by`, () => {
+      expect(
+        build({ name: 'course-funnel', anyParams: true, [field]: value, fetch: async () => 'v' }),
+      ).toThrow(message)
+    })
+
+    it(`rejects ${field} even when it is explicitly undefined`, () => {
+      expect(
+        build({
+          name: 'course-funnel',
+          anyParams: true,
+          [field]: undefined,
+          fetch: async () => 'v',
+        }),
+      ).toThrow(message)
+    })
+  }
+
+  it('accepts a base that declares only what an open base can have', () => {
+    expect(
+      build({
+        name: 'course-funnel',
+        anyParams: true,
+        timeout: '5s',
+        source: 'analytics',
+        fetch: async () => 'v',
+      }),
+    ).not.toThrow()
   })
 })

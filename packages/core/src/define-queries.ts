@@ -272,6 +272,19 @@ function cartesian(
   return combos
 }
 
+/**
+ * Fields an open base cannot mean anything by. The types already exclude them,
+ * but a JS caller has no types, so presence of the property is what is checked -
+ * an explicit `every: undefined` is still somebody declaring a schedule for
+ * something that is never scheduled.
+ */
+const OPEN_BASE_FORBIDDEN: ReadonlyArray<readonly [string, string]> = [
+  ['every', 'anyParams has no entries to schedule, so it cannot declare a period'],
+  ['lease', 'anyParams claims no lease, so it cannot declare one'],
+  ['validUntil', 'anyParams stores no result, so there is nothing for validUntil to expire'],
+  ['codec', 'anyParams stores nothing, so a codec would have nothing to encode'],
+]
+
 function makeOpen(definition: ParameterizedQueryDef): OpenBase {
   const at = `query '${definition.name}'`
   if (definition.anyParams !== true) {
@@ -280,10 +293,10 @@ function makeOpen(definition: ParameterizedQueryDef): OpenBase {
   if (typeof definition.fetch !== 'function') {
     throw new ConfigError(`${at}: fetch must be a function`)
   }
-  if ((definition as { codec?: unknown }).codec !== undefined) {
-    throw new ConfigError(
-      `${at}: anyParams stores nothing, so a codec would have nothing to encode`,
-    )
+  for (const [field, why] of OPEN_BASE_FORBIDDEN) {
+    if (Object.hasOwn(definition, field)) {
+      throw new ConfigError(`${at}: ${why}`)
+    }
   }
   const timeoutMs =
     definition.timeout === undefined

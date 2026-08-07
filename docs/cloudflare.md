@@ -192,7 +192,7 @@ Those two are the arrangements that ship complete on Cloudflare, not the only le
 
 ## Construction-time validation
 
-- `defineQueries` validates names, durations, fetchers, duplicate variants, `timeout < lease`, and that an `anyParams` base declares no list and no `codec` (`every`, `lease` and `validUntil` are rejected by the types).
+- `defineQueries` validates names, durations, fetchers, duplicate variants, `timeout < lease`, and that an `anyParams` base declares no list, no `every`, no `lease`, no `validUntil` and no `codec`.
 - `FridgeDO` validates its registry, source policies, and the Cloudflare wall-clock ceiling during ignition and before alarms.
 - `cronFridge` validates its registry, store-factory shape, schedule-plane resolution, and wall-clock ceiling when constructed.
 - A Cloudflare query timeout must be shorter than 15 minutes.
