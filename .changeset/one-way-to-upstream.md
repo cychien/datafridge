@@ -1,6 +1,6 @@
 ---
-'@datafridge/core': major
-'@datafridge/cloudflare': major
+'@datafridge/core': minor
+'@datafridge/cloudflare': minor
 ---
 
 One exit to upstream, and a read that never opens it.

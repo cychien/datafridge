@@ -1,6 +1,6 @@
 ---
-'@datafridge/core': major
-'@datafridge/cloudflare': major
+'@datafridge/core': minor
+'@datafridge/cloudflare': minor
 ---
 
 A source ceiling that actually counts, and that both kinds of call obey.

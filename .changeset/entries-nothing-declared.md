@@ -1,6 +1,6 @@
 ---
-'@datafridge/core': major
-'@datafridge/cloudflare': major
+'@datafridge/core': minor
+'@datafridge/cloudflare': minor
 ---
 
 Open parameter spaces, without pretending they are entries.
