@@ -72,3 +72,5 @@ jobs:
         with:
           publish: pnpm release
           createGithubReleases: true
+        env:
+          NPM_CONFIG_LOGLEVEL: verbose
