@@ -1,6 +1,6 @@
 {
   "name": "@datafridge/core",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Proactively refreshed local reads for slow or unreliable APIs - core engine, zero runtime dependencies",
   "keywords": [
     "cache",
