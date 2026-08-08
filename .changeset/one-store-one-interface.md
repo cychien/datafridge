@@ -1,6 +1,6 @@
 ---
-'@datafridge/core': major
-'@datafridge/cloudflare': major
+'@datafridge/core': minor
+'@datafridge/cloudflare': minor
 ---
 
 One store, one interface. `Store` holds both halves of what datafridge keeps - result envelopes and schedule bookkeeping - and `d1(db)` is the single D1 store.

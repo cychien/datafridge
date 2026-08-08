@@ -1,5 +1,5 @@
 ---
-'@datafridge/cloudflare': major
+'@datafridge/cloudflare': minor
 ---
 
 D1 is the coordination plane; the Durable Object is only a scheduler.

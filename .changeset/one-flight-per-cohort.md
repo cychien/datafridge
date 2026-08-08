@@ -1,6 +1,6 @@
 ---
-'@datafridge/core': major
-'@datafridge/cloudflare': major
+'@datafridge/core': minor
+'@datafridge/cloudflare': minor
 ---
 
 Concurrency and coalescing move into the store, where every executor can see them.

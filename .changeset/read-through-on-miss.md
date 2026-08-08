@@ -1,5 +1,5 @@
 ---
-'@datafridge/core': major
+'@datafridge/core': minor
 ---
 
 A read with nothing stored waits for the first result, and a reader can hold the query registry.

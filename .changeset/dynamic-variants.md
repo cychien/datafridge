@@ -1,5 +1,5 @@
 ---
-'@datafridge/core': major
+'@datafridge/core': minor
 '@datafridge/cloudflare': minor
 ---
 

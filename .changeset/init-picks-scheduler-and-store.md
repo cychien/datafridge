@@ -1,5 +1,5 @@
 ---
-'@datafridge/cloudflare': major
+'@datafridge/cloudflare': minor
 ---
 
 `datafridge init` takes the scheduler and the store as separate choices, and writes only what that combination needs.
