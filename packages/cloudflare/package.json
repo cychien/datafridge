@@ -1,6 +1,6 @@
 {
   "name": "@datafridge/cloudflare",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cloudflare adapters for datafridge - Durable Object alarms driver, D1 store, cron shell",
   "keywords": [
     "cloudflare-workers",
