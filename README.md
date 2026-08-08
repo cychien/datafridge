@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/logo.png" alt="datafridge" width="120" height="120" />
+</p>
+
 <h1 align="center">datafridge</h1>
 
 <p align="center">
