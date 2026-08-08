@@ -2,9 +2,9 @@
 
 [English](../writing-adapters.md) | 繁體中文
 
-datafridge 的 core 只依賴 contract，不假設任何平台特性。Durable Object、D1、Redis、cron、node timer 全部只是 adapter。某些後端讓 adapter 特別好寫（例如 DO 的單線程執行）- 那是該 adapter 的幸運，永遠不是 core 的假設。
+datafridge 的 core 只依賴 contract，不假設任何平台特性。Durable Object、D1 與 Cron Triggers 都透過 adapter 接入；其他 store 或 scheduler 也遵守同一套 contract。某些後端讓 adapter 特別好寫（例如 DO 的單線程執行）- 那是該 adapter 的特性，永遠不是 core 的假設。
 
-介面刻意極小。Query registry 是 code 裡宣告的有限集合（幾個到幾十個 queries），所以逐筆 `readSchedule` 完全可行，`listDue` 只是優化。Core 發出的每一次呼叫都有界：`listDue` 一定帶著有限的 limit，沒有任何方法會要求後端把手上的東西全部交出來。這就是「任何後端半天寫完一個 adapter」的保證。
+介面刻意極小。小型 registry 可以逐筆 `readSchedule`，大型或動態 registry 則透過 `listDue` 與 `readSchedules` 做有界的批次讀取。Core 發出的每一次呼叫都有界：`listDue` 一定帶著有限的 limit，沒有任何方法會要求後端把手上的東西全部交出來。
 
 ## Store contract：一個 store，兩個半邊
 
@@ -56,7 +56,7 @@ interface Store {
 
 兩個半邊的一致性需求仍然不同，而有狀態的 serialized driver 可以自己保管排程簿記，這時 store 只有 result 那一半會被用到。這種 driver 實作的是 `SchedulePlane`，也就是單獨的排程那一半；它屬於 adapter 層級：只有在你要寫這種 driver 時才需要實作它。
 
-**已出貨的東西沒有一個這樣做。** `FridgeDO` 刻意不保管任何自己的 dispatch 狀態：row、lease、quota 與結果全都住在你交給它的 Store 裡，所以一個 Durable Object 和一個 cron trigger 指向同一個 D1 時，是透過那個 store 協調，而不是透過「剛好是 singleton 的那個物件」。一個把協調平面據為己有的 scheduler，是一個你沒辦法再加第二個讀取端的 scheduler。
+`FridgeDO` 不保管自己的 dispatch 狀態：row、lease、quota 與結果全都住在你交給它的 Store 裡，所以一個 Durable Object 和一個 cron trigger 指向同一個 D1 時，是透過那個 store 協調，而不是透過「剛好是 singleton 的那個物件」。一個把協調平面據為己有的 scheduler，無法再加入第二個讀取端共同協調。
 
 ## 能力矩陣
 
@@ -121,7 +121,7 @@ Driver 是 integration shell，它的義務：
 
 ## 驗收標準：contract compatibility test suite
 
-`@datafridge/core` 附帶一份 Store contract compatibility test suite，首先由內建的 `memoryStore` 參考實作驗證通過。它把[概念](./concepts.md)中的每一條語意時間軸都編成確定性的測試（注入假時鐘、零 sleep）：claim/lease 行為、租約過期重撿、zombie 寫回被拒、兩個併發 `runDue` 對每個 query 恰好 fetch 一次，等等。
+`@datafridge/core` 附帶一份 Store contract compatibility test suite，首先由內建的 `memoryStore` 參考實作驗證通過。它以注入假時鐘、零 sleep 的確定性測試驗證 claim、lease、quota、permit、flight、失敗復原與 version check。
 
 一個 adapter 通過這份套件對真實後端的完整執行，即為驗收 - 例如 Cloudflare 的 `d1` store 對真的 D1 binding 跑完整套件，含併發 CAS claim 案例。任何 adapter 都不重寫自己的正確性測試；這份套件就是 adapter 生態的規格書。
 
@@ -129,8 +129,8 @@ Driver 是 integration shell，它的義務：
 
 Package 是配銷單位，不是組合單位 - 組合自由由 core interface 保證，與包邊界無關。
 
-1. **按共享 runtime 依賴群聚。** Cloudflare 的三個部件（doAlarms、d1、cron shell）共享同一組依賴與發版節奏，所以同包。Redis、SQLite 各自依賴不同 client，各自成包。
+1. **按共享 runtime 依賴群聚。** Cloudflare 的 `FridgeDO`、`d1`、`cronDriver` 與 `cronFridge` 共享同一組依賴與發版節奏，所以放在同一個 package。其他 backend 若依賴不同 client，應放在各自的 package。
 2. **包內每個部件是獨立 subpath export**（`@datafridge/cloudflare/do`、`/d1`、`/cron`）- 想用哪個拿哪個。
-3. **任何包不得依賴兄弟包；所有部件只認 core 的 interface。** `FridgeDO` 接受任何 `Store`，所以跨包混搭（DO scheduler + Redis store）就是裝兩個包，永遠合法。
+3. **任何包不得依賴兄弟包；所有部件只認 core 的 interface。** `FridgeDO` 接受任何完整的 `Store`，所以 scheduler 與不同 package 提供的 store 可以自由混搭。
 4. 純 JS、零平台依賴的部件住 core，不進平台包。
 5. Driver 天生平台味（Cloudflare 的 scheduled handler、node 的 timer、K8s 的 HTTP endpoint 形狀各不同），按平台組織是貼合現實。

@@ -2,9 +2,9 @@
 
 English | [繁體中文](./zh-TW/writing-adapters.md)
 
-datafridge's core only depends on contracts; it assumes nothing about any platform. Durable Objects, D1, Redis, cron, and node timers are all just adapters. Some backends make an adapter unusually easy to implement (a DO's single-threaded execution, for example) - that is the adapter's luck, never a core assumption.
+datafridge's core only depends on contracts; it assumes nothing about any platform. Durable Objects, D1, and Cron Triggers all connect through adapters, and other stores or schedulers follow the same contracts. Some backends make an adapter unusually easy to implement (a DO's single-threaded execution, for example) - that is a property of the adapter, never a core assumption.
 
-The interfaces are deliberately tiny. The query registry is a finite set declared in code (a handful to a few dozen queries), so per-name `readSchedule` calls are entirely viable and `listDue` is only an optimization. Every call core makes is bounded: `listDue` always carries a finite limit, and no method asks a backend to hand over everything it holds. This is the guarantee behind "any backend gets an adapter in half a day".
+The interfaces are deliberately small. A small registry can use individual `readSchedule` calls, while a large or dynamic registry uses bounded batch reads through `listDue` and `readSchedules`. Every call core makes is bounded: `listDue` always carries a finite limit, and no method asks a backend to return everything it holds.
 
 ## Store contract: one store, both halves
 
@@ -56,7 +56,7 @@ This is what keeps `datafridge init <target>` the same size on every platform.
 
 The two halves still have different consistency needs, and a stateful serialized driver may keep the schedule bookkeeping itself; then only the store's result half is used. Such a driver implements `SchedulePlane`, the schedule half alone, and it is adapter-level: implement it only if you are writing that kind of driver.
 
-**Nothing shipped does.** `FridgeDO` deliberately keeps no dispatch state of its own: rows, leases, quota and results all live in the Store it is given, so a Durable Object and a cron trigger over the same D1 coordinate through that store rather than through whichever object happens to be the singleton. A scheduler that owns the coordination plane is a scheduler you cannot add a second reader to.
+`FridgeDO` keeps no dispatch state of its own: rows, leases, quota, and results all live in the Store it is given, so a Durable Object and a cron trigger over the same D1 coordinate through that store rather than through whichever object happens to be the singleton. A scheduler that owns the coordination plane cannot add a second reader that participates in the same coordination.
 
 ## Capability matrix
 
@@ -121,7 +121,7 @@ A non-serialized driver combined with schedule bookkeeping lacking `atomicClaim`
 
 ## Acceptance bar: the contract compatibility test suite
 
-`@datafridge/core` ships a Store contract compatibility test suite, first proven against the built-in `memoryStore` reference implementation. It encodes every timeline in [Concepts](./concepts.md) as a deterministic test (injected fake clock, zero sleeps): claim/lease behavior, expired-lease re-claim, zombie write rejection, concurrent `runDue` fetching each query exactly once, and so on.
+`@datafridge/core` ships a Store contract compatibility test suite, first proven against the built-in `memoryStore` reference implementation. Deterministic tests with an injected fake clock and zero sleeps cover claims, leases, quotas, permits, flights, failure recovery, and version checks.
 
 An adapter is accepted when it passes this suite against its real backend - the Cloudflare `d1` store, for example, runs the full suite against a real D1 binding, including the concurrent CAS claim cases. No adapter rewrites its own correctness tests; the suite is the spec for the adapter ecosystem.
 
@@ -129,8 +129,8 @@ An adapter is accepted when it passes this suite against its real backend - the 
 
 Packages are distribution units, not composition units - composition freedom is guaranteed by the core interfaces and has nothing to do with package boundaries.
 
-1. **Cluster by shared runtime dependency.** The three Cloudflare parts (doAlarms, d1, cron shell) share one dependency set and release cadence, so they share one package. Redis and SQLite depend on different clients, so they each get their own.
+1. **Cluster by shared runtime dependency.** Cloudflare's `FridgeDO`, `d1`, `cronDriver`, and `cronFridge` share one dependency set and release cadence, so they live in one package. Other backends that require different clients should live in their own packages.
 2. **Each part is an independent subpath export** (`@datafridge/cloudflare/do`, `/d1`, `/cron`) - import only what you use.
-3. **No package may depend on a sibling package; every part talks only to core's interfaces.** `FridgeDO` accepts any `Store`, so cross-package mixing (DO scheduler + a Redis store) is just installing two packages, and always legal.
+3. **No package may depend on a sibling package; every part talks only to core's interfaces.** `FridgeDO` accepts any full `Store`, so schedulers can freely combine with stores from other packages.
 4. Pure-JS, platform-free parts live in core, not in platform packages.
 5. Drivers are inherently platform-shaped (Cloudflare's scheduled handler, node's timer, a K8s HTTP endpoint all look different), so organizing them by platform reflects reality.

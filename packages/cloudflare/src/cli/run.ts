@@ -22,8 +22,8 @@ const USAGE = `Usage: datafridge init --scheduler <${SCHEDULERS.join('|')}> --st
 The scheduler and the store are chosen independently, and only the declarations
 that combination needs are written - nothing is scaffolded for you to delete.
 
-  --scheduler durable-object   Durable Object alarms; exact due times, keeps its
-                               own schedule bookkeeping in the object's SQLite
+  --scheduler durable-object   Durable Object alarms; exact due times, schedule
+                               bookkeeping lives in the store
   --scheduler cron             Cron Trigger; 1-minute floor, schedule
                                bookkeeping lives in the store
   --store d1                   Cloudflare D1

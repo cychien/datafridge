@@ -97,4 +97,4 @@ fetch: async ({ signal }) => {
 
 ## 跨服務共用同一個上限
 
-`takeQuota` 屬於 store 契約，所以一個 source 的 ledger 住在 store 住的地方。兩個服務指向同一個 D1 - 或未來同一個 Redis - 就共用同一份計數，不需要任何額外協調。機制就只有這樣：沒有另一個要跑的 rate limiter。
+`takeQuota` 屬於 store 契約，所以一個 source 的 ledger 住在 store 住的地方。兩個服務只要指向同一個 Store backend，就共用同一份計數，不需要任何額外協調，也不需要另外執行 rate limiter。

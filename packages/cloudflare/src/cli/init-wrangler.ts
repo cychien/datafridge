@@ -54,8 +54,7 @@ crons = ["${CRON_SCHEDULE}"]`
 
 const CRONS_LINE = `crons = ["${CRON_SCHEDULE}"] # datafridge: cron tick driving the scheduled handler`
 
-const D1_BLOCK = `# datafridge: D1 database holding results, and schedule bookkeeping unless the
-# scheduler keeps its own.
+const D1_BLOCK = `# datafridge: D1 database holding results and coordination state.
 # TODO: run \`wrangler d1 create ${D1_DATABASE_NAME}\` and paste its database_id here.
 [[d1_databases]]
 binding = "${D1_BINDING}"
