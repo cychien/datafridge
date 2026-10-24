@@ -12,10 +12,11 @@ The installable public package graph contains exactly:
 |---|---:|---|
 | `@datafridge/core` | `1.0.0` | Engine, types, memory store, parameterized identity, deterministic utilities, and contract tests |
 | `@datafridge/cloudflare` | `1.0.0` | D1 stores, Durable Object alarms, Cron Trigger shell, migration, and init CLI |
+| `@datafridge/postgres` | `1.0.0` | Postgres store and its migration |
 
-`@datafridge/cloudflare` declares `@datafridge/core` as a peer dependency. Changesets converts the workspace range to a public semver range in packed artifacts.
+`@datafridge/cloudflare` and `@datafridge/postgres` declare `@datafridge/core` as a peer dependency. Changesets converts the workspace range to a public semver range in packed artifacts.
 
-The unscoped names `datafridge` and `data-fridge` are brand-reservation intent only. They are not aliases, meta-packages, or members of the package graph. npm has no non-package name-reservation operation, so this project will not publish empty or placeholder packages to occupy them. Any future unscoped publication requires real user-facing semantics and a separate reviewed decision. Users should install only `@datafridge/core` and `@datafridge/cloudflare`.
+The unscoped names `datafridge` and `data-fridge` are brand-reservation intent only. They are not aliases, meta-packages, or members of the package graph. npm has no non-package name-reservation operation, so this project will not publish empty or placeholder packages to occupy them. Any future unscoped publication requires real user-facing semantics and a separate reviewed decision. Users should install only `@datafridge/core`, `@datafridge/cloudflare` and `@datafridge/postgres`.
 
 ## Local release checks
 
@@ -27,7 +28,7 @@ pnpm test
 pnpm release:check
 ```
 
-`release:check` validates the Changesets release plan, builds both packages, packs each twice, requires byte-identical archives, verifies declarations, migration, CLI, licenses, READMEs, and subpath exports, rejects source/test directories, installs both tarballs into a clean temporary npm consumer, imports core and Cloudflare subpaths, and runs the packaged CLI.
+`release:check` validates the Changesets release plan, builds every package, packs each twice, requires byte-identical archives, verifies declarations, migrations, CLI, licenses, READMEs, and subpath exports, rejects source/test directories, installs every tarball into a clean temporary npm consumer, imports core, Cloudflare and Postgres entry points, and runs the packaged CLI.
 
 To inspect a tarball without publishing:
 
@@ -69,14 +70,14 @@ There is no npm token, and no Actions secret of any kind. The workflow authentic
 - **npm is pinned.** `changeset publish` shells out to `pnpm publish`, which packs a tarball and hands the registry call to the npm CLI. Trusted publishing arrived in npm 11.5.0, and Node releases 24.0.0 through 24.4.1 shipped npm older than that, so the job installs a fixed npm rather than inheriting whatever the runner resolves for `node-version: 24`. `scripts/assert-npm-supports-trusted-publishing.mjs` then checks the npm that `pnpm publish` will actually invoke, which is the one next to the running node executable rather than the first `npm` on `PATH`.
 - **`registry-url` is deliberately absent** from `actions/setup-node`. It writes an `.npmrc` whose `_authToken` expands to the literal string `${NODE_AUTH_TOKEN}` when no such variable exists. npm reads that as a credential, so a failed OIDC exchange would surface as an opaque `401` instead of a clear `ENEEDAUTH`. With no `.npmrc`, OIDC is the only credential source and its absence fails loudly.
 
-Configure the GitHub `npm` environment with required reviewers. Configure npm trusted publishers for both scoped packages with:
+Configure the GitHub `npm` environment with required reviewers. Configure npm trusted publishers for every scoped package with:
 
 - GitHub owner: `cychien`
 - repository: `datafridge`
 - workflow filename: `release.yml`
 - environment: `npm`
 
-**Do not dispatch the workflow until trusted publishing is configured for both packages.** There is no token to fall back on, so the publish step will simply fail.
+**Do not dispatch the workflow until trusted publishing is configured for every package.** There is no token to fall back on, so the publish step will simply fail.
 
 ## First publication of 1.0.0 (captain, local, one time only)
 
@@ -134,6 +135,10 @@ Note that `pnpm publish --dry-run` never reaches npm's authentication or provena
 Afterwards, on npmjs.com, for **each** of `@datafridge/core` and `@datafridge/cloudflare`, open Settings and add a GitHub Actions trusted publisher with the owner, repository, workflow filename, and environment listed above. Only then may the workflow be dispatched.
 
 Tag and release `1.0.0` in git as well, since the local publish does not create the tags the action would.
+
+## First publication of a later package
+
+A package added after `1.0.0` starts the same way, because npm still cannot trust a publisher for a name that does not exist yet. `@datafridge/postgres` enters the graph at `0.0.0` with a `major` changeset, so the version PR takes it to `1.0.0`. Once that PR is on `main`, the captain publishes that one package locally with the runbook above, from inside `packages/postgres`, then configures its trusted publisher on npmjs.com the same way. Do not dispatch the workflow while it is still unpublished: the publish step would fail on it.
 
 ## Release sequence
 

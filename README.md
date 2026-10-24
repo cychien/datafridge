@@ -15,6 +15,11 @@
       alt="@datafridge/cloudflare on npm"
       src="https://img.shields.io/npm/v/%40datafridge%2Fcloudflare?style=flat-square&label=%40datafridge%2Fcloudflare"
   /></a>
+  <a href="https://www.npmjs.com/package/@datafridge/postgres"
+    ><img
+      alt="@datafridge/postgres on npm"
+      src="https://img.shields.io/npm/v/%40datafridge%2Fpostgres?style=flat-square&label=%40datafridge%2Fpostgres"
+  /></a>
   <a href="https://github.com/cychien/datafridge/actions/workflows/ci.yml"
     ><img
       alt="CI"
@@ -51,7 +56,7 @@ The whole library is one promise: **when your app wants data, it always has some
    { data, fetchedAt, isStale, age }
 ```
 
-`@datafridge/core` is the engine: pure logic with zero runtime dependencies. `@datafridge/cloudflare` is the adapter package for Cloudflare infrastructure such as Durable Object alarms, Cron Triggers, and D1.
+`@datafridge/core` is the engine: pure logic with zero runtime dependencies. `@datafridge/cloudflare` is the adapter package for Cloudflare infrastructure such as Durable Object alarms, Cron Triggers, and D1. `@datafridge/postgres` is a store for Postgres over the pool, PGlite, Neon or Drizzle database your app already has, usable with any scheduler, `FridgeDO` included.
 
 ## Use cases
 
@@ -121,6 +126,7 @@ The first read attempts to fetch fresh data. Once data exists, later reads only 
 
 - [API reference](./docs/api.md)
 - [Cloudflare setup](./docs/cloudflare.md)
+- [Postgres store](./docs/api.md#datafridgepostgres)
 - [Runnable Cloudflare example](./examples/cloudflare-basic)
 
 ## License

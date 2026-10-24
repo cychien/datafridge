@@ -225,9 +225,11 @@ export class Poller extends FridgeDO<Env> {
 | Member | Required/default | Meaning |
 |---|---|---|
 | `queries` | Required | A registry or query definitions. |
-| `store(env)` | Required | Returns a full `Store`. |
+| `store(env)` | Required | Returns a full `Store`: `d1(env.DB)`, `postgresStore(...)`, or any other. Called at the start of every alarm. |
 | `sources` | No limit | Source policies. |
 | `onRunReport(report)` | No-op | A hook after each alarm. Do not log payloads or unsanitized error details. |
+
+`store(env)` runs once per alarm, so it should return a cheap wrapper over a connection the object keeps: a Durable Object may reuse its connections across its own requests and alarms, so hold a Postgres pool on the instance and return `postgresStore(this.pool)`, rather than opening a pool per alarm.
 
 `ensureStarted(namespace, instanceName?)` starts the alarm chain. `instanceName` defaults to `'datafridge'`, and repeated calls are safe. Cloudflare query `timeout` values must be shorter than 15 minutes.
 
@@ -255,7 +257,7 @@ export default {
 | Field | Required/default | Meaning |
 |---|---|---|
 | `queries` | Required | A registry or query definitions. |
-| `store(env)` | Required | Creates a full Store for each invocation. |
+| `store(env)` | Required | Creates a full Store for each invocation. A plain Worker cannot reuse a connection across invocations, so give it a store that holds none open between statements, such as `postgresStore(neon(url, { fullResults: true }))`. |
 | `sources` | No limit | Source policies. |
 | `onRunReport(report)` | No-op | A hook after each tick. |
 
@@ -274,3 +276,28 @@ pnpm exec datafridge init --scheduler <durable-object|cron> --store d1 [--config
 | `--config` | `wrangler.toml` | The TOML file to update. |
 
 The CLI preserves existing declarations and adds only the bindings, migration, or cron trigger needed by the selected combination. See [Cloudflare setup](./cloudflare.md) for the full deployment sequence.
+
+## `@datafridge/postgres`
+
+| Export | Purpose |
+|---|---|
+| `postgresStore(db)` | Postgres Store with atomic claims and `listDue`. |
+| `ensureSchema(db)` | Creates the tables and indexes the store owns, if missing. |
+| `POSTGRES_SCHEMA` | The same DDL as single statements, for your own migration pipeline. |
+| `PostgresQueryable`, `PostgresClient` | The client shapes `db` may take. |
+
+```ts
+import { createReader } from '@datafridge/core'
+import { ensureSchema, postgresStore } from '@datafridge/postgres'
+
+const store = postgresStore(pool)
+await ensureSchema(pool) // optional: the first write does it otherwise
+const reader = createReader({ store, queries, sources })
+```
+
+`db` is the client your app already holds; the store never opens a connection of its own and has no runtime dependencies. It accepts anything with `query(text, params) => Promise<{ rows }>` - a node-postgres `Pool`, `Client` or `PoolClient`, PGlite, Neon's `Pool` and `Client`, or `neon(url, { fullResults: true })` - and a Drizzle database over node-postgres or PGlite, whose `$client` it reads again for every statement, so a database that hands out connections per request or per Durable Object keeps working. A node-postgres `Client` serves one statement at a time; prefer a `Pool` wherever several reads or ticks share it.
+
+- **One statement per operation, no transactions.** Atomicity comes from Postgres row locks: a claim is an `UPDATE ... WHERE version = $n`, which re-checks its condition on the newest row once it holds the lock; the quota ledger and the concurrency permits are single `INSERT ... ON CONFLICT DO UPDATE` statements over one row per source; flights are leased the same way, and the sweep skips rows a peer has locked. A pool is therefore safe to pass as is, under `READ COMMITTED`.
+- **Tables.** `datafridge_results`, `datafridge_schedule`, `datafridge_quota`, `datafridge_permit` and `datafridge_flight`, unqualified, so they land in the first schema on the connection's `search_path`. The packaged `migrations/0001_datafridge_init.sql` holds the same statements as `POSTGRES_SCHEMA`.
+- **Schema.** Applied before the first write, once per client, in one statement that checks each object before creating it: several processes starting at once all succeed, and a role without `CREATE` on the schema runs against tables someone else migrated. Reads never create anything; a missing table reads as empty. A table dropped under a running process is re-created on the next write. If a schema tool manages the same database and drops tables it does not know, exclude `datafridge_*` from it.
+- **Fidelity.** Envelopes are stored as JSON text, so key order and every string survive exactly; timestamps are `DOUBLE PRECISION`, exact for any JavaScript number.
