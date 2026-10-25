@@ -1,6 +1,6 @@
 {
   "name": "@datafridge/postgres",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Postgres store for datafridge - results, schedule, quota, permits and flights over any pg-compatible client",
   "keywords": [
     "postgres",
