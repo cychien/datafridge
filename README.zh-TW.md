@@ -15,6 +15,11 @@
       alt="@datafridge/cloudflare on npm"
       src="https://img.shields.io/npm/v/%40datafridge%2Fcloudflare?style=flat-square&label=%40datafridge%2Fcloudflare"
   /></a>
+  <a href="https://www.npmjs.com/package/@datafridge/postgres"
+    ><img
+      alt="@datafridge/postgres on npm"
+      src="https://img.shields.io/npm/v/%40datafridge%2Fpostgres?style=flat-square&label=%40datafridge%2Fpostgres"
+  /></a>
   <a href="https://github.com/cychien/datafridge/actions/workflows/ci.yml"
     ><img
       alt="CI"
@@ -51,7 +56,7 @@ datafridge 幫你處理這件事。你只需要註冊一次 query，設定 sched
    { data, fetchedAt, isStale, age }
 ```
 
-`@datafridge/core` 是引擎：純邏輯，零 runtime 依賴。`@datafridge/cloudflare` 是 adapter package，讓它能使用 Cloudflare infra 例如 Durable Object alarms、Cron Triggers 或 D1。
+`@datafridge/core` 是引擎：純邏輯，零 runtime 依賴。`@datafridge/cloudflare` 是 adapter package，讓它能使用 Cloudflare infra 例如 Durable Object alarms、Cron Triggers 或 D1。`@datafridge/postgres` 是 Postgres store，直接使用你的 app 已有的 pool、PGlite、Neon 或 Drizzle database，可搭配任何 scheduler，包括 `FridgeDO`。
 
 ## 使用場景
 
@@ -121,6 +126,7 @@ export default {
 
 - [API reference](./docs/zh-TW/api.md)
 - [Cloudflare 設定](./docs/zh-TW/cloudflare.md)
+- [Postgres store](./docs/zh-TW/api.md#datafridgepostgres)
 - [可執行的 Cloudflare 範例](./examples/cloudflare-basic)
 
 ## License

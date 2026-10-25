@@ -85,6 +85,10 @@ interface Store {
 
 `joinFlight` 是讓「registry 沒有指名的 parameter 組合」在重疊讀取時只發一次呼叫的機制。第一個呼叫者是 leader；在它執行期間抵達的都是那個 `generation` 的 follower。`settleFlight` 為該 generation 寫下答案，一旦 generation 前進就會被拒絕 - 這正是遲到的答案不會被交給錯誤群組的原因。在 flight 結束後才抵達的呼叫者會開一個新的 generation - 答案屬於等它的那批讀者，重用它就會讓那個組合變成一個快取 entry，而它正好不是。Flight 是暫時的：它們會過期，`sweepFlights` 以有界的批次丟掉已結束的那些。它也會丟掉過了期限仍在跑的那些，而呼叫端傳進來的 `before` 刻意遠遠落後 `now`，理由是：刪掉一個還在跑的 flight，會讓下一個呼叫者從 generation 一重新開始，而那正好是遲到的 leader 手上還握著的那個值。那段餘裕就是讓 generation 只增不減的東西。
 
+## 寫入會並行執行的 SQL backend
+
+D1 與 SQLite 一次只執行一個 writer，所以 permit `INSERT` 裡的 `COUNT(*)` 在那裡是安全的。`READ COMMITTED` 下的 Postgres 不是：每個 statement 讀的是它開始時拍下的 snapshot，兩個 peer 可能都數到四個存活的 permit、對上限五都判定還有空位，然後都插入。真正成立的是：會 lock row 的 statement - `UPDATE`，或 `INSERT ... ON CONFLICT DO UPDATE` 的 conflict 分支 - 取得 lock 後會對那一列的最新版本重新評估條件。所以 `@datafridge/postgres` 把 contract 需要判斷的每一份共享狀態都放在一列裡：claim 用 schedule row、quota 每個 source 一列 ledger、permit 每個 source 一列並以 `holder -> expiry` 存放所有存活的 permit、flight 每個 key 一列。每個操作因此都是一個 lock 住它所判斷那一列的 statement，不需要 transaction，可以安全地跑在 connection pool 上。它的 sweep 以 `FOR UPDATE SKIP LOCKED` 挑 row，所以 peer 正在重新領頭的 flight 會被跳過而不是被刪掉。它的測試在一條連線上保持 transaction 開著，並斷言另一條連線上競爭的 statement 確實停在 lock 上、且在 lock 釋放後做出正確判斷 - contract suite 的 `Promise.all` 競爭無法確定性地走到這種交錯。
+
 ## 排程那一半從哪來（建構時就決定）
 
 ```
@@ -129,7 +133,7 @@ Driver 是 integration shell，它的義務：
 
 Package 是配銷單位，不是組合單位 - 組合自由由 core interface 保證，與包邊界無關。
 
-1. **按共享 runtime 依賴群聚。** Cloudflare 的 `FridgeDO`、`d1`、`cronDriver` 與 `cronFridge` 共享同一組依賴與發版節奏，所以放在同一個 package。其他 backend 若依賴不同 client，應放在各自的 package。
+1. **按共享 runtime 依賴群聚。** Cloudflare 的 `FridgeDO`、`d1`、`cronDriver` 與 `cronFridge` 共享同一組依賴與發版節奏，所以放在同一個 package。其他 backend 若依賴不同 client，應放在各自的 package：`@datafridge/postgres` 在任何有 Postgres client 的地方都能跑，所以不是 Cloudflare 的 subpath；它以參數接收 client，所以也不帶任何 driver 依賴。
 2. **包內每個部件是獨立 subpath export**（`@datafridge/cloudflare/do`、`/d1`、`/cron`）- 想用哪個拿哪個。
 3. **任何包不得依賴兄弟包；所有部件只認 core 的 interface。** `FridgeDO` 接受任何完整的 `Store`，所以 scheduler 與不同 package 提供的 store 可以自由混搭。
 4. 純 JS、零平台依賴的部件住 core，不進平台包。

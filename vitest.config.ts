@@ -6,6 +6,7 @@ export default defineConfig({
       'packages/core',
       'packages/cloudflare',
       'packages/cloudflare/vitest.cli.config.ts',
+      'packages/postgres',
       {
         // Plain node, because the point is to start a real workerd from
         // outside and watch whether it comes up.

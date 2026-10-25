@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "paths": {
+      "@datafridge/core": ["../core/src/index.ts"],
+      "@datafridge/core/contract-tests": ["../core/src/contract-tests.ts"]
+    }
+  },
+  "include": ["src", "test", "tsup.config.ts", "vitest.config.ts"]
+}

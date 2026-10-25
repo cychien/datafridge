@@ -120,6 +120,27 @@ Variant 清單會在執行期改變時，把它宣告成函式 - 每次 alarm �
 
 `onRunReport` 用於 operational evidence，不是 payload logging。建議只記錄 category count 或 allowlisted identity。Error message 來自 application fetcher，可能含有 sensitive data，寫 log 前必須 sanitize。
 
+## 用 Postgres 取代 D1
+
+`FridgeDO`、`cronFridge` 與 `createReader` 都接受任何完整的 `Store`，所以協調平面可以透過 [`@datafridge/postgres`](./api.md#datafridgepostgres) 改用 Postgres。上面的內容在把 `d1(env.DB)` 換成 `postgresStore(...)` 後都成立；改變的是誰持有連線。
+
+```ts
+import { postgresStore } from '@datafridge/postgres'
+import pg from 'pg'
+
+export class Poller extends FridgeDO<Env> {
+  queries = queries
+  #pool: pg.Pool | undefined
+
+  store(env: Env) {
+    this.#pool ??= new pg.Pool({ connectionString: env.DATABASE_URL, max: 4 })
+    return postgresStore(this.#pool)
+  }
+}
+```
+
+`store(env)` 在每次 alarm 開始時執行，而 module 載入期間不能開任何連線，所以 pool 延遲建立並放在 instance 上：Durable Object 可以在自己的 alarms 與 requests 之間重用連線，pool 的壽命與物件相同。在自己的 Durable Object 裡執行的 request path（或在那裡重用 app 既有的 pool 或 Drizzle database）也以同樣方式傳給 `postgresStore`。一般 Worker 無法把連線從一次 invocation 帶到下一次，所以那裡的 reader 或 `cronFridge` 應使用在 statements 之間不持有連線的 store，例如 `postgresStore(neon(env.DATABASE_URL, { fullResults: true }))`。
+
 ## Cron Triggers：`cronFridge`
 
 這條路的 scheduler 就是你匯出的那個 handler：Cloudflare 的 cron trigger 會呼叫 `scheduled`，所以沒有東西需要自己點火，也沒有 `ensureStarted`。`cronDriver` 不是 serialized 的，所以它需要 atomic claim，而 `d1` 正好提供。可接受 scheduler 最低 1 分鐘，而且希望 D1 是唯一 stateful platform component 時，用這個配對。

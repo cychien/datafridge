@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [],
+    "paths": {
+      "@datafridge/core": ["../core/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

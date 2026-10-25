@@ -120,6 +120,27 @@ For a variant list that changes at runtime, declare it as a function - it is res
 
 `onRunReport` is for operational evidence, not payload logging. Prefer category counts or allowlisted identities. Error messages originate in application fetchers and may be sensitive, so sanitize them before logging.
 
+## Postgres instead of D1
+
+`FridgeDO`, `cronFridge` and `createReader` take any full `Store`, so the coordination plane can be Postgres through [`@datafridge/postgres`](./api.md#datafridgepostgres). Everything above holds with `postgresStore(...)` in place of `d1(env.DB)`; what changes is who owns the connection.
+
+```ts
+import { postgresStore } from '@datafridge/postgres'
+import pg from 'pg'
+
+export class Poller extends FridgeDO<Env> {
+  queries = queries
+  #pool: pg.Pool | undefined
+
+  store(env: Env) {
+    this.#pool ??= new pg.Pool({ connectionString: env.DATABASE_URL, max: 4 })
+    return postgresStore(this.#pool)
+  }
+}
+```
+
+`store(env)` runs at the start of every alarm, and nothing may open a connection while the module loads, so the pool is created lazily and kept on the instance: a Durable Object may reuse its connections across its own alarms and requests, and it lives as long as the object does. A request path that runs in a Durable Object of its own (or reuses an app's existing pool or Drizzle database there) passes that to `postgresStore` the same way. A plain Worker cannot carry a connection from one invocation to the next, so a reader or `cronFridge` there should use a store that holds no connection between statements, such as `postgresStore(neon(env.DATABASE_URL, { fullResults: true }))`.
+
 ## Cron Triggers: `cronFridge`
 
 The scheduler here is the handler you export: Cloudflare's cron trigger calls `scheduled`, so nothing has to ignite itself and there is no `ensureStarted`. `cronDriver` is not serialized, so it needs atomic claims - which `d1` provides. Use this pairing when a one-minute scheduler floor is acceptable and you prefer D1 as the only stateful platform component.

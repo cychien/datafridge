@@ -85,6 +85,10 @@ Two details make it safe to build on. A refusal reports **when it could stop bei
 
 `joinFlight` is how overlapping reads of a parameter combination the registry does not name become one call. The first caller is the leader; anyone arriving while it runs is a follower of that `generation`. `settleFlight` writes the answer for that generation and is refused once the generation has moved on, which is what keeps a late answer from being handed to the wrong cohort. A caller arriving after a flight settles starts a new generation - the answer belongs to the readers who waited for it, and reusing it would make the combination a cached entry, which is exactly what it is not. Flights are transient: they expire, and `sweepFlights` drops the settled ones in bounded batches. It also drops running ones past their expiry, and callers pass a `before` already well behind `now` for a reason - deleting a running flight lets the next caller restart at generation one, which is exactly the value a late leader would still be holding. The margin is what keeps generations climbing.
 
+## SQL backends whose writers run concurrently
+
+D1 and SQLite run one writer at a time, which is what makes a `COUNT(*)` inside the permit `INSERT` safe there. Postgres under `READ COMMITTED` does not: every statement reads a snapshot taken when it started, so two peers can both count four live permits against a limit of five and both insert. What does hold is that a statement which locks a row - `UPDATE`, or the conflict branch of `INSERT ... ON CONFLICT DO UPDATE` - re-evaluates its condition against the newest version of that row once it has the lock. So `@datafridge/postgres` keeps each piece of shared state the contract has to decide on in one row: the schedule row for a claim, one ledger row per source for quota, one row per source holding every live permit as `holder -> expiry`, one row per flight key. Each operation is then a single statement that locks the row it decides on, needs no transaction, and runs safely over a connection pool. Its sweep picks rows `FOR UPDATE SKIP LOCKED`, so a flight a peer is re-leading at that moment is skipped rather than deleted. Its tests hold a transaction open on one connection and assert the racing statement on another is parked on the lock and decides correctly once it is released - the contract suite's `Promise.all` races cannot reach that interleaving deterministically.
+
 ## Where the schedule half comes from (decided at config time)
 
 ```
@@ -129,7 +133,7 @@ An adapter is accepted when it passes this suite against its real backend - the 
 
 Packages are distribution units, not composition units - composition freedom is guaranteed by the core interfaces and has nothing to do with package boundaries.
 
-1. **Cluster by shared runtime dependency.** Cloudflare's `FridgeDO`, `d1`, `cronDriver`, and `cronFridge` share one dependency set and release cadence, so they live in one package. Other backends that require different clients should live in their own packages.
+1. **Cluster by shared runtime dependency.** Cloudflare's `FridgeDO`, `d1`, `cronDriver`, and `cronFridge` share one dependency set and release cadence, so they live in one package. Other backends that require different clients should live in their own packages: `@datafridge/postgres` runs anywhere a Postgres client does, so it is not a Cloudflare subpath, and it takes the client as an argument, so it carries no driver dependency either.
 2. **Each part is an independent subpath export** (`@datafridge/cloudflare/do`, `/d1`, `/cron`) - import only what you use.
 3. **No package may depend on a sibling package; every part talks only to core's interfaces.** `FridgeDO` accepts any full `Store`, so schedulers can freely combine with stores from other packages.
 4. Pure-JS, platform-free parts live in core, not in platform packages.

@@ -1,0 +1,58 @@
+{
+  "name": "@datafridge/postgres",
+  "version": "0.0.0",
+  "description": "Postgres store for datafridge - results, schedule, quota, permits and flights over any pg-compatible client",
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "cache",
+    "polling"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cychien/datafridge.git",
+    "directory": "packages/postgres"
+  },
+  "homepage": "https://github.com/cychien/datafridge#readme",
+  "bugs": "https://github.com/cychien/datafridge/issues",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "migrations"
+  ],
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
+  },
+  "peerDependencies": {
+    "@datafridge/core": "workspace:^"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@datafridge/core": "workspace:*",
+    "@electric-sql/pglite": "^0.5.11",
+    "@neondatabase/serverless": "^1.2.0",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.20.0",
+    "drizzle-orm": "^0.45.4",
+    "pg": "^8.23.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.10"
+  }
+}

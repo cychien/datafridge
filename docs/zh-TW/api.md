@@ -225,9 +225,11 @@ export class Poller extends FridgeDO<Env> {
 | 成員 | 必填／預設值 | 意義 |
 |---|---|---|
 | `queries` | 必填 | Registry 或 query definitions。 |
-| `store(env)` | 必填 | 回傳完整的 `Store`。 |
+| `store(env)` | 必填 | 回傳完整的 `Store`：`d1(env.DB)`、`postgresStore(...)` 或任何其他 Store。每次 alarm 開始時呼叫。 |
 | `sources` | 無限制 | Source policies。 |
 | `onRunReport(report)` | no-op | 每次 alarm 後的 hook。不要記錄 payload 或未清理的 error details。 |
+
+`store(env)` 每次 alarm 都會呼叫，所以應回傳一個輕量 wrapper，包住物件自己持有的連線：Durable Object 可以在自己的 requests 與 alarms 之間重用連線，因此把 Postgres pool 放在 instance 上並回傳 `postgresStore(this.pool)`，不要每次 alarm 都開一個新 pool。
 
 `ensureStarted(namespace, instanceName?)` 會啟動 alarm chain；`instanceName` 預設為 `'datafridge'`。重複呼叫是安全的。Cloudflare query 的 `timeout` 必須短於 15 分鐘。
 
@@ -255,7 +257,7 @@ export default {
 | 欄位 | 必填／預設值 | 意義 |
 |---|---|---|
 | `queries` | 必填 | Registry 或 query definitions。 |
-| `store(env)` | 必填 | 每次 invocation 建立完整 Store。 |
+| `store(env)` | 必填 | 每次 invocation 建立完整 Store。一般 Worker 無法跨 invocation 重用連線，因此請給它一個在 statements 之間不持有連線的 store，例如 `postgresStore(neon(url, { fullResults: true }))`。 |
 | `sources` | 無限制 | Source policies。 |
 | `onRunReport(report)` | no-op | 每次 tick 後的 hook。 |
 
@@ -274,3 +276,28 @@ pnpm exec datafridge init --scheduler <durable-object|cron> --store d1 [--config
 | `--config` | `wrangler.toml` | 要更新的 TOML file。 |
 
 CLI 會保留既有 declarations，只加入所選組合需要的 bindings、migration 或 cron trigger。完整部署流程見 [Cloudflare 設定](./cloudflare.md)。
+
+## `@datafridge/postgres`
+
+| Export | 用途 |
+|---|---|
+| `postgresStore(db)` | 支援 atomic claim 與 `listDue` 的 Postgres Store。 |
+| `ensureSchema(db)` | 建立 store 擁有的 tables 與 indexes（若不存在）。 |
+| `POSTGRES_SCHEMA` | 同一份 DDL 的單一 statements，供你自己的 migration pipeline 使用。 |
+| `PostgresQueryable`, `PostgresClient` | `db` 可接受的 client 形狀。 |
+
+```ts
+import { createReader } from '@datafridge/core'
+import { ensureSchema, postgresStore } from '@datafridge/postgres'
+
+const store = postgresStore(pool)
+await ensureSchema(pool) // 選用：否則第一次寫入時會自動執行
+const reader = createReader({ store, queries, sources })
+```
+
+`db` 就是你的 app 已經持有的 client；store 從不自己開連線，也沒有 runtime dependency。任何具備 `query(text, params) => Promise<{ rows }>` 的東西都可以：node-postgres 的 `Pool`、`Client` 或 `PoolClient`、PGlite、Neon 的 `Pool` 與 `Client`，或 `neon(url, { fullResults: true })`；也接受 node-postgres 或 PGlite 的 Drizzle database，每個 statement 都會重新讀取它的 `$client`，所以按 request 或按 Durable Object 分配連線的 database 也能正常運作。node-postgres 的 `Client` 一次只服務一個 statement；多個 reads 或 ticks 共用時請用 `Pool`。
+
+- **每個操作一個 statement，不用 transaction。** Atomicity 來自 Postgres row lock：claim 是 `UPDATE ... WHERE version = $n`，取得 lock 後會對最新的 row 重新檢查條件；quota ledger 與 concurrency permits 都是針對每個 source 一列的單一 `INSERT ... ON CONFLICT DO UPDATE`；flights 也用同樣方式取得，sweep 會跳過被其他連線 lock 住的 row。因此在 `READ COMMITTED` 下直接傳入 pool 是安全的。
+- **Tables。** `datafridge_results`、`datafridge_schedule`、`datafridge_quota`、`datafridge_permit` 與 `datafridge_flight`，不帶 schema 前綴，因此會建立在連線 `search_path` 的第一個 schema。內附的 `migrations/0001_datafridge_init.sql` 與 `POSTGRES_SCHEMA` 內容相同。
+- **Schema。** 第一次寫入前套用，每個 client 一次，且以單一 statement 逐一檢查物件是否存在再建立：多個 process 同時啟動都會成功，沒有 schema `CREATE` 權限的 role 也能在別人 migrate 好的 tables 上運作。讀取不會建立任何東西；不存在的 table 視為空。執行中被 drop 的 table 會在下一次寫入時重建。若有 schema 工具管理同一個 database 並會刪除它不認得的 tables，請把 `datafridge_*` 排除在外。
+- **保真度。** Envelope 以 JSON text 儲存，key 順序與每個字串都原樣保留；時間戳記使用 `DOUBLE PRECISION`，任何 JavaScript number 都能精確保存。

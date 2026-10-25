@@ -37,6 +37,17 @@ const packages = [
       'package/migrations/0001_datafridge_init.sql',
     ],
   },
+  {
+    directory: join(root, 'packages/postgres'),
+    archivePrefix: 'datafridge-postgres-',
+    required: [
+      'package/LICENSE',
+      'package/README.md',
+      'package/dist/index.js',
+      'package/dist/index.d.ts',
+      'package/migrations/0001_datafridge_init.sql',
+    ],
+  },
 ]
 
 const temporary = await mkdtemp(join(tmpdir(), 'datafridge-release-check-'))
@@ -101,11 +112,13 @@ try {
     `import { createReader, defineQueries, memoryStore } from '@datafridge/core'
 import { cronDriver } from '@datafridge/cloudflare/cron'
 import { d1 } from '@datafridge/cloudflare/d1'
+import { ensureSchema, POSTGRES_SCHEMA, postgresStore } from '@datafridge/postgres'
 
 const queries = defineQueries([{ name: 'fixture', every: '1m', fetch: async () => 1 }])
 if (queries.get('fixture')?.everyMs !== 60_000) throw new Error('core import failed')
 if (typeof createReader !== 'function' || typeof memoryStore !== 'function') throw new Error('core exports failed')
 if (typeof cronDriver !== 'function' || typeof d1 !== 'function') throw new Error('Cloudflare subpath exports failed')
+if (typeof postgresStore !== 'function' || typeof ensureSchema !== 'function' || POSTGRES_SCHEMA.length === 0) throw new Error('Postgres exports failed')
 
 const store = memoryStore()
 await store.writeResult('fixture', { data: 7, fetchedAt: 0, freshUntil: 1 })
@@ -119,6 +132,11 @@ if (read?.data !== 7 || read.status !== 'ok') throw new Error('read shape failed
 import type { QueryCodec } from '@datafridge/core'
 import { cronFridge } from '@datafridge/cloudflare/cron'
 import { d1 } from '@datafridge/cloudflare/d1'
+import { postgresStore } from '@datafridge/postgres'
+import type { PostgresQueryable } from '@datafridge/postgres'
+
+const client: PostgresQueryable = { query: async () => ({ rows: [] }) }
+void postgresStore(client)
 
 const codec: QueryCodec<Map<string, number>> = {
   encode: (value) => ({ rows: [...value] }),
@@ -158,6 +176,7 @@ void d1
 
   const coreArchive = firstArchives.get('datafridge-core-')
   const cloudflareArchive = firstArchives.get('datafridge-cloudflare-')
+  const postgresArchive = firstArchives.get('datafridge-postgres-')
   run(
     'npm',
     [
@@ -168,6 +187,7 @@ void d1
       '--package-lock=false',
       coreArchive,
       cloudflareArchive,
+      postgresArchive,
     ],
     { cwd: fixture },
   )
